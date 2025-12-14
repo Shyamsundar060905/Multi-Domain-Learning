@@ -1,136 +1,134 @@
-🌍 Domain Generalization for Remote Sensing Image Classification
+# 🌍 Domain Generalization for Remote Sensing Image Classification
+### Using Residual Adapters with a Shared ResNet-50 Backbone
 
-Using Residual Adapters with a Shared ResNet-50 Backbone
+---
 
-📌 Overview
+## 📌 Overview
+Deep learning models for image classification often suffer from **domain shift**—a sharp drop in performance when evaluated on data from unseen or different distributions. This problem is especially severe in **remote sensing**, where images vary across satellites, sensors, resolutions, and geographic regions.
 
-Deep learning models for image classification often suffer from domain shift—a drop in performance when evaluated on data from unseen or different distributions. This problem is especially severe in remote sensing, where images vary across satellites, sensors, resolutions, and geographic regions.
+This project proposes a **parameter-efficient multi-domain learning framework** that replaces multiple domain-specific CNNs with a **single unified model** using **residual adapters**. Instead of training one heavy model per dataset, we share a frozen ResNet-50 backbone and introduce lightweight, domain-specific adapter modules for specialization.
 
-This project proposes a parameter-efficient multi-domain learning framework that replaces multiple domain-specific CNNs with a single unified model using residual adapters. Instead of training one heavy model per dataset, we share a frozen ResNet-50 backbone and introduce lightweight, domain-specific adapter modules for specialization.
+---
 
-✨ Key Features
+## ✨ Key Features
+- Single unified model for multiple domains  
+- Frozen ResNet-50 backbone pretrained on ImageNet  
+- Lightweight residual adapters for domain specialization  
+- Domain-specific Batch Normalization layers  
+- Separate classifier heads per dataset  
+- Significant reduction in total trainable parameters  
 
-✅ Single unified model for multiple remote sensing datasets
+---
 
-✅ Frozen ResNet-50 backbone pretrained on ImageNet
+## 🧠 Methodology
 
-✅ Lightweight residual adapters for domain-specific specialization
+### Architecture
+- **Backbone:** ResNet-50 (ImageNet pretrained, frozen)
+- **Adapters:** Bottleneck-style residual adapters
+- **Insertion Layers:** Layer 3 and Layer 4 only
+- **Normalization:** Domain-specific BatchNorm
+- **Classifier:** One fully connected head per domain
 
-✅ Domain-specific Batch Normalization and classifier heads
+Early layers learn domain-invariant features, while deeper layers adapt to domain-specific semantics via adapters.
 
-✅ Significant reduction in total parameters
+---
 
-✅ Competitive accuracy compared to separate models
+## 📊 Datasets Used
+The model is trained and evaluated across four diverse remote sensing datasets:
 
-🧠 Methodology
-Architecture
+| Dataset     | Description                          | Classes |
+|------------|--------------------------------------|---------|
+| EuroSAT    | Sentinel-2 satellite imagery         | 10      |
+| PatternNet | High-resolution aerial scenes        | 38      |
+| MLRS       | Mixed aerial & satellite imagery     | 46      |
+| ADVANCE    | Real-world satellite images          | 13      |
 
-Backbone: ResNet-50 (pretrained on ImageNet, frozen)
+All datasets are used in **RGB format** with consistent preprocessing.
 
-Adapters:
+---
 
-Bottleneck-style residual adapters
+## ⚙️ Training Strategy
 
-Inserted only in Layer 3 and Layer 4
+### Optimization
+- **Loss:** Domain-specific Cross Entropy
+- **Optimizer:** Adam (separate optimizer per domain)
+- **Learning Rate:** `1e-3`
+- **Weight Decay:** `1e-4`
 
-Normalization: Domain-specific BatchNorm layers
+### Training Rules
+- Backbone parameters remain frozen
+- Only adapters, BatchNorm layers, and classifier heads are trained
+- Domain-aware routing selects the appropriate adapter stack
 
-Classifier: Separate fully connected head per domain
+---
 
-Why adapters?
-Early layers learn general visual features, while deeper layers capture domain-specific semantics. Adapters allow domain customization without modifying shared parameters.
+## 📈 Results
 
-📊 Datasets Used
+### Classification Accuracy
 
-The model is trained and evaluated across four diverse remote sensing domains:
+| Dataset     | Single-Domain (%) | Multi-Domain (%) |
+|------------|------------------|------------------|
+| EuroSAT    | 97.64            | 96.83            |
+| PatternNet | 99.17            | 98.95            |
+| MLRS       | 94.57            | 94.41            |
+| ADVANCE    | 93.56            | 93.24            |
 
-Dataset	Type	Classes
-EuroSAT	Sentinel-2 satellite imagery	10
-PatternNet	High-resolution aerial scenes	38
-MLRS	Mixed aerial & satellite	46
-ADVANCE	Real-world satellite images	13
+> Performance drop is **less than 1%**, despite using a single shared model.
 
-All datasets are used in RGB format, with consistent preprocessing and augmentation.
+---
 
-⚙️ Training Strategy
+### Parameter Efficiency
 
-Shared backbone remains frozen
+| Setup | Trainable Parameters |
+|------|----------------------|
+| 4 × Single-Domain Models | ~94M |
+| **Multi-Domain (Adapters)** | **28.5M** |
 
-Only adapters, BatchNorm layers, and classifiers are trained
+This results in **~70% reduction** in total parameters.
 
-Domain-aware routing selects the correct adapter and classifier
+---
 
-Loss: Domain-specific Cross Entropy
+## 🔍 Feature Visualization
+t-SNE visualization of penultimate-layer features shows **clear separation between domains**, confirming that adapters learn domain-specific representations while preserving shared features.
 
-Optimizer: Adam (per-domain)
+---
 
-Learning rate: 1e-3
+## 🧪 Implementation Details
+- Framework: **PyTorch**
+- Backbone: **ResNet-50**
+- Input normalization: ImageNet mean & std
+- Data augmentation:
+  - Random horizontal flips
+  - Rotations
+  - Color jitter
 
-Weight decay: 1e-4
+---
 
-| Dataset    | Type                          | Classes |
-| ---------- | ----------------------------- | ------- |
-| EuroSAT    | Sentinel-2 satellite imagery  | 10      |
-| PatternNet | High-resolution aerial scenes | 38      |
-| MLRS       | Mixed aerial & satellite      | 46      |
-| ADVANCE    | Real-world satellite images   | 13      |
+## 🚀 Why This Project Matters
+- Scales efficiently to many domains
+- Reduces memory and deployment cost
+- Suitable for edge devices and large-scale systems
+- Strong foundation for continual and multi-modal learning
 
+---
 
-➡️ Performance drop < 1%, despite using a single shared model.
+## 🔮 Future Work
+- Dynamic or shared adapter selection
+- Continual learning (EWC, LwF)
+- Adapter fusion across related domains
+- Extension to multispectral, SAR, and temporal data
+- Transformer backbones with adapters
 
-Parameter Efficiency
-Setup	Trainable Parameters
-4 × Single-Domain Models	~94M
-Multi-Domain (Adapters)	28.5M
+---
 
-✅ ~70% parameter reduction compared to training four separate models.
+## 👨‍💻 Authors
+**Shyamsundar Paramasivam**  
+**Yash Singhal**  
+Department of Computer Science & Engineering  
+LNMIIT Jaipur
 
-🔍 Feature Visualization
+---
 
-t-SNE analysis of penultimate-layer features shows clear domain separation, confirming that adapters successfully learn domain-specific representations while preserving a shared feature space.
-
-🧪 Implementation Details
-
-Framework: PyTorch
-
-Backbone: ResNet-50
-
-Input normalization: ImageNet mean & std
-
-Augmentations:
-
-Random horizontal flip
-
-Rotation
-
-Color jitter
-
-🚀 Why This Matters
-
-Scales efficiently to many domains
-
-Suitable for resource-constrained deployment (edge, satellites, drones)
-
-Avoids maintaining multiple heavy models
-
-Strong foundation for continual learning and multi-modal remote sensing
-
-🔮 Future Work
-
-Dynamic or shared adapter selection
-
-Continual learning methods (EWC, LwF)
-
-Adapter fusion for related domains
-
-Extension to multispectral, SAR, or temporal data
-
-Transformer-based backbones with adapters
-
-📚 References
-
-Rebuffi et al., Learning Multiple Visual Domains with Residual Adapters, NeurIPS 2017
-
-Rebuffi et al., Efficient Parametrization of Multi-Domain CNNs, CVPR 2018
-
-EuroSAT, PatternNet, MLRS datasets
+## 📚 References
+- Rebuffi et al., *Learning Multiple Visual Domains with Residual Adapters*, NeurIPS 2017  
+- Rebuffi et al., *Efficient Parametrization of Multi-Domain CNNs*, CVPR 2018  
