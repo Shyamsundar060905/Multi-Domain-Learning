@@ -68,13 +68,13 @@ Learning rate: 1e-3
 
 Weight decay: 1e-4
 
-📈 Results
-Accuracy Comparison
-Dataset	Single-Domain (%)	Multi-Domain (%)
-EuroSAT	97.64	96.83
-PatternNet	99.17	98.95
-MLRS	94.57	94.41
-ADVANCE	93.56	93.24
+| Dataset    | Type                          | Classes |
+| ---------- | ----------------------------- | ------- |
+| EuroSAT    | Sentinel-2 satellite imagery  | 10      |
+| PatternNet | High-resolution aerial scenes | 38      |
+| MLRS       | Mixed aerial & satellite      | 46      |
+| ADVANCE    | Real-world satellite images   | 13      |
+
 
 ➡️ Performance drop < 1%, despite using a single shared model.
 
