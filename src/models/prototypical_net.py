@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from src.utils.helpers import macro_f1_from_indices
 
 class PrototypicalNetwork(nn.Module):
     """
@@ -27,12 +28,14 @@ class PrototypicalNetwork(nn.Module):
         support_embs = embeddings[:num_support]
         query_embs = embeddings[num_support:]
         
+        support_labels = labels[:num_support]
         query_labels = labels[num_support:]
 
         # Reshape support embeddings to (n_way, k_shot, embedding_dim)
         support_embs = support_embs.view(n_way, k_shot, -1)
         
-        # Calculate prototypes (n_way, embedding_dim)
+        support_labels = support_labels.view(n_way, k_shot)
+        prototype_labels = support_labels[:, 0]
         prototypes = support_embs.mean(dim=1)
         
         # Calculate euclidean distances between queries and prototypes
@@ -43,12 +46,18 @@ class PrototypicalNetwork(nn.Module):
         # The true log-probabilities are the negative distances
         log_p_y = F.log_softmax(-dists, dim=1)
         
-        # The target indices for queries matching prototypes
-        target_inds = torch.arange(n_way).repeat_interleave(q_query).to(embeddings.device)
-        
+        label_to_proto_idx = {
+            int(lbl.item()): idx for idx, lbl in enumerate(prototype_labels)
+        }
+        target_inds = torch.tensor(
+            [label_to_proto_idx[int(lbl.item())] for lbl in query_labels],
+            device=embeddings.device,
+            dtype=torch.long
+        )
+
         loss = F.nll_loss(log_p_y, target_inds)
         
         _, y_hat = log_p_y.max(1)
         acc = (y_hat == target_inds).float().mean()
-        
-        return loss, acc
+        f1 = macro_f1_from_indices(target_inds, y_hat, n_way)
+        return loss, acc, f1

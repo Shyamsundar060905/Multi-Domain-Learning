@@ -1,3 +1,17 @@
+import torch
+import random
+import numpy as np
+
+def set_seed(seed=42):
+    """Locks random seeds across core mathematical modules for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
 def count_parameters(model):
     """Prints the total, trainable, and frozen parameters of a model."""
     total = sum(p.numel() for p in model.parameters())
@@ -21,3 +35,40 @@ def domain_parameters(model, domain: str):
     # Note: assuming model is PrototypicalNetwork which wraps backbone
     backbone = getattr(model, 'backbone', model)
     return list(backbone.adapters[domain].parameters())
+
+
+def validate_episode_config(n_way: int, k_shot: int, q_query: int, num_episodes: int) -> None:
+    if n_way <= 1:
+        raise ValueError("n_way must be > 1.")
+    if k_shot <= 0:
+        raise ValueError("k_shot must be > 0.")
+    if q_query <= 0:
+        raise ValueError("q_query must be > 0.")
+    if num_episodes <= 0:
+        raise ValueError("num_episodes must be > 0.")
+
+
+def macro_f1_from_indices(targets: torch.Tensor, preds: torch.Tensor, n_classes: int) -> float:
+    """
+    Lightweight macro-F1 without sklearn dependency.
+    """
+    eps = 1e-12
+    f1_scores = []
+    for cls_idx in range(n_classes):
+        tp = ((preds == cls_idx) & (targets == cls_idx)).sum().item()
+        fp = ((preds == cls_idx) & (targets != cls_idx)).sum().item()
+        fn = ((preds != cls_idx) & (targets == cls_idx)).sum().item()
+
+        precision = tp / (tp + fp + eps)
+        recall = tp / (tp + fn + eps)
+        f1 = 2.0 * precision * recall / (precision + recall + eps)
+        f1_scores.append(f1)
+    return float(np.mean(f1_scores)) if f1_scores else 0.0
+
+
+def to_python_int(x):
+    if isinstance(x, (np.integer,)):
+        return int(x)
+    if torch.is_tensor(x):
+        return int(x.item())
+    return int(x)
