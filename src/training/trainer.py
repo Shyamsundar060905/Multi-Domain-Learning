@@ -14,8 +14,9 @@ class ContinualFewShotTrainer:
         self.schedulers = schedulers
         self.device = device
         self.ewc = EWC(model, ewc_lambda=ewc_lambda)
+        self.amp_device_type = self.device.type
         self.use_amp = device.type == "cuda"
-        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
+        self.scaler = torch.amp.GradScaler(self.amp_device_type, enabled=self.use_amp)
 
     def train_task(self, domain, epochs, n_way, k_shot, q_query):
         """Trains a single domain sequentially, then stores it in EWC."""
@@ -43,7 +44,7 @@ class ContinualFewShotTrainer:
                     labels = labels.to(self.device, non_blocking=True)
                     self.optimizers[domain].zero_grad(set_to_none=True)
 
-                    with torch.amp.autocast(device_type="cuda", enabled=self.use_amp):
+                    with torch.amp.autocast(device_type=self.amp_device_type, enabled=self.use_amp):
                         embeddings = self.model(images, domain)
                         loss, acc, f1 = self.model.compute_loss_and_acc(embeddings, labels, n_way, k_shot, q_query)
                         ewc_loss = self.ewc.penalty(self.model)
