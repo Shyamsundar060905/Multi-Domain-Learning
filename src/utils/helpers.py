@@ -67,8 +67,27 @@ def macro_f1_from_indices(targets: torch.Tensor, preds: torch.Tensor, n_classes:
 
 
 def to_python_int(x):
-    if isinstance(x, (np.integer,)):
+    """
+    Converts different index types to a pure Python int.
+    Handles numpy, torch, lists, etc.
+    """
+    if isinstance(x, int):
+        return x
+
+    if isinstance(x, np.integer):
         return int(x)
-    if torch.is_tensor(x):
-        return int(x.item())
-    return int(x)
+
+    if isinstance(x, torch.Tensor):
+        if x.numel() == 1:
+            return int(x.item())
+        else:
+            return [to_python_int(i) for i in x]
+
+    if isinstance(x, list) or isinstance(x, tuple):
+        return [to_python_int(i) for i in x]
+
+    # fallback (very important)
+    try:
+        return int(x)
+    except Exception:
+        raise TypeError(f"Unsupported index type: {type(x)}")
