@@ -17,8 +17,12 @@ class ApplyTransform(Dataset):
         self.transform = transform
 
     def __getitem__(self, idx):
-        idx = to_python_int(idx)
-        x, y = self.dataset[idx]
+        idx_converted = to_python_int(idx)
+        
+        if isinstance(idx_converted, list):
+            return [self.__getitem__(i) for i in idx_converted]
+            
+        x, y = self.dataset[idx_converted]
         if self.transform:
             x = self.transform(x)
         return x, y

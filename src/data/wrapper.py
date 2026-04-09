@@ -29,18 +29,13 @@ class HFDatasetWrapper(Dataset):
         return len(self.dataset)
 
     def __getitem__(self, idx):
-        # DataLoader workers may pass numpy/torch scalar indices.
-        if torch.is_tensor(idx):
-            idx = idx.item() if idx.numel() == 1 else idx.tolist()
-        if isinstance(idx, np.ndarray):
-            idx = idx.item() if idx.ndim == 0 else idx.tolist()
-        if isinstance(idx, np.generic):
-            idx = idx.item()
-        if isinstance(idx, (list, tuple)):
-            return [self.__getitem__(i) for i in idx]
-        if not isinstance(idx, numbers.Integral):
-            raise TypeError(f"Unsupported dataset index type: {type(idx)}")
-        idx = int(idx)
+        from src.utils.helpers import to_python_int
+        idx_converted = to_python_int(idx)
+        
+        if isinstance(idx_converted, list):
+            return [self.__getitem__(i) for i in idx_converted]
+            
+        idx = idx_converted
 
         # 🔥 Step 2: Get item safely
         item = self.dataset[idx]
