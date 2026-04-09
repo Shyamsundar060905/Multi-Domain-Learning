@@ -1,0 +1,16 @@
+{
+  "mlrs_dir": "./Dataset/MLRSNet",
+  "hf_cache_dir": "./.hf_cache",
+  "hf_max_samples": 2000,
+  "epochs": 3,
+  "lr": 0.001,
+  "num_workers": 2,
+  "seed": 42,
+  "dry_run": false,
+  "skip_mlrs": false,
+  "n_way": 5,
+  "k_shot": 1,
+  "q_query": 5,
+  "num_episodes": 30,
+  "ewc_lambda": 300.0
+}
