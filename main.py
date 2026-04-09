@@ -36,6 +36,7 @@ def build_parser(defaults=None):
     parser.add_argument('--q-query', type=int, default=defaults.get('q_query', 15), help='Number of query samples per class')
     parser.add_argument('--num-episodes', type=int, default=defaults.get('num_episodes', 100), help='Number of episodes per epoch')
     parser.add_argument('--ewc-lambda', type=float, default=defaults.get('ewc_lambda', 1000.0), help='EWC regularization strength')
+    parser.add_argument('--output-dir', type=str, default=defaults.get('output_dir', './checkpoints'), help='Directory to save model checkpoints')
     return parser
 
 
@@ -82,6 +83,7 @@ def main():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.set_float32_matmul_precision("high")
     os.makedirs(args.hf_cache_dir, exist_ok=True)
+    os.makedirs(args.output_dir, exist_ok=True)
     set_seed(args.seed)
     validate_episode_config(args.n_way, args.k_shot, args.q_query, args.num_episodes)
 
@@ -178,7 +180,8 @@ def main():
         optimizers=optimizers,
         schedulers=schedulers,
         device=device,
-        ewc_lambda=args.ewc_lambda
+        ewc_lambda=args.ewc_lambda,
+        output_dir=args.output_dir
     )
 
     print("Starting Continual Training...")
@@ -189,6 +192,10 @@ def main():
             print(f"[Error] Training failed for domain {domain}: {e}")
             continue
         trainer.evaluate_all(args.n_way, args.k_shot, args.q_query)
+
+    final_model_path = os.path.join(args.output_dir, 'final_continual_model.pth')
+    print(f"\nSaving final model to {final_model_path}")
+    torch.save(model.state_dict(), final_model_path)
 
 if __name__ == "__main__":
     main()

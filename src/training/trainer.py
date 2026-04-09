@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 from tqdm import tqdm
@@ -5,7 +6,7 @@ from src.utils.helpers import freeze_domain
 from src.training.ewc import EWC
 
 class ContinualFewShotTrainer:
-    def __init__(self, model, train_loaders, test_loaders, domain_list, optimizers, schedulers, device, ewc_lambda=1000):
+    def __init__(self, model, train_loaders, test_loaders, domain_list, optimizers, schedulers, device, ewc_lambda=1000, output_dir='./checkpoints'):
         self.model = model
         self.train_loaders = train_loaders
         self.test_loaders = test_loaders
@@ -14,6 +15,7 @@ class ContinualFewShotTrainer:
         self.schedulers = schedulers
         self.device = device
         self.ewc = EWC(model, ewc_lambda=ewc_lambda)
+        self.output_dir = output_dir
         self.amp_device_type = self.device.type
         self.use_amp = device.type == "cuda"
         self.scaler = torch.amp.GradScaler(self.amp_device_type, enabled=self.use_amp)
@@ -26,6 +28,7 @@ class ContinualFewShotTrainer:
         loader = self.train_loaders[domain]
         print(f"\n--- Training on domain: {domain} ---")
         
+        best_acc = 0.0
         for epoch in range(epochs):
             self.model.train()
             domain_loss = 0.0
@@ -81,7 +84,13 @@ class ContinualFewShotTrainer:
             )
 
             self.schedulers[domain].step()
-            self.evaluate(domain, n_way, k_shot, q_query)
+            val_acc = self.evaluate(domain, n_way, k_shot, q_query)
+            
+            if val_acc > best_acc:
+                best_acc = val_acc
+                save_path = os.path.join(self.output_dir, f'best_model_{domain}.pth')
+                torch.save(self.model.state_dict(), save_path)
+                print(f" -> Saved new best checkpoint for {domain} (Acc: {val_acc:.2f}%)")
         
         # After training, tell EWC to remember
         print(f"Consolidating weights for {domain}...")
