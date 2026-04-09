@@ -27,7 +27,7 @@ class EWC:
             self.model.zero_grad()
             embeddings = self.model(images, domain)
             
-            loss, _ = self.model.compute_loss_and_acc(embeddings, labels, n_way, k_shot, q_query)
+            loss, _, _ = self.model.compute_loss_and_acc(embeddings, labels, n_way, k_shot, q_query)
             loss.backward()
             
             for n, p in self.model.named_parameters():
