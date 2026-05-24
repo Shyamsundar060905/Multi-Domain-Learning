@@ -2,7 +2,7 @@ import argparse
 import json
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, RandomSampler
 from torchvision.models import resnet50, ResNet50_Weights
 
 from src.data.LEVIR_dataset import LEVIRFewShotDataset
@@ -37,6 +37,13 @@ def build_parser(defaults=None):
     p.add_argument("--bce-weight", type=float, default=defaults.get("bce_weight", 0.3))
     p.add_argument("--positive-only", action="store_true",
                    help="Train only on samples that contain change (recommended).")
+    p.add_argument("--balance-domain-samples", dest="balance_domain_samples",
+                   action="store_true", default=defaults.get("balance_domain_samples", True),
+                   help="Oversample smaller train domains with replacement so every "
+                        "domain yields the same number of batches per epoch.")
+    p.add_argument("--no-balance-domain-samples", dest="balance_domain_samples",
+                   action="store_false",
+                   help="Disable domain oversampling; each loader yields its natural length.")
     p.add_argument("--schedule", type=str,
                    default=defaults.get("schedule", "per_domain_full_epoch"),
                    choices=["round_robin", "sequential", "per_domain_full_epoch"],
@@ -110,7 +117,45 @@ def _make_loaders(args):
     except Exception as e:
         print(f"[Warning] LEVIR loading failed: {e}")
 
+    if args.balance_domain_samples and len(train_loaders) > 1:
+        train_loaders = _balance_domain_samples(train_loaders, args)
+
     return train_loaders, test_loaders
+
+
+def _balance_domain_samples(train_loaders, args):
+    """Oversample smaller train datasets with replacement so every domain
+    contributes the same number of batches per epoch.
+
+    Concretely: ``max_samples = max_d |dataset_d|``; for every smaller domain
+    we replace its DataLoader with one whose ``RandomSampler`` draws
+    ``max_samples`` indices with replacement.  WHU stays as-is and LEVIR is
+    cycled with random repetition until both yield the same batch count per
+    epoch.
+    """
+    sizes = {d: len(ld.dataset) for d, ld in train_loaders.items()}
+    max_samples = max(sizes.values())
+    largest = max(sizes, key=sizes.get)
+    print(f"[balance] target samples/domain/epoch = {max_samples} (largest: {largest})")
+
+    for d, ld in list(train_loaders.items()):
+        if len(ld.dataset) >= max_samples:
+            continue
+        ratio = max_samples / len(ld.dataset)
+        sampler = RandomSampler(
+            ld.dataset, replacement=True, num_samples=max_samples
+        )
+        train_loaders[d] = DataLoader(
+            ld.dataset,
+            batch_size=ld.batch_size,
+            sampler=sampler,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=True,
+        )
+        print(f"[balance] {d}: {sizes[d]} samples -> oversampled to {max_samples} "
+              f"({ratio:.1f}x repetition per epoch)")
+    return train_loaders
 
 
 def main():
