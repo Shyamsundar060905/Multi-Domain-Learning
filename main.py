@@ -119,7 +119,7 @@ def main():
     print("Initializing model...")
     base_model = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
     backbone = ResNetWithAdapters(base_model, domain_list)
-    model = ChangeDetectionModel(backbone).to(device)
+    model = ChangeDetectionModel(backbone, domain_list=domain_list).to(device)
 
     count_parameters(model)
 
