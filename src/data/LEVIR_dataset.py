@@ -27,7 +27,7 @@ class LEVIRFewShotDataset(Dataset):
         q_query: int = 1,
         positive_only: bool = False,
         min_change_pixels: int = 1,
-        image_size: int = 224,
+        image_size: int = 512,
     ):
         self.root = os.path.join(root_dir, split)
         self.k_shot = k_shot

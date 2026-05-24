@@ -40,7 +40,8 @@ class EWC:
             mask = (mask > 0.5).float()
 
             self.model.zero_grad(set_to_none=True)
-            logits = self.model(img1, img2, domain)
+            out = self.model(img1, img2, domain)
+            logits = out[0] if isinstance(out, tuple) else out
 
             pos = mask.sum().clamp(min=1.0)
             neg = (mask.numel() - mask.sum()).clamp(min=1.0)

@@ -21,7 +21,8 @@ def build_parser(defaults=None):
     p.add_argument("--epochs", type=int, default=defaults.get("epochs", 10))
     p.add_argument("--lr", type=float, default=defaults.get("lr", 1e-4))
     p.add_argument("--weight-decay", type=float, default=defaults.get("weight_decay", 1e-4))
-    p.add_argument("--batch-size", type=int, default=defaults.get("batch_size", 8))
+    p.add_argument("--batch-size", type=int, default=defaults.get("batch_size", 4))
+    p.add_argument("--image-size", type=int, default=defaults.get("image_size", 512))
     p.add_argument("--num-workers", type=int, default=defaults.get("num_workers", 4))
     p.add_argument("--seed", type=int, default=defaults.get("seed", 42))
     p.add_argument("--n-way", type=int, default=defaults.get("n_way", 5))
@@ -35,6 +36,13 @@ def build_parser(defaults=None):
     p.add_argument("--focal-gamma", type=float, default=defaults.get("focal_gamma", 2.0))
     p.add_argument("--dice-weight", type=float, default=defaults.get("dice_weight", 0.7))
     p.add_argument("--bce-weight", type=float, default=defaults.get("bce_weight", 0.3))
+    p.add_argument("--deep-supervision-weight", type=float,
+                   default=defaults.get("deep_supervision_weight", 0.4),
+                   help="Weight on the layer3 auxiliary segmentation loss.")
+    p.add_argument("--oversample-cap", type=float,
+                   default=defaults.get("oversample_cap", 4.0),
+                   help="Max oversampling factor for smaller domains (e.g. 4 = "
+                        "LEVIR repeated at most 4x per epoch).")
     p.add_argument("--positive-only", action="store_true",
                    help="Train only on samples that contain change (recommended).")
     p.add_argument("--balance-domain-samples", dest="balance_domain_samples",
@@ -68,8 +76,8 @@ def build_parser(defaults=None):
 
 
 def _make_loaders(args):
-    train_transform = get_train_transform()
-    test_transform = get_test_transform()
+    train_transform = get_train_transform(args.image_size)
+    test_transform = get_test_transform(args.image_size)
     train_loaders, test_loaders = {}, {}
 
     if not args.use_change_datasets:
@@ -80,10 +88,11 @@ def _make_loaders(args):
     try:
         whu_train = WHUDataset(
             root_dir=args.whu_dir, split="train", transform=train_transform,
-            positive_only=args.positive_only,
+            positive_only=args.positive_only, image_size=args.image_size,
         )
         whu_test = WHUDataset(
             root_dir=args.whu_dir, split="test", transform=test_transform,
+            image_size=args.image_size,
         )
         train_loaders["WHU"] = DataLoader(
             whu_train, batch_size=args.batch_size, shuffle=True,
@@ -100,10 +109,11 @@ def _make_loaders(args):
     try:
         levir_train = LEVIRFewShotDataset(
             root_dir=args.levir_dir, split="train", transform=train_transform,
-            positive_only=args.positive_only,
+            positive_only=args.positive_only, image_size=args.image_size,
         )
         levir_test = LEVIRFewShotDataset(
             root_dir=args.levir_dir, split="test", transform=test_transform,
+            image_size=args.image_size,
         )
         train_loaders["LEVIR"] = DataLoader(
             levir_train, batch_size=args.batch_size, shuffle=True,
@@ -124,26 +134,26 @@ def _make_loaders(args):
 
 
 def _balance_domain_samples(train_loaders, args):
-    """Oversample smaller train datasets with replacement so every domain
-    contributes the same number of batches per epoch.
+    """Balance domains to the same sample count per epoch.
 
-    Concretely: ``max_samples = max_d |dataset_d|``; for every smaller domain
-    we replace its DataLoader with one whose ``RandomSampler`` draws
-    ``max_samples`` indices with replacement.  WHU stays as-is and LEVIR is
-    cycled with random repetition until both yield the same batch count per
-    epoch.
+    Target = min(largest_domain, oversample_cap * smallest_domain).
+    Smaller domains are oversampled with replacement; larger domains are
+    randomly subsampled without replacement.  Both yield the same batch count.
     """
     sizes = {d: len(ld.dataset) for d, ld in train_loaders.items()}
     max_samples = max(sizes.values())
-    largest = max(sizes, key=sizes.get)
-    print(f"[balance] target samples/domain/epoch = {max_samples} (largest: {largest})")
+    min_samples = min(sizes.values())
+    target = min(max_samples, int(args.oversample_cap * min_samples))
+    print(f"[balance] target samples/domain/epoch = {target} "
+          f"(cap={args.oversample_cap}x on smallest domain)")
 
     for d, ld in list(train_loaders.items()):
-        if len(ld.dataset) >= max_samples:
+        n = len(ld.dataset)
+        if n == target:
             continue
-        ratio = max_samples / len(ld.dataset)
+        replacement = n < target
         sampler = RandomSampler(
-            ld.dataset, replacement=True, num_samples=max_samples
+            ld.dataset, replacement=replacement, num_samples=target
         )
         train_loaders[d] = DataLoader(
             ld.dataset,
@@ -153,8 +163,10 @@ def _balance_domain_samples(train_loaders, args):
             pin_memory=True,
             drop_last=True,
         )
-        print(f"[balance] {d}: {sizes[d]} samples -> oversampled to {max_samples} "
-              f"({ratio:.1f}x repetition per epoch)")
+        if replacement:
+            print(f"[balance] {d}: {n} -> {target} samples ({target/n:.1f}x oversample)")
+        else:
+            print(f"[balance] {d}: {n} -> {target} samples ({100*target/n:.0f}% subsample)")
     return train_loaders
 
 
@@ -181,10 +193,12 @@ def main():
     if not domain_list:
         raise SystemExit("No domains loaded -- enable --use-change-datasets and check data paths.")
 
+    print(f"Image size: {args.image_size}x{args.image_size}")
     print("Initializing model...")
     base_model = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
     backbone = ResNetWithAdapters(base_model, domain_list)
     model = ChangeDetectionModel(backbone, domain_list=domain_list).to(device)
+    print("Fusion: concat(f1, f2, |f1-f2|)  |  deep supervision on layer3")
 
     count_parameters(model)
 
@@ -203,7 +217,9 @@ def main():
                 continue
             pos_weight_arg[d] = float(v)
     else:
-        pos_weight_arg = args.pos_weight
+        # Sensible defaults tuned for WHU (~13% pos) vs LEVIR (~3% pos).
+        defaults_pw = {"WHU": 7.0, "LEVIR": 45.0}
+        pos_weight_arg = {d: defaults_pw.get(d, args.pos_weight) for d in domain_list}
 
     trainer = ContinualFewShotTrainer(
         model=model,
@@ -218,6 +234,7 @@ def main():
         focal_gamma=args.focal_gamma,
         dice_weight=args.dice_weight,
         bce_weight=args.bce_weight,
+        deep_supervision_weight=args.deep_supervision_weight,
         schedule=args.schedule,
         domain_order=domain_order,
         scheduler_step_size=args.scheduler_step_size,

@@ -73,9 +73,9 @@ class PairedCDTransform:
         return img1, img2, mask
 
 
-def get_train_transform(size: int = 224) -> PairedCDTransform:
+def get_train_transform(size: int = 512) -> PairedCDTransform:
     return PairedCDTransform(size=size, train=True)
 
 
-def get_test_transform(size: int = 224) -> PairedCDTransform:
+def get_test_transform(size: int = 512) -> PairedCDTransform:
     return PairedCDTransform(size=size, train=False)
