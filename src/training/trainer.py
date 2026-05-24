@@ -136,9 +136,11 @@ class ContinualFewShotTrainer:
 
         # Freeze every BatchNorm in the model (running stats + affine).
         # Pretrained backbone BNs are already frozen by the backbone itself,
-        # but per-domain adapter BNs are tiny -- we leave them trainable.
+        # but per-domain adapter BNs + decoder BNs are tiny -- leave them trainable.
+        trainable_bn_prefixes = ("domain_adapters", "decoder_adapters",
+                                  "reduce", "conv1", "conv2")
         for name, m in self.model.named_modules():
-            if isinstance(m, nn.BatchNorm2d) and "domain_adapters" not in name and "head" not in name and "reduce" not in name:
+            if isinstance(m, nn.BatchNorm2d) and not any(t in name for t in trainable_bn_prefixes):
                 m.eval()
                 for p in m.parameters():
                     p.requires_grad = False
@@ -215,8 +217,12 @@ class ContinualFewShotTrainer:
             print("No training loaders available.")
             return
 
-        max_len = max(len(l) for l in self.train_loaders.values())
-        steps_per_epoch = max_len * len(self.train_loaders)
+        # Equal-sample round-robin: each epoch contains ``min_len`` batches per
+        # domain.  WHU is randomly subsampled by the shuffled DataLoader on each
+        # epoch (so over multiple epochs we cycle through all of WHU); LEVIR is
+        # consumed once per epoch.  Total batches/epoch = min_len * num_domains.
+        min_len = min(len(l) for l in self.train_loaders.values())
+        steps_per_epoch = min_len * len(self.train_loaders)
 
         for epoch in range(epochs):
             self.model.train()
