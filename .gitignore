@@ -6,3 +6,12 @@ data/
 *.pth
 *.pt
 __pycache__/
+.ipynb_checkpoints/
+Data/
+__pycache__/
+*.pt
+*.pth
+*.ckpt
+wandb/
+runs/
+

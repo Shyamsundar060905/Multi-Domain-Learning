@@ -1,63 +1,100 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from src.utils.helpers import macro_f1_from_indices
 
 class PrototypicalNetwork(nn.Module):
-    """
-    Prototypical Network wrapper over a backbone embedding model.
-    """
     def __init__(self, backbone):
         super().__init__()
         self.backbone = backbone
 
-    def forward(self, x, domain):
-        # We assume the backbone outputs normalized embeddings
-        embeddings = self.backbone(x, domain)
-        return embeddings
+    # ----------------------------
+    # FEATURE EXTRACTION
+    # ----------------------------
+    def extract_features(self, img, domain):
+        x = self.backbone.stem(img)
+        x = self.backbone.layer1(x)
+        x = self.backbone.layer2(x)
+        x = self.backbone.adapters[domain]['layer3'](x)
+        x = self.backbone.adapters[domain]['layer4'](x)
+        return x   # [B, 2048, H/32, W/32]
 
-    def compute_loss_and_acc(self, embeddings, labels, n_way, k_shot, q_query):
+    # ----------------------------
+    # PROTOTYPE COMPUTATION
+    # ----------------------------
+    def compute_prototype(self, feat, mask):
         """
-        Computes the prototypical loss and accuracy for an episode.
-        Assumes embeddings are structured as:
-         [support_class1... support_classN, query_class1... query_classN]
-        where support has length k_shot and query has length q_query.
+        feat: [B, C, H, W]
+        mask: [B, 1, H, W] (0/1)
         """
-        # Split embeddings into support and query
-        num_support = n_way * k_shot
-        support_embs = embeddings[:num_support]
-        query_embs = embeddings[num_support:]
-        
-        support_labels = labels[:num_support]
-        query_labels = labels[num_support:]
+        masked_feat = feat * mask
+        proto = masked_feat.sum(dim=(0, 2, 3)) / (mask.sum() + 1e-6)
+        return proto  # [C]
 
-        # Reshape support embeddings to (n_way, k_shot, embedding_dim)
-        support_embs = support_embs.view(n_way, k_shot, -1)
-        
-        support_labels = support_labels.view(n_way, k_shot)
-        prototype_labels = support_labels[:, 0]
-        prototypes = support_embs.mean(dim=1)
-        
-        # Calculate euclidean distances between queries and prototypes
-        # query_embs: (n_way * q_query, emb_dim)
-        # prototypes: (n_way, emb_dim)
-        dists = torch.cdist(query_embs, prototypes) # shape: (n_query, n_way)
-        
-        # The true log-probabilities are the negative distances
-        log_p_y = F.log_softmax(-dists, dim=1)
-        
-        label_to_proto_idx = {
-            int(lbl.item()): idx for idx, lbl in enumerate(prototype_labels)
-        }
-        target_inds = torch.tensor(
-            [label_to_proto_idx[int(lbl.item())] for lbl in query_labels],
-            device=embeddings.device,
-            dtype=torch.long
+    # ----------------------------
+    # COSINE SIMILARITY MAP
+    # ----------------------------
+    def cosine_similarity_map(self, feat, prototype):
+        B, C, H, W = feat.shape
+
+        feat_flat = feat.view(B, C, -1)             # [B, C, HW]
+        proto = prototype.view(1, C, 1)             # [1, C, 1]
+
+        sim = F.cosine_similarity(feat_flat, proto, dim=1)
+        sim = sim.view(B, 1, H, W)
+
+        return sim
+
+    # ----------------------------
+    # FORWARD (TRAINING EPISODE)
+    # ----------------------------
+    def forward(
+        self,
+        support_img1, support_img2, support_mask,
+        query_img1, query_img2,
+        domain
+    ):
+        """
+        support_*: [Ns, ...]
+        query_*: [Nq, ...]
+        """
+
+        # ---- SUPPORT ----
+        f1_s = self.extract_features(support_img1, domain)
+        f2_s = self.extract_features(support_img2, domain)
+
+        diff_s = torch.abs(f1_s - f2_s)
+
+        # Resize masks to feature size
+        support_mask = F.interpolate(
+            support_mask, size=diff_s.shape[-2:], mode='nearest'
         )
 
-        loss = F.nll_loss(log_p_y, target_inds)
-        
-        _, y_hat = log_p_y.max(1)
-        acc = (y_hat == target_inds).float().mean()
-        f1 = macro_f1_from_indices(target_inds, y_hat, n_way)
-        return loss, acc, f1
+        # Change prototype
+        change_proto = self.compute_prototype(diff_s, support_mask)
+
+        # No-change prototype
+        no_change_mask = 1 - support_mask
+        no_change_proto = self.compute_prototype(diff_s, no_change_mask)
+
+        # ---- QUERY ----
+        f1_q = self.extract_features(query_img1, domain)
+        f2_q = self.extract_features(query_img2, domain)
+
+        diff_q = torch.abs(f1_q - f2_q)
+
+        # Similarity maps
+        sim_change = self.cosine_similarity_map(diff_q, change_proto)
+        sim_no_change = self.cosine_similarity_map(diff_q, no_change_proto)
+
+        # Stack logits
+        logits = torch.cat([sim_no_change, sim_change], dim=1)
+
+        # Upsample to original resolution
+        logits = F.interpolate(
+            logits,
+            size=query_img1.shape[-2:],
+            mode='bilinear',
+            align_corners=False
+        )
+
+        return logits
