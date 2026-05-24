@@ -124,6 +124,7 @@ class ContinualFewShotTrainer:
         focal_gamma: float = 2.0,
         dice_weight: float = 0.7,
         bce_weight: float = 0.3,
+        deep_supervision_weight: float = 0.4,
         schedule: str = "per_domain_full_epoch",
         domain_order: Iterable[str] | None = None,
         scheduler_step_size: int = 15,
@@ -145,6 +146,7 @@ class ContinualFewShotTrainer:
         self.focal_gamma = focal_gamma
         self.dice_weight = dice_weight
         self.bce_weight = bce_weight
+        self.deep_supervision_weight = deep_supervision_weight
 
         if schedule not in {"round_robin", "sequential", "per_domain_full_epoch"}:
             raise ValueError(
@@ -181,6 +183,7 @@ class ContinualFewShotTrainer:
         self._lock_backbone_bn()
 
         print(f"Per-domain pos_weight: {self.pos_weight}")
+        print(f"Deep supervision weight: {self.deep_supervision_weight}")
         print(f"Domain order:          {self.domain_order}")
         print(f"Schedule:              {self.schedule}")
         self._log_trainable()
@@ -224,7 +227,7 @@ class ContinualFewShotTrainer:
         opt = self.optimizers[domain]
         opt.zero_grad(set_to_none=True)
 
-        logits = self.model(img1, img2, domain)
+        logits, aux_logits = self.model(img1, img2, domain)
         loss = change_detection_loss(
             logits, mask,
             pos_weight=self.pos_weight[domain],
@@ -232,6 +235,15 @@ class ContinualFewShotTrainer:
             dice_weight=self.dice_weight,
             bce_weight=self.bce_weight,
         )
+        if aux_logits is not None:
+            aux_loss = change_detection_loss(
+                aux_logits, mask,
+                pos_weight=self.pos_weight[domain],
+                gamma=self.focal_gamma,
+                dice_weight=self.dice_weight,
+                bce_weight=self.bce_weight,
+            )
+            loss = loss + self.deep_supervision_weight * aux_loss
         ewc_loss = self.ewc.penalty(self.model)
         total = loss + ewc_loss
 
@@ -360,7 +372,7 @@ class ContinualFewShotTrainer:
                     mask = mask.unsqueeze(0).unsqueeze(0)
                 mask = (mask > 0.5).float()
 
-                logits = self.model(img1, img2, domain)
+                logits, _ = self.model(img1, img2, domain)
                 acc, dice, iou = _segmentation_metrics(logits, mask)
                 total_acc += acc.item()
                 total_dice += dice.item()
