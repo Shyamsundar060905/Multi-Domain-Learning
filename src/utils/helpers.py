@@ -34,28 +34,55 @@ def count_parameters(model) -> None:
 
 
 def freeze_domain(model, current_domain: str) -> None:
-    """Mask gradient flow so only ``current_domain``'s adapters update.
+    """Notebook-style domain isolation.
 
-    NOTE: this does NOT touch the backbone -- the backbone is frozen at model
-    construction time and must stay frozen.  It also leaves the segmentation
-    head trainable.  Only the per-domain ``domain_adapters`` module is touched.
+    Turn ``requires_grad`` on for ALL of ``current_domain``'s trainable
+    surfaces (its backbone adapters + its full decoder) and off for every
+    other domain.  The shared frozen backbone (stem, layer1..4 conv weights)
+    is left alone -- those parameters were frozen at construction time and
+    never become trainable.
+
+    Designed to be called once at the top of each domain's training block in
+    the outer loop, exactly as the notebook does.
     """
     backbone = getattr(model, "backbone", model)
-    if not hasattr(backbone, "domain_adapters"):
-        return
+    backbone_adapters = getattr(backbone, "domain_adapters", None)
+    decoders = getattr(model, "decoders", None)
 
-    for domain_name, module in backbone.domain_adapters.items():
-        flag = (domain_name == current_domain)
-        for p in module.parameters():
-            p.requires_grad = flag
+    if backbone_adapters is not None:
+        for d, module in backbone_adapters.items():
+            flag = (d == current_domain)
+            for p in module.parameters():
+                p.requires_grad = flag
+
+    if decoders is not None:
+        for d, module in decoders.items():
+            flag = (d == current_domain)
+            for p in module.parameters():
+                p.requires_grad = flag
 
 
 def domain_parameters(model, domain: str) -> list:
-    """Return the trainable parameters owned by a specific domain's adapters."""
+    """Return the trainable parameters owned by a specific domain.
+
+    Includes the per-domain backbone adapters (from ``ResNetWithAdapters``)
+    plus the per-domain decoder (from ``ChangeDetectionModel``).  Pass this
+    list directly to a ``torch.optim`` constructor for notebook-style
+    per-domain optimisers.
+    """
+    if hasattr(model, "domain_parameters"):
+        return model.domain_parameters(domain)
+
+    params: list = []
     backbone = getattr(model, "backbone", model)
-    if not hasattr(backbone, "domain_adapters") or domain not in backbone.domain_adapters:
-        return []
-    return list(backbone.domain_adapters[domain].parameters())
+    adapters = getattr(backbone, "domain_adapters", None)
+    if adapters is not None and domain in adapters:
+        params += list(adapters[domain].parameters())
+
+    decoders = getattr(model, "decoders", None)
+    if decoders is not None and domain in decoders:
+        params += list(decoders[domain].parameters())
+    return params
 
 
 def to_python_int(x):

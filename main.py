@@ -37,10 +37,19 @@ def build_parser(defaults=None):
     p.add_argument("--bce-weight", type=float, default=defaults.get("bce_weight", 0.3))
     p.add_argument("--positive-only", action="store_true",
                    help="Train only on samples that contain change (recommended).")
-    p.add_argument("--schedule", type=str, default=defaults.get("schedule", "sequential"),
-                   choices=["round_robin", "sequential"],
-                   help="round_robin: alternate WHU/LEVIR every batch. "
-                        "sequential: all batches of the first domain then all of the next.")
+    p.add_argument("--schedule", type=str,
+                   default=defaults.get("schedule", "per_domain_full_epoch"),
+                   choices=["round_robin", "sequential", "per_domain_full_epoch"],
+                   help="round_robin: alternate domains every batch. "
+                        "sequential: min_len batches of first then second domain per outer epoch. "
+                        "per_domain_full_epoch: full inner epoch of each domain per outer epoch "
+                        "(notebook style; recommended with per-domain optimisers).")
+    p.add_argument("--scheduler-step-size", type=int,
+                   default=defaults.get("scheduler_step_size", 15),
+                   help="Step-LR step size (epochs) for the per-domain schedulers.")
+    p.add_argument("--scheduler-gamma", type=float,
+                   default=defaults.get("scheduler_gamma", 0.1),
+                   help="Step-LR gamma for the per-domain schedulers.")
     p.add_argument("--domain-order", type=str, nargs="+",
                    default=defaults.get("domain_order", ["LEVIR", "WHU"]),
                    help="Order in which domains are trained (sequential mode) "
@@ -166,6 +175,8 @@ def main():
         bce_weight=args.bce_weight,
         schedule=args.schedule,
         domain_order=domain_order,
+        scheduler_step_size=args.scheduler_step_size,
+        scheduler_gamma=args.scheduler_gamma,
     )
 
     print("Starting training...")
