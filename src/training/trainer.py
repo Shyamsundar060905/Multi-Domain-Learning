@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from itertools import cycle
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Mapping, Union
 
 import torch
 import torch.nn as nn
@@ -12,6 +12,9 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from src.training.ewc import EWC
+
+
+PosWeightLike = Union[float, Mapping[str, float]]
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +129,7 @@ class ContinualFewShotTrainer:
         lr: float = 1e-4,
         weight_decay: float = 1e-4,
         ewc_lambda: float = 1e4,
-        pos_weight: float = 20.0,
+        pos_weight: PosWeightLike = 20.0,
         focal_gamma: float = 2.0,
         dice_weight: float = 0.7,
         bce_weight: float = 0.3,
@@ -139,7 +142,15 @@ class ContinualFewShotTrainer:
         self.domain_list = list(domain_list)
         self.device = device
 
-        self.pos_weight = pos_weight
+        # ``pos_weight`` may be a single float (applied to every domain) or a
+        # mapping ``{domain_name: weight}`` for per-domain class balancing.
+        if isinstance(pos_weight, Mapping):
+            self.pos_weight: Dict[str, float] = {
+                d: float(pos_weight.get(d, 1.0)) for d in self.domain_list
+            }
+        else:
+            self.pos_weight = {d: float(pos_weight) for d in self.domain_list}
+
         self.focal_gamma = focal_gamma
         self.dice_weight = dice_weight
         self.bce_weight = bce_weight
@@ -181,6 +192,7 @@ class ContinualFewShotTrainer:
                 for p in m.parameters():
                     p.requires_grad = False
 
+        print(f"Per-domain pos_weight: {self.pos_weight}")
         self._log_trainable()
 
     # ------------------------------------------------------------------
@@ -225,7 +237,7 @@ class ContinualFewShotTrainer:
 
         loss = change_detection_loss(
             logits, mask,
-            pos_weight=self.pos_weight,
+            pos_weight=self.pos_weight[domain],
             gamma=self.focal_gamma,
             dice_weight=self.dice_weight,
             bce_weight=self.bce_weight,
