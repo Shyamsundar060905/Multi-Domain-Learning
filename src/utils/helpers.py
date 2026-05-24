@@ -1,9 +1,15 @@
-import torch
-import random
-import numpy as np
+"""Shared utility helpers."""
 
-def set_seed(seed=42):
-    """Locks random seeds across core mathematical modules for reproducibility."""
+from __future__ import annotations
+
+import random
+from typing import Iterable
+
+import numpy as np
+import torch
+
+
+def set_seed(seed: int = 42) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -12,11 +18,12 @@ def set_seed(seed=42):
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
-def has_change(mask, threshold=0.01):
-    return (mask.sum() / mask.numel()) > threshold
 
-def count_parameters(model):
-    """Prints the total, trainable, and frozen parameters of a model."""
+def has_change(mask: torch.Tensor, threshold: float = 0.01) -> bool:
+    return float(mask.sum().item()) / max(int(mask.numel()), 1) > threshold
+
+
+def count_parameters(model) -> None:
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     frozen = total - trainable
@@ -25,55 +32,44 @@ def count_parameters(model):
     print(f"Trainable parameters: {trainable:,}")
     print(f"Frozen parameters:    {frozen:,}")
 
-def freeze_domain(model, current_domain: str):
-    backbone = getattr(model, 'backbone', model)
 
-    for name, param in backbone.named_parameters():
-        # Train current domain adapters
-        if f"adapters.{current_domain}" in name:
-            param.requires_grad = True
+def freeze_domain(model, current_domain: str) -> None:
+    """Mask gradient flow so only ``current_domain``'s adapters update.
 
-        # Freeze other domain adapters
-        elif "adapters" in name:
-            param.requires_grad = False
+    NOTE: this does NOT touch the backbone -- the backbone is frozen at model
+    construction time and must stay frozen.  It also leaves the segmentation
+    head trainable.  Only the per-domain ``domain_adapters`` module is touched.
+    """
+    backbone = getattr(model, "backbone", model)
+    if not hasattr(backbone, "domain_adapters"):
+        return
 
-        # Keep shared layers trainable (IMPORTANT)
-        else:
-            param.requires_grad = True
-    
-
-def domain_parameters(model, domain: str):
-    """Returns the parameters that are specific to the given domain."""
-    # Note: assuming model is PrototypicalNetwork which wraps backbone
-    backbone = getattr(model, 'backbone', model)
-    return list(backbone.adapters[domain].parameters())
+    for domain_name, module in backbone.domain_adapters.items():
+        flag = (domain_name == current_domain)
+        for p in module.parameters():
+            p.requires_grad = flag
 
 
-
+def domain_parameters(model, domain: str) -> list:
+    """Return the trainable parameters owned by a specific domain's adapters."""
+    backbone = getattr(model, "backbone", model)
+    if not hasattr(backbone, "domain_adapters") or domain not in backbone.domain_adapters:
+        return []
+    return list(backbone.domain_adapters[domain].parameters())
 
 
 def to_python_int(x):
-    """
-    Converts different index types to a pure Python int.
-    Handles numpy, torch, lists, etc.
-    """
     if isinstance(x, int):
         return x
-
     if isinstance(x, np.integer):
         return int(x)
-
     if isinstance(x, torch.Tensor):
         if x.numel() == 1:
             return int(x.item())
-        else:
-            return [to_python_int(i) for i in x]
-
-    if isinstance(x, list) or isinstance(x, tuple):
         return [to_python_int(i) for i in x]
-
-    # fallback (very important)
+    if isinstance(x, (list, tuple)):
+        return [to_python_int(i) for i in x]
     try:
         return int(x)
-    except Exception:
-        raise TypeError(f"Unsupported index type: {type(x)}")
+    except Exception as e:
+        raise TypeError(f"Unsupported index type: {type(x)}") from e
