@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from itertools import cycle
 from typing import Dict, Iterable, List
 
@@ -166,11 +167,16 @@ class ContinualFewShotTrainer:
 
         # Freeze every BatchNorm in the model (running stats + affine).
         # Pretrained backbone BNs are already frozen by the backbone itself,
-        # but per-domain adapter BNs + decoder BNs are tiny -- leave them trainable.
-        trainable_bn_prefixes = ("domain_adapters", "decoder_adapters",
-                                  "reduce", "conv1", "conv2")
+        # but per-domain adapter BNs, per-domain decoder BNs (DomainBN), and
+        # the small decoder BNs are tiny -- leave them trainable.
+        trainable_bn_keywords = (
+            "domain_adapters",     # backbone per-domain adapters
+            "decoder_adapters",    # decoder per-domain adapters
+            "reduce", "conv1", "conv2",  # shared decoder convs + their per-domain BN
+            "bns",                 # DomainBN.bns.<domain>
+        )
         for name, m in self.model.named_modules():
-            if isinstance(m, nn.BatchNorm2d) and not any(t in name for t in trainable_bn_prefixes):
+            if isinstance(m, nn.BatchNorm2d) and not any(t in name for t in trainable_bn_keywords):
                 m.eval()
                 for p in m.parameters():
                     p.requires_grad = False
@@ -259,18 +265,21 @@ class ContinualFewShotTrainer:
             f"batches/domain/epoch: {batches_per_domain}  |  total steps/epoch: {steps_per_epoch}"
         )
 
-        # Cosine schedule across the full run with a short linear warmup so the
-        # adapters don't get hit with the full LR on the very first step.
+        # Closed-form warmup + cosine in a single LambdaLR.  Equivalent to
+        # SequentialLR([LinearLR, CosineAnnealingLR]) but without the
+        # `epoch=...` deprecation warning that SequentialLR triggers.
         warmup_epochs = max(1, min(5, epochs // 10))
-        warmup = torch.optim.lr_scheduler.LinearLR(
-            self.optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs
-        )
-        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=max(1, epochs - warmup_epochs), eta_min=self._base_lr * 0.01
-        )
-        self.scheduler = torch.optim.lr_scheduler.SequentialLR(
-            self.optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs]
-        )
+        cosine_epochs = max(1, epochs - warmup_epochs)
+        min_factor = 0.01
+
+        def _lr_lambda(epoch: int) -> float:
+            if epoch < warmup_epochs:
+                return 0.1 + 0.9 * (epoch / max(1, warmup_epochs))
+            progress = (epoch - warmup_epochs) / cosine_epochs
+            cosine = 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
+            return min_factor + (1.0 - min_factor) * cosine
+
+        self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, _lr_lambda)
 
         for epoch in range(epochs):
             self.model.train()
