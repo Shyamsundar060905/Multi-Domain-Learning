@@ -28,7 +28,10 @@ def build_parser(defaults=None):
     p.add_argument("--k-shot", type=int, default=defaults.get("k_shot", 1))
     p.add_argument("--q-query", type=int, default=defaults.get("q_query", 15))
     p.add_argument("--ewc-lambda", type=float, default=defaults.get("ewc_lambda", 1000.0))
-    p.add_argument("--pos-weight", type=float, default=defaults.get("pos_weight", 20.0))
+    p.add_argument("--pos-weight", type=float, default=defaults.get("pos_weight", 20.0),
+                   help="Global pos_weight; overridden by --pos-weight-per-domain if set.")
+    p.add_argument("--pos-weight-per-domain", type=str, nargs="*", default=None,
+                   help="Per-domain pos_weight overrides, e.g. WHU=7 LEVIR=28.")
     p.add_argument("--focal-gamma", type=float, default=defaults.get("focal_gamma", 2.0))
     p.add_argument("--dice-weight", type=float, default=defaults.get("dice_weight", 0.7))
     p.add_argument("--bce-weight", type=float, default=defaults.get("bce_weight", 0.3))
@@ -135,6 +138,19 @@ def main():
     if not domain_order:
         domain_order = domain_list
 
+    if args.pos_weight_per_domain:
+        pos_weight_arg = {d: args.pos_weight for d in domain_list}
+        for kv in args.pos_weight_per_domain:
+            if "=" not in kv:
+                raise SystemExit(f"--pos-weight-per-domain expects DOMAIN=VALUE, got {kv!r}")
+            d, v = kv.split("=", 1)
+            if d not in domain_list:
+                print(f"[warn] --pos-weight-per-domain entry {kv!r} references unknown domain; ignored.")
+                continue
+            pos_weight_arg[d] = float(v)
+    else:
+        pos_weight_arg = args.pos_weight
+
     trainer = ContinualFewShotTrainer(
         model=model,
         train_loaders=train_loaders,
@@ -144,7 +160,7 @@ def main():
         lr=args.lr,
         weight_decay=args.weight_decay,
         ewc_lambda=args.ewc_lambda,
-        pos_weight=args.pos_weight,
+        pos_weight=pos_weight_arg,
         focal_gamma=args.focal_gamma,
         dice_weight=args.dice_weight,
         bce_weight=args.bce_weight,
