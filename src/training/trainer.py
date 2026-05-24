@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from itertools import cycle
-from typing import Dict, Iterable
+from typing import Dict, Iterable, List
 
 import torch
 import torch.nn as nn
@@ -62,17 +62,34 @@ def change_detection_loss(
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_round_robin(loaders: Dict[str, torch.utils.data.DataLoader], steps: int):
+def _make_round_robin(
+    loaders: Dict[str, torch.utils.data.DataLoader],
+    steps: int,
+    domain_order: List[str],
+):
     """Yield ``steps`` (domain, batch) tuples balanced equally across domains.
 
-    Each domain contributes the same number of batches; the smaller loader is
-    cycled to keep parity with the larger one.
+    Each domain contributes the same number of batches; smaller loaders are
+    cycled so every domain reaches ``steps / num_domains`` batches per epoch.
     """
-    iterators = {d: cycle(loader) for d, loader in loaders.items()}
-    domains = list(loaders.keys())
+    iterators = {d: cycle(loaders[d]) for d in domain_order}
     for i in range(steps):
-        d = domains[i % len(domains)]
+        d = domain_order[i % len(domain_order)]
         yield d, next(iterators[d])
+
+
+def _make_sequential(
+    loaders: Dict[str, torch.utils.data.DataLoader],
+    batches_per_domain: int,
+    domain_order: List[str],
+):
+    """Sequential schedule: yield ALL ``batches_per_domain`` batches of one
+    domain before moving on to the next, in ``domain_order``.
+    """
+    for d in domain_order:
+        it = cycle(loaders[d])
+        for _ in range(batches_per_domain):
+            yield d, next(it)
 
 
 def _segmentation_metrics(logits: torch.Tensor, target: torch.Tensor):
@@ -112,6 +129,8 @@ class ContinualFewShotTrainer:
         focal_gamma: float = 2.0,
         dice_weight: float = 0.7,
         bce_weight: float = 0.3,
+        schedule: str = "round_robin",
+        domain_order: Iterable[str] | None = None,
     ):
         self.model = model
         self.train_loaders = train_loaders
@@ -124,13 +143,24 @@ class ContinualFewShotTrainer:
         self.dice_weight = dice_weight
         self.bce_weight = bce_weight
 
+        if schedule not in {"round_robin", "sequential"}:
+            raise ValueError(f"schedule must be 'round_robin' or 'sequential', got {schedule!r}")
+        self.schedule = schedule
+
+        if domain_order is None:
+            self.domain_order = self.domain_list
+        else:
+            self.domain_order = list(domain_order)
+            unknown = set(self.domain_order) - set(self.train_loaders)
+            if unknown:
+                raise ValueError(f"domain_order contains unknown domains: {unknown}")
+
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         self.optimizer = torch.optim.AdamW(
             trainable_params, lr=lr, weight_decay=weight_decay
         )
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=max(1, len(self.train_loaders)) * 10
-        )
+        self._base_lr = lr
+        self.scheduler = None  # built lazily in ``train_joint`` once total epochs is known
 
         self.ewc = EWC(model, ewc_lambda=ewc_lambda)
 
@@ -217,19 +247,43 @@ class ContinualFewShotTrainer:
             print("No training loaders available.")
             return
 
-        # Equal-sample round-robin: each epoch contains ``min_len`` batches per
-        # domain.  WHU is randomly subsampled by the shuffled DataLoader on each
-        # epoch (so over multiple epochs we cycle through all of WHU); LEVIR is
-        # consumed once per epoch.  Total batches/epoch = min_len * num_domains.
-        min_len = min(len(l) for l in self.train_loaders.values())
-        steps_per_epoch = min_len * len(self.train_loaders)
+        # Equal-sample schedule: every domain contributes ``batches_per_domain``
+        # batches per epoch.  The shuffled DataLoader cycles through the larger
+        # WHU pool over multiple epochs; the smaller LEVIR pool is consumed
+        # ~once per epoch.
+        batches_per_domain = min(len(l) for l in self.train_loaders.values())
+        steps_per_epoch = batches_per_domain * len(self.train_loaders)
+
+        print(
+            f"Schedule: {self.schedule}  |  order: {self.domain_order}  |  "
+            f"batches/domain/epoch: {batches_per_domain}  |  total steps/epoch: {steps_per_epoch}"
+        )
+
+        # Cosine schedule across the full run with a short linear warmup so the
+        # adapters don't get hit with the full LR on the very first step.
+        warmup_epochs = max(1, min(5, epochs // 10))
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            self.optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs
+        )
+        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=max(1, epochs - warmup_epochs), eta_min=self._base_lr * 0.01
+        )
+        self.scheduler = torch.optim.lr_scheduler.SequentialLR(
+            self.optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs]
+        )
 
         for epoch in range(epochs):
             self.model.train()
+
+            if self.schedule == "round_robin":
+                stream = _make_round_robin(self.train_loaders, steps_per_epoch, self.domain_order)
+            else:
+                stream = _make_sequential(self.train_loaders, batches_per_domain, self.domain_order)
+
             pbar = tqdm(
-                _make_round_robin(self.train_loaders, steps_per_epoch),
+                stream,
                 total=steps_per_epoch,
-                desc=f"[Joint] Epoch {epoch+1}/{epochs}",
+                desc=f"[{self.schedule}] Epoch {epoch+1}/{epochs}",
             )
 
             running = {d: [0.0, 0.0, 0] for d in self.domain_list}
@@ -247,9 +301,10 @@ class ContinualFewShotTrainer:
                 })
 
             self.scheduler.step()
+            current_lr = self.optimizer.param_groups[0]["lr"]
             for d, (lsum, dsum, n) in running.items():
                 if n:
-                    print(f"  [{d}] epoch {epoch+1}: loss={lsum/n:.4f}  dice={dsum/n:.4f}")
+                    print(f"  [{d}] epoch {epoch+1}: loss={lsum/n:.4f}  dice={dsum/n:.4f}  lr={current_lr:.2e}")
 
         print("\nConsolidating weights for all domains (EWC)...")
         for domain in self.domain_list:

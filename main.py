@@ -34,6 +34,14 @@ def build_parser(defaults=None):
     p.add_argument("--bce-weight", type=float, default=defaults.get("bce_weight", 0.3))
     p.add_argument("--positive-only", action="store_true",
                    help="Train only on samples that contain change (recommended).")
+    p.add_argument("--schedule", type=str, default=defaults.get("schedule", "sequential"),
+                   choices=["round_robin", "sequential"],
+                   help="round_robin: alternate WHU/LEVIR every batch. "
+                        "sequential: all batches of the first domain then all of the next.")
+    p.add_argument("--domain-order", type=str, nargs="+",
+                   default=defaults.get("domain_order", ["LEVIR", "WHU"]),
+                   help="Order in which domains are trained (sequential mode) "
+                        "or rotated (round_robin mode).")
     p.add_argument("--whu-dir", type=str, default="./Data/WHU")
     p.add_argument("--levir-dir", type=str, default="./Data/LEVIR CD")
     p.add_argument("--use-change-datasets", action="store_true")
@@ -123,6 +131,10 @@ def main():
 
     count_parameters(model)
 
+    domain_order = [d for d in args.domain_order if d in train_loaders]
+    if not domain_order:
+        domain_order = domain_list
+
     trainer = ContinualFewShotTrainer(
         model=model,
         train_loaders=train_loaders,
@@ -136,6 +148,8 @@ def main():
         focal_gamma=args.focal_gamma,
         dice_weight=args.dice_weight,
         bce_weight=args.bce_weight,
+        schedule=args.schedule,
+        domain_order=domain_order,
     )
 
     print("Starting training...")
