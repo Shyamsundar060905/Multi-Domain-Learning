@@ -29,6 +29,8 @@ def build_parser(defaults=None):
     p.add_argument("--k-shot", type=int, default=defaults.get("k_shot", 1))
     p.add_argument("--q-query", type=int, default=defaults.get("q_query", 15))
     p.add_argument("--ewc-lambda", type=float, default=defaults.get("ewc_lambda", 1000.0))
+    p.add_argument("--skip-ewc", action="store_true",
+                   help="Skip post-training EWC Fisher consolidation (safe for joint training).")
     p.add_argument("--pos-weight", type=float, default=defaults.get("pos_weight", 20.0),
                    help="Global pos_weight; overridden by --pos-weight-per-domain if set.")
     p.add_argument("--pos-weight-per-domain", type=str, nargs="*", default=None,
@@ -239,11 +241,14 @@ def main():
         domain_order=domain_order,
         scheduler_step_size=args.scheduler_step_size,
         scheduler_gamma=args.scheduler_gamma,
+        skip_ewc=args.skip_ewc,
     )
 
     print("Starting training...")
-    trainer.train_joint(args.epochs)
-    trainer.evaluate_all()
+    try:
+        trainer.train_joint(args.epochs)
+    finally:
+        trainer.evaluate_all()
 
 
 if __name__ == "__main__":

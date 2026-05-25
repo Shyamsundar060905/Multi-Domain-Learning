@@ -129,6 +129,7 @@ class ContinualFewShotTrainer:
         domain_order: Iterable[str] | None = None,
         scheduler_step_size: int = 15,
         scheduler_gamma: float = 0.1,
+        skip_ewc: bool = False,
     ):
         self.model = model
         self.train_loaders = train_loaders
@@ -153,6 +154,7 @@ class ContinualFewShotTrainer:
                 "schedule must be one of round_robin, sequential, per_domain_full_epoch"
             )
         self.schedule = schedule
+        self.skip_ewc = skip_ewc
 
         if domain_order is None:
             self.domain_order = list(self.domain_list)
@@ -344,10 +346,18 @@ class ContinualFewShotTrainer:
             for d in self.domain_list:
                 self.schedulers[d].step()
 
-        print("\nConsolidating weights for all domains (EWC)...")
-        for domain in self.domain_list:
-            if domain in self.train_loaders:
-                self.ewc.remember_task(domain, self.train_loaders[domain], self.device)
+        if self.skip_ewc:
+            print("\nSkipping EWC consolidation (--skip-ewc).")
+        else:
+            print("\nConsolidating weights for all domains (EWC)...")
+            try:
+                for domain in self.domain_list:
+                    if domain in self.train_loaders:
+                        self.ewc.remember_task(domain, self.train_loaders[domain], self.device)
+                print("EWC consolidation complete.")
+            except Exception as exc:
+                print(f"[Warning] EWC consolidation failed: {exc}")
+                print("Training weights are kept; continuing to evaluation.")
 
     # ------------------------------------------------------------------
     def evaluate(self, domain: str, *_):

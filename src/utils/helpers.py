@@ -33,43 +33,8 @@ def count_parameters(model) -> None:
     print(f"Frozen parameters:    {frozen:,}")
 
 
-def freeze_domain(model, current_domain: str) -> None:
-    """Notebook-style domain isolation.
-
-    Turn ``requires_grad`` on for ALL of ``current_domain``'s trainable
-    surfaces (its backbone adapters + its full decoder) and off for every
-    other domain.  The shared frozen backbone (stem, layer1..4 conv weights)
-    is left alone -- those parameters were frozen at construction time and
-    never become trainable.
-
-    Designed to be called once at the top of each domain's training block in
-    the outer loop, exactly as the notebook does.
-    """
-    backbone = getattr(model, "backbone", model)
-    backbone_adapters = getattr(backbone, "domain_adapters", None)
-    decoders = getattr(model, "decoders", None)
-
-    if backbone_adapters is not None:
-        for d, module in backbone_adapters.items():
-            flag = (d == current_domain)
-            for p in module.parameters():
-                p.requires_grad = flag
-
-    if decoders is not None:
-        for d, module in decoders.items():
-            flag = (d == current_domain)
-            for p in module.parameters():
-                p.requires_grad = flag
-
-
 def domain_parameters(model, domain: str) -> list:
-    """Return the trainable parameters owned by a specific domain.
-
-    Includes the per-domain backbone adapters (from ``ResNetWithAdapters``)
-    plus the per-domain decoder (from ``ChangeDetectionModel``).  Pass this
-    list directly to a ``torch.optim`` constructor for notebook-style
-    per-domain optimisers.
-    """
+    """Return parameters owned by a domain (adapters + main + aux decoder)."""
     if hasattr(model, "domain_parameters"):
         return model.domain_parameters(domain)
 
@@ -82,7 +47,24 @@ def domain_parameters(model, domain: str) -> list:
     decoders = getattr(model, "decoders", None)
     if decoders is not None and domain in decoders:
         params += list(decoders[domain].parameters())
+
+    aux_decoders = getattr(model, "aux_decoders", None)
+    if aux_decoders is not None and domain in aux_decoders:
+        params += list(aux_decoders[domain].parameters())
     return params
+
+
+def freeze_domain(model, current_domain: str) -> None:
+    """Enable gradients only for ``current_domain``'s adapters + decoders."""
+    domains = getattr(model, "domain_list", None)
+    if domains is None:
+        backbone = getattr(model, "backbone", model)
+        domains = getattr(backbone, "domain_list", [])
+
+    for d in domains:
+        flag = d == current_domain
+        for p in domain_parameters(model, d):
+            p.requires_grad = flag
 
 
 def to_python_int(x):
