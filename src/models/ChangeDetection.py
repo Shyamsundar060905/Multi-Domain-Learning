@@ -17,8 +17,13 @@ def build_bitemporal_fusion(f1: torch.Tensor, f2: torch.Tensor) -> torch.Tensor:
     return torch.cat([f1, f2, torch.abs(f1 - f2)], dim=1)
 
 
-# Fused skip channels = 3 × native stage width.
-FUSED_CHANNELS = {k: 3 * v for k, v in STAGE_CHANNELS.items()}
+# Fused skip channels = 3 × native stage width (keys match ``extract_multiscale``).
+FUSED_CHANNELS = {
+    "l1": 3 * STAGE_CHANNELS["layer1"],
+    "l2": 3 * STAGE_CHANNELS["layer2"],
+    "l3": 3 * STAGE_CHANNELS["layer3"],
+    "l4": 3 * STAGE_CHANNELS["layer4"],
+}
 
 
 class FrozenConvBlock(nn.Module):
