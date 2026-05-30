@@ -200,7 +200,9 @@ def main():
     base_model = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
     backbone = ResNetWithAdapters(base_model, domain_list)
     model = ChangeDetectionModel(backbone, domain_list=domain_list).to(device)
-    print("Fusion: concat(f1, f2, |f1-f2|)  |  deep supervision on layer3")
+    print("Architecture: U-Net encoder (frozen ResNet50 + domain adapters, all 4 stages)")
+    print("              + U-Net decoder (upsample + skip merge + frozen conv + domain adapters)")
+    print("Fusion: concat(f1, f2, |f1-f2|) at each scale  |  deep sup on 1st decoder up-stage")
 
     count_parameters(model)
 

@@ -44,13 +44,9 @@ def domain_parameters(model, domain: str) -> list:
     if adapters is not None and domain in adapters:
         params += list(adapters[domain].parameters())
 
-    decoders = getattr(model, "decoders", None)
-    if decoders is not None and domain in decoders:
-        params += list(decoders[domain].parameters())
-
-    aux_decoders = getattr(model, "aux_decoders", None)
-    if aux_decoders is not None and domain in aux_decoders:
-        params += list(aux_decoders[domain].parameters())
+    dec = getattr(model, "decoder", None)
+    if dec is not None and hasattr(dec, "domain_parameters"):
+        params += dec.domain_parameters(domain)
     return params
 
 
