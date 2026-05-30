@@ -1,80 +1,169 @@
-"""Per-domain change-detection model with concat fusion + deep supervision."""
+"""U-Net change-detection head: frozen shared decoder blocks + per-domain adapters."""
 
 from __future__ import annotations
 
 import math
-from typing import Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.models.adapter_resnet import ResidualAdapter, STAGE_CHANNELS
+
 
 def build_bitemporal_fusion(f1: torch.Tensor, f2: torch.Tensor) -> torch.Tensor:
-    """Concatenate both time steps and their absolute difference."""
+    """Concatenate both time steps and their absolute difference (3× channels)."""
     return torch.cat([f1, f2, torch.abs(f1 - f2)], dim=1)
 
 
-class CDDecoder(nn.Module):
-    """Main decoder on layer4 fusion (3 * in_channels)."""
+# Fused skip channels = 3 × native stage width.
+FUSED_CHANNELS = {k: 3 * v for k, v in STAGE_CHANNELS.items()}
 
-    def __init__(self, in_channels: int, prior: float = 0.02):
+
+class FrozenConvBlock(nn.Module):
+    """Conv-BN-ReLU block with frozen weights (shared decoder trunk)."""
+
+    def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3, padding: int = 1):
         super().__init__()
-        self.reduce = nn.Sequential(
-            nn.Conv2d(in_channels, 256, kernel_size=1, bias=False),
-            nn.BatchNorm2d(256),
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=kernel_size, padding=padding, bias=False),
+            nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
         )
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(256, 128, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-        )
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(128, 64, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-        )
-        self.classifier = nn.Conv2d(64, 1, kernel_size=1)
-        self._init_classifier(prior)
-
-    def _init_classifier(self, prior: float) -> None:
-        nn.init.normal_(self.classifier.weight, std=0.01)
-        nn.init.constant_(self.classifier.bias, math.log(prior / (1.0 - prior)))
+        for p in self.parameters():
+            p.requires_grad = False
+        for m in self.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.eval()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.reduce(x)
-        x = self.conv1(x)
-        x = self.conv2(x)
-        return self.classifier(x)
+        return self.block(x)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        for m in self.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.eval()
+        return self
 
 
-class CDAuxDecoder(nn.Module):
-    """Lightweight auxiliary head on layer3 fusion for small-object supervision."""
+class UNetUpStage(nn.Module):
+    """One U-Net decoder step: upsample → concat skip → frozen conv → domain adapter."""
 
-    def __init__(self, in_channels: int, prior: float = 0.02):
+    def __init__(
+        self,
+        in_ch: int,
+        skip_ch: int,
+        out_ch: int,
+        domain_list: Iterable[str],
+        adapter_reduction: int = 8,
+        adapter_dropout: float = 0.1,
+    ):
         super().__init__()
-        self.reduce = nn.Sequential(
-            nn.Conv2d(in_channels, 128, kernel_size=1, bias=False),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-        )
-        self.classifier = nn.Conv2d(128, 1, kernel_size=1)
-        self._init_classifier(prior)
+        self.skip_ch = skip_ch
+        merge_in = in_ch + skip_ch if skip_ch > 0 else in_ch
+        self.merge_conv = FrozenConvBlock(merge_in, out_ch, kernel_size=3, padding=1)
 
-    def _init_classifier(self, prior: float) -> None:
-        nn.init.normal_(self.classifier.weight, std=0.01)
-        nn.init.constant_(self.classifier.bias, math.log(prior / (1.0 - prior)))
+        self.domain_adapters = nn.ModuleDict({
+            d: ResidualAdapter(out_ch, reduction=adapter_reduction, dropout=adapter_dropout)
+            for d in domain_list
+        })
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.classifier(self.reduce(x))
+    def forward(
+        self,
+        x: torch.Tensor,
+        skip: Optional[torch.Tensor],
+        domain: str,
+        target_size: Optional[Tuple[int, int]] = None,
+    ) -> torch.Tensor:
+        if target_size is None:
+            if skip is not None:
+                target_size = skip.shape[-2:]
+            else:
+                raise ValueError("target_size required when skip is None")
+
+        x = F.interpolate(x, size=target_size, mode="bilinear", align_corners=False)
+        if skip is not None:
+            x = torch.cat([x, skip], dim=1)
+        x = self.merge_conv(x)
+        return self.domain_adapters[domain](x)
+
+
+class UNetDecoderWithAdapters(nn.Module):
+    """Symmetric U-Net decoder: frozen merge convs + per-domain residual adapters."""
+
+    def __init__(
+        self,
+        domain_list: Iterable[str],
+        prior: float = 0.02,
+        adapter_reduction: int = 8,
+        adapter_dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.domain_list = list(domain_list)
+
+        # Bottleneck on fused l4 (6144 → 1024).
+        self.bottleneck = FrozenConvBlock(FUSED_CHANNELS["l4"], 512, kernel_size=1, padding=0)
+
+        # Upsampling stages: (in_ch, skip_ch, out_ch).
+        self.up_stages = nn.ModuleList([
+            UNetUpStage(512, FUSED_CHANNELS["l3"], 256, domain_list, adapter_reduction, adapter_dropout),
+            UNetUpStage(256, FUSED_CHANNELS["l2"], 128, domain_list, adapter_reduction, adapter_dropout),
+            UNetUpStage(128, FUSED_CHANNELS["l1"], 64, domain_list, adapter_reduction, adapter_dropout),
+            UNetUpStage(64, 0, 32, domain_list, adapter_reduction, adapter_dropout),
+        ])
+
+        self.classifiers = nn.ModuleDict({
+            d: nn.Conv2d(32, 1, kernel_size=1) for d in self.domain_list
+        })
+
+        # Deep-supervision head on first decoder scale (≈ layer3 resolution).
+        self.aux_classifiers = nn.ModuleDict({
+            d: nn.Conv2d(256, 1, kernel_size=1) for d in self.domain_list
+        })
+
+        prior_bias = math.log(prior / (1.0 - prior))
+        for head in list(self.classifiers.values()) + list(self.aux_classifiers.values()):
+            nn.init.normal_(head.weight, std=0.01)
+            nn.init.constant_(head.bias, prior_bias)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.bottleneck.train(False)
+        for stage in self.up_stages:
+            stage.merge_conv.train(False)
+        return self
+
+    def forward(
+        self,
+        fused_skips: Dict[str, torch.Tensor],
+        domain: str,
+        out_size: Tuple[int, int],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = self.bottleneck(fused_skips["l4"])
+
+        x = self.up_stages[0](x, fused_skips["l3"], domain)
+        aux = self.aux_classifiers[domain](x)
+
+        x = self.up_stages[1](x, fused_skips["l2"], domain)
+        x = self.up_stages[2](x, fused_skips["l1"], domain)
+        x = self.up_stages[3](x, skip=None, domain=domain, target_size=out_size)
+
+        logits = self.classifiers[domain](x)
+        return logits, aux
+
+    def domain_parameters(self, domain: str) -> list:
+        params: list = []
+        for stage in self.up_stages:
+            params += list(stage.domain_adapters[domain].parameters())
+        params += list(self.classifiers[domain].parameters())
+        params += list(self.aux_classifiers[domain].parameters())
+        return params
 
 
 class ChangeDetectionModel(nn.Module):
-    """Backbone -> concat(f1,f2,|f1-f2|) -> per-domain decoder (+ aux on layer3)."""
-
-    LAYER3_CHANNELS = 1024
-    LAYER4_CHANNELS = 2048
+    """Bi-temporal U-Net CD: adapter encoder pyramid + adapter U-Net decoder."""
 
     def __init__(
         self,
@@ -82,6 +171,8 @@ class ChangeDetectionModel(nn.Module):
         domain_list: Iterable[str] | None = None,
         prior: float = 0.02,
         use_deep_supervision: bool = True,
+        adapter_reduction: int = 8,
+        adapter_dropout: float = 0.1,
     ):
         super().__init__()
         self.backbone = backbone
@@ -95,49 +186,39 @@ class ChangeDetectionModel(nn.Module):
             )
         self.domain_list: List[str] = list(domain_list)
 
-        fusion_l4 = 3 * self.LAYER4_CHANNELS
-        fusion_l3 = 3 * self.LAYER3_CHANNELS
+        self.decoder = UNetDecoderWithAdapters(
+            self.domain_list,
+            prior=prior,
+            adapter_reduction=adapter_reduction,
+            adapter_dropout=adapter_dropout,
+        )
 
-        self.decoders = nn.ModuleDict({
-            d: CDDecoder(in_channels=fusion_l4, prior=prior)
-            for d in self.domain_list
-        })
-        self.aux_decoders = nn.ModuleDict({
-            d: CDAuxDecoder(in_channels=fusion_l3, prior=prior)
-            for d in self.domain_list
-        })
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.decoder.train(mode)
+        return self
+
+    def _fuse_pyramid(
+        self, p1: Dict[str, torch.Tensor], p2: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        return {k: build_bitemporal_fusion(p1[k], p2[k]) for k in p1}
 
     def forward(
         self, img1: torch.Tensor, img2: torch.Tensor, domain: str
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if domain not in self.decoders:
-            raise KeyError(
-                f"Unknown domain '{domain}'. Known: {list(self.decoders)}"
-            )
+        pyramid1 = self.backbone.extract_multiscale(img1, domain)
+        pyramid2 = self.backbone.extract_multiscale(img2, domain)
+        fused = self._fuse_pyramid(pyramid1, pyramid2)
 
-        f1_l3, f1_l4 = self.backbone.extract_features(img1, domain)
-        f2_l3, f2_l4 = self.backbone.extract_features(img2, domain)
+        logits, aux = self.decoder(fused, domain, out_size=img1.shape[-2:])
 
-        fused_l4 = build_bitemporal_fusion(f1_l4, f2_l4)
-        fused_l3 = build_bitemporal_fusion(f1_l3, f2_l3)
+        if not (self.use_deep_supervision and self.training):
+            aux = None
 
-        logits = self.decoders[domain](fused_l4)
-        logits = F.interpolate(
-            logits, size=img1.shape[-2:], mode="bilinear", align_corners=False
-        )
+        return logits, aux
 
-        aux_logits = None
-        if self.use_deep_supervision and self.training:
-            aux_logits = self.aux_decoders[domain](fused_l3)
-            aux_logits = F.interpolate(
-                aux_logits, size=img1.shape[-2:], mode="bilinear", align_corners=False
-            )
-
-        return logits, aux_logits
-
-    def domain_parameters(self, domain: str):
-        params = list(self.decoders[domain].parameters())
-        params += list(self.aux_decoders[domain].parameters())
+    def domain_parameters(self, domain: str) -> list:
+        params = self.decoder.domain_parameters(domain)
         backbone_adapters = getattr(self.backbone, "domain_adapters", None)
         if backbone_adapters is not None and domain in backbone_adapters:
             params += list(backbone_adapters[domain].parameters())

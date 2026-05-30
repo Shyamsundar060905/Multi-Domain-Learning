@@ -1,6 +1,8 @@
-"""Multi-domain ResNet backbone with frozen weights + lightweight residual adapters."""
+"""U-Net style encoder: frozen ResNet50 + per-domain residual adapters at every stage."""
 
 from __future__ import annotations
+
+from typing import Dict
 
 import torch
 import torch.nn as nn
@@ -26,10 +28,22 @@ class ResidualAdapter(nn.Module):
         return x + self.dropout(self.up(self.act(self.bn(self.down(x)))))
 
 
-class ResNetWithAdapters(nn.Module):
-    """ResNet50 backbone (frozen) with per-domain residual adapters in layer3/4."""
+# Native channel widths at each ResNet stage (ResNet50).
+STAGE_CHANNELS = {
+    "layer1": 256,
+    "layer2": 512,
+    "layer3": 1024,
+    "layer4": 2048,
+}
 
-    def __init__(self, base, domain_list, adapter_dropout: float = 0.1):
+
+class ResNetWithAdapters(nn.Module):
+    """Frozen ResNet50 encoder with per-domain adapters after every bottleneck.
+
+    Produces a four-level feature pyramid (l1..l4) for U-Net skip connections.
+    """
+
+    def __init__(self, base, domain_list, adapter_dropout: float = 0.1, adapter_reduction: int = 16):
         super().__init__()
 
         self.stem = nn.Sequential(base.conv1, base.bn1, base.relu, base.maxpool)
@@ -38,18 +52,16 @@ class ResNetWithAdapters(nn.Module):
         self.layer3 = base.layer3
         self.layer4 = base.layer4
 
-        self.feature_channels = 2048
-        self.mid_channels = 1024
+        self.feature_channels = STAGE_CHANNELS["layer4"]
         self.domain_list = list(domain_list)
 
         self.domain_adapters = nn.ModuleDict({
             d: nn.ModuleDict({
-                "layer3": nn.ModuleList(
-                    [ResidualAdapter(1024, dropout=adapter_dropout) for _ in self.layer3]
-                ),
-                "layer4": nn.ModuleList(
-                    [ResidualAdapter(2048, dropout=adapter_dropout) for _ in self.layer4]
-                ),
+                stage: nn.ModuleList([
+                    ResidualAdapter(ch, reduction=adapter_reduction, dropout=adapter_dropout)
+                    for _ in getattr(self, stage)
+                ])
+                for stage, ch in STAGE_CHANNELS.items()
             })
             for d in self.domain_list
         })
@@ -84,23 +96,28 @@ class ResNetWithAdapters(nn.Module):
             x = adapter(x)
         return x
 
-    def extract_features(self, x: torch.Tensor, domain: str):
-        """Return (layer3, layer4) feature maps for deep supervision."""
+    def extract_multiscale(self, x: torch.Tensor, domain: str) -> Dict[str, torch.Tensor]:
+        """Return encoder pyramid ``{l1, l2, l3, l4}`` with domain adapters applied."""
         if domain not in self.domain_adapters:
             raise KeyError(
                 f"Unknown domain '{domain}'. Known: {list(self.domain_adapters)}"
             )
 
+        ad = self.domain_adapters[domain]
         x = self.stem(x)
-        x = self.layer1(x)
-        x = self.layer2(x)
-        f3 = self._run_stage(self.layer3, self.domain_adapters[domain]["layer3"], x)
-        f4 = self._run_stage(self.layer4, self.domain_adapters[domain]["layer4"], f3)
-        return f3, f4
+        l1 = self._run_stage(self.layer1, ad["layer1"], x)
+        l2 = self._run_stage(self.layer2, ad["layer2"], l1)
+        l3 = self._run_stage(self.layer3, ad["layer3"], l2)
+        l4 = self._run_stage(self.layer4, ad["layer4"], l3)
+        return {"l1": l1, "l2": l2, "l3": l3, "l4": l4}
+
+    def extract_features(self, x: torch.Tensor, domain: str):
+        """Backward-compatible (layer3, layer4) tuple."""
+        feats = self.extract_multiscale(x, domain)
+        return feats["l3"], feats["l4"]
 
     def forward(self, x: torch.Tensor, domain: str) -> torch.Tensor:
-        _, f4 = self.extract_features(x, domain)
-        return f4
+        return self.extract_multiscale(x, domain)["l4"]
 
     def adapter_parameters(self, domain: str | None = None):
         if domain is None:
