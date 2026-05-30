@@ -217,7 +217,11 @@ class ChangeDetectionModel(nn.Module):
 
         logits, aux = self.decoder(fused, domain, out_size=img1.shape[-2:])
 
-        if not (self.use_deep_supervision and self.training):
+        if self.use_deep_supervision and self.training and aux is not None:
+            aux = F.interpolate(
+                aux, size=img1.shape[-2:], mode="bilinear", align_corners=False
+            )
+        else:
             aux = None
 
         return logits, aux

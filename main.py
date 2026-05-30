@@ -247,10 +247,8 @@ def main():
     )
 
     print("Starting training...")
-    try:
-        trainer.train_joint(args.epochs)
-    finally:
-        trainer.evaluate_all()
+    trainer.train_joint(args.epochs)
+    trainer.evaluate_all()
 
 
 if __name__ == "__main__":
