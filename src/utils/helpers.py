@@ -34,7 +34,7 @@ def count_parameters(model) -> None:
 
 
 def domain_parameters(model, domain: str) -> list:
-    """Return parameters owned by a domain (adapters + main + aux decoder)."""
+    """Return parameters owned by a single domain (typically encoder adapters)."""
     if hasattr(model, "domain_parameters"):
         return model.domain_parameters(domain)
 
@@ -50,17 +50,25 @@ def domain_parameters(model, domain: str) -> list:
     return params
 
 
-def freeze_domain(model, current_domain: str) -> None:
-    """Enable gradients only for ``current_domain``'s adapters + decoders."""
-    domains = getattr(model, "domain_list", None)
-    if domains is None:
-        backbone = getattr(model, "backbone", model)
-        domains = getattr(backbone, "domain_list", [])
+def shared_parameters(model) -> list:
+    """Return shared trainable parameters (e.g. common decoder)."""
+    if hasattr(model, "shared_parameters"):
+        return model.shared_parameters()
 
-    for d in domains:
-        flag = d == current_domain
-        for p in domain_parameters(model, d):
-            p.requires_grad = flag
+    dec = getattr(model, "decoder", None)
+    if dec is not None and not hasattr(dec, "domain_parameters"):
+        return list(dec.parameters())
+    return []
+
+
+def freeze_domain(model, current_domain: str) -> None:
+    """Enable gradients for the active domain's adapters + any shared modules."""
+    for p in model.parameters():
+        p.requires_grad = False
+    for p in domain_parameters(model, current_domain):
+        p.requires_grad = True
+    for p in shared_parameters(model):
+        p.requires_grad = True
 
 
 def to_python_int(x):

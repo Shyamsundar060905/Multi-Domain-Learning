@@ -1,4 +1,4 @@
-"""U-Net change detection: adapter encoder pyramid + per-domain trainable decoder."""
+"""U-Net change detection: adapter encoder pyramid + shared trainable decoder."""
 
 from __future__ import annotations
 
@@ -67,8 +67,8 @@ class UNetUpStage(nn.Module):
         return self.merge_conv(x)
 
 
-class DomainUNetDecoder(nn.Module):
-    """Full U-Net decoder for a single domain (all conv weights trainable)."""
+class UNetDecoder(nn.Module):
+    """Shared U-Net decoder (trainable) used by all domains."""
 
     def __init__(self, prior: float = 0.02):
         super().__init__()
@@ -107,34 +107,8 @@ class DomainUNetDecoder(nn.Module):
         return logits, aux
 
 
-class PerDomainUNetDecoder(nn.Module):
-    """One independent U-Net decoder per domain."""
-
-    def __init__(self, domain_list: Iterable[str], prior: float = 0.02):
-        super().__init__()
-        self.domain_list = list(domain_list)
-        self.decoders = nn.ModuleDict({
-            d: DomainUNetDecoder(prior=prior) for d in self.domain_list
-        })
-
-    def forward(
-        self,
-        fused_skips: Dict[str, torch.Tensor],
-        domain: str,
-        out_size: Tuple[int, int],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if domain not in self.decoders:
-            raise KeyError(
-                f"Unknown domain '{domain}'. Known: {list(self.decoders)}"
-            )
-        return self.decoders[domain](fused_skips, out_size)
-
-    def domain_parameters(self, domain: str) -> list:
-        return list(self.decoders[domain].parameters())
-
-
 class ChangeDetectionModel(nn.Module):
-    """Bi-temporal U-Net CD: adapter encoder pyramid + per-domain U-Net decoder."""
+    """Bi-temporal U-Net CD: adapter encoder pyramid + shared U-Net decoder."""
 
     def __init__(
         self,
@@ -155,7 +129,7 @@ class ChangeDetectionModel(nn.Module):
             )
         self.domain_list: List[str] = list(domain_list)
 
-        self.decoder = PerDomainUNetDecoder(self.domain_list, prior=prior)
+        self.decoder = UNetDecoder(prior=prior)
 
     def _fuse_pyramid(
         self, p1: Dict[str, torch.Tensor], p2: Dict[str, torch.Tensor]
@@ -169,7 +143,7 @@ class ChangeDetectionModel(nn.Module):
         pyramid2 = self.backbone.extract_multiscale(img2, domain)
         fused = self._fuse_pyramid(pyramid1, pyramid2)
 
-        logits, aux = self.decoder(fused, domain, out_size=img1.shape[-2:])
+        logits, aux = self.decoder(fused, out_size=img1.shape[-2:])
 
         if self.use_deep_supervision and self.training and aux is not None:
             aux = F.interpolate(
@@ -181,8 +155,12 @@ class ChangeDetectionModel(nn.Module):
         return logits, aux
 
     def domain_parameters(self, domain: str) -> list:
-        params = self.decoder.domain_parameters(domain)
+        """Per-domain encoder adapters only."""
         backbone_adapters = getattr(self.backbone, "domain_adapters", None)
         if backbone_adapters is not None and domain in backbone_adapters:
-            params += list(backbone_adapters[domain].parameters())
-        return params
+            return list(backbone_adapters[domain].parameters())
+        return []
+
+    def shared_parameters(self) -> list:
+        """Shared trainable decoder weights (common across domains)."""
+        return list(self.decoder.parameters())
