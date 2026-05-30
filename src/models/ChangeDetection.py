@@ -42,27 +42,25 @@ class ConvBlock(nn.Module):
 
 
 class UNetUpStage(nn.Module):
-    """One U-Net decoder step: upsample → concat skip → trainable merge conv."""
+    """One U-Net decoder step: ConvTranspose2d upsample → concat skip → merge conv."""
 
-    def __init__(self, in_ch: int, skip_ch: int, out_ch: int):
+    def __init__(self, in_ch: int, skip_ch: int, out_ch: int, upsample_stride: int = 2):
         super().__init__()
-        merge_in = in_ch + skip_ch if skip_ch > 0 else in_ch
+        self.has_skip = skip_ch > 0
+        self.upconv = nn.ConvTranspose2d(
+            in_ch, in_ch, kernel_size=upsample_stride, stride=upsample_stride
+        )
+        merge_in = in_ch + skip_ch if self.has_skip else in_ch
         self.merge_conv = ConvBlock(merge_in, out_ch, kernel_size=3, padding=1)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        skip: Optional[torch.Tensor],
-        target_size: Optional[Tuple[int, int]] = None,
-    ) -> torch.Tensor:
-        if target_size is None:
-            if skip is not None:
-                target_size = skip.shape[-2:]
-            else:
-                raise ValueError("target_size required when skip is None")
-
-        x = F.interpolate(x, size=target_size, mode="bilinear", align_corners=False)
+    def forward(self, x: torch.Tensor, skip: Optional[torch.Tensor] = None) -> torch.Tensor:
+        x = self.upconv(x)
         if skip is not None:
+            if x.shape[-2:] != skip.shape[-2:]:
+                raise ValueError(
+                    f"Upsampled shape {x.shape[-2:]} != skip shape {skip.shape[-2:]}. "
+                    "Use an input size divisible by 32."
+                )
             x = torch.cat([x, skip], dim=1)
         return self.merge_conv(x)
 
@@ -74,11 +72,12 @@ class UNetDecoder(nn.Module):
         super().__init__()
         self.bottleneck = ConvBlock(FUSED_CHANNELS["l4"], 512, kernel_size=1, padding=0)
 
+        # l4→l3, l3→l2, l2→l1 are 2×; l1→full resolution is 4× (H/4 → H).
         self.up_stages = nn.ModuleList([
-            UNetUpStage(512, FUSED_CHANNELS["l3"], 256),
-            UNetUpStage(256, FUSED_CHANNELS["l2"], 128),
-            UNetUpStage(128, FUSED_CHANNELS["l1"], 64),
-            UNetUpStage(64, 0, 32),
+            UNetUpStage(512, FUSED_CHANNELS["l3"], 256, upsample_stride=2),
+            UNetUpStage(256, FUSED_CHANNELS["l2"], 128, upsample_stride=2),
+            UNetUpStage(128, FUSED_CHANNELS["l1"], 64, upsample_stride=2),
+            UNetUpStage(64, 0, 32, upsample_stride=4),
         ])
 
         self.classifier = nn.Conv2d(32, 1, kernel_size=1)
@@ -92,7 +91,6 @@ class UNetDecoder(nn.Module):
     def forward(
         self,
         fused_skips: Dict[str, torch.Tensor],
-        out_size: Tuple[int, int],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         x = self.bottleneck(fused_skips["l4"])
 
@@ -101,7 +99,7 @@ class UNetDecoder(nn.Module):
 
         x = self.up_stages[1](x, fused_skips["l2"])
         x = self.up_stages[2](x, fused_skips["l1"])
-        x = self.up_stages[3](x, skip=None, target_size=out_size)
+        x = self.up_stages[3](x)
 
         logits = self.classifier(x)
         return logits, aux
@@ -143,8 +141,9 @@ class ChangeDetectionModel(nn.Module):
         pyramid2 = self.backbone.extract_multiscale(img2, domain)
         fused = self._fuse_pyramid(pyramid1, pyramid2)
 
-        logits, aux = self.decoder(fused, out_size=img1.shape[-2:])
+        logits, aux = self.decoder(fused)
 
+        # Aux head is at H/16; upsample mask path for deep-sup loss only.
         if self.use_deep_supervision and self.training and aux is not None:
             aux = F.interpolate(
                 aux, size=img1.shape[-2:], mode="bilinear", align_corners=False
