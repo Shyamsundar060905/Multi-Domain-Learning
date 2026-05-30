@@ -26,7 +26,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from src.training.ewc import EWC
-from src.utils.helpers import domain_parameters, freeze_domain
+from src.utils.helpers import domain_parameters, freeze_domain, shared_parameters
 
 
 PosWeightLike = Union[float, Mapping[str, float]]
@@ -164,10 +164,7 @@ class ContinualFewShotTrainer:
             if unknown:
                 raise ValueError(f"domain_order contains unknown domains: {unknown}")
 
-        # ---------------- Per-domain optimisers + StepLR schedulers ----------
-        # Mirrors the notebook: one optimiser holding only that domain's
-        # trainable parameters (its backbone adapters + its full decoder).
-        # Adam state is therefore never contaminated across domains.
+        # Per-domain optimisers for encoder adapters; one shared decoder optimiser.
         self.optimizers: Dict[str, torch.optim.Optimizer] = {}
         self.schedulers: Dict[str, torch.optim.lr_scheduler._LRScheduler] = {}
         for d in self.domain_list:
@@ -178,6 +175,14 @@ class ContinualFewShotTrainer:
             self.schedulers[d] = torch.optim.lr_scheduler.StepLR(
                 self.optimizers[d], step_size=scheduler_step_size, gamma=scheduler_gamma
             )
+
+        decoder_params = shared_parameters(self.model)
+        self.decoder_optimizer = torch.optim.AdamW(
+            decoder_params, lr=lr, weight_decay=weight_decay
+        )
+        self.decoder_scheduler = torch.optim.lr_scheduler.StepLR(
+            self.decoder_optimizer, step_size=scheduler_step_size, gamma=scheduler_gamma
+        )
 
         self.ewc = EWC(model, ewc_lambda=ewc_lambda)
 
@@ -207,9 +212,12 @@ class ContinualFewShotTrainer:
         trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         print(f"Total params:     {total:,}")
         print(f"Trainable params: {trainable:,} ({100.0 * trainable / total:.2f}%)")
+        shared_n = sum(p.numel() for p in shared_parameters(self.model))
+        if shared_n:
+            print(f"  - shared decoder: {shared_n:,} params")
         for d in self.domain_list:
             n = sum(p.numel() for p in domain_parameters(self.model, d))
-            print(f"  - {d} owns {n:,} params")
+            print(f"  - {d} adapters: {n:,} params")
 
     # ------------------------------------------------------------------
     def train_step(self, batch, domain: str):
@@ -228,6 +236,7 @@ class ContinualFewShotTrainer:
 
         opt = self.optimizers[domain]
         opt.zero_grad(set_to_none=True)
+        self.decoder_optimizer.zero_grad(set_to_none=True)
 
         logits, aux_logits = self.model(img1, img2, domain)
         loss = change_detection_loss(
@@ -250,8 +259,10 @@ class ContinualFewShotTrainer:
         total = loss + ewc_loss
 
         total.backward()
-        torch.nn.utils.clip_grad_norm_(domain_parameters(self.model, domain), max_norm=1.0)
+        trainable = domain_parameters(self.model, domain) + shared_parameters(self.model)
+        torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
         opt.step()
+        self.decoder_optimizer.step()
 
         with torch.no_grad():
             _, dice, _ = _segmentation_metrics(logits, mask)
@@ -345,6 +356,8 @@ class ContinualFewShotTrainer:
 
             for d in self.domain_list:
                 self.schedulers[d].step()
+            if shared_parameters(self.model):
+                self.decoder_scheduler.step()
 
         if self.skip_ewc:
             print("\nSkipping EWC consolidation (--skip-ewc).")
