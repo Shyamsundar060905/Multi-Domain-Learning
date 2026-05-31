@@ -3,14 +3,82 @@
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import Dict, Iterable, List, Optional
 
 from PIL import Image
 from torch.utils.data import Dataset
 
-from src.data.split_utils import list_image_names, validate_triplet_files
 from src.data.transforms import PairedCDTransform, get_train_transform, get_test_transform
 
+
+# ---------------------------------------------------------------------------
+# Split helpers (kept in this file to avoid extra module sync issues)
+# ---------------------------------------------------------------------------
+
+def normalize_image_name(name: str) -> str:
+    return os.path.normcase(name.strip())
+
+
+def assert_disjoint_splits(
+    names_a: Iterable[str],
+    names_b: Iterable[str],
+    label: str,
+) -> None:
+    set_a = {normalize_image_name(n) for n in names_a}
+    set_b = {normalize_image_name(n) for n in names_b}
+    overlap = set_a & set_b
+    if overlap:
+        examples = sorted(overlap)[:8]
+        raise ValueError(
+            f"{label}: {len(overlap)} image(s) appear in BOTH splits. "
+            f"Examples: {examples}. "
+            "Each split must contain disjoint tiles."
+        )
+
+
+def list_image_names(root_dir: str, split: str, image_subdir: str = "A") -> List[str]:
+    image_dir = os.path.join(root_dir, split, image_subdir)
+    if not os.path.isdir(image_dir):
+        raise FileNotFoundError(f"Expected directory not found: {image_dir}")
+    return sorted(os.listdir(image_dir))
+
+
+def validate_triplet_files(
+    root_dir: str,
+    split: str,
+    names: Iterable[str],
+    dataset_name: str,
+    mask_subdir: str = "label",
+) -> None:
+    base = os.path.join(root_dir, split)
+    a_dir = os.path.join(base, "A")
+    b_dir = os.path.join(base, "B")
+    m_dir = os.path.join(base, mask_subdir)
+    missing: List[str] = []
+    for name in names:
+        if not all(os.path.isfile(os.path.join(d, name)) for d in (a_dir, b_dir, m_dir)):
+            missing.append(name)
+    if missing:
+        examples = missing[:8]
+        raise FileNotFoundError(
+            f"{dataset_name} [{split}]: {len(missing)} sample(s) missing A/B/{mask_subdir}. "
+            f"Examples: {examples}"
+        )
+
+
+def verify_levir_splits(root_dir: str, splits: Dict[str, List[str]]) -> None:
+    """Validate LEVIR-CD train/val/test are pairwise disjoint with complete triplets."""
+    split_names = list(splits.keys())
+    for i, a in enumerate(split_names):
+        for b in split_names[i + 1 :]:
+            assert_disjoint_splits(splits[a], splits[b], f"LEVIR ({a} vs {b})")
+    for split, names in splits.items():
+        validate_triplet_files(root_dir, split, names, "LEVIR", mask_subdir="label")
+
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
 
 class LEVIRFewShotDataset(Dataset):
     """LEVIR-CD dataset (``root_dir/<split>/{A,B,label}``).
