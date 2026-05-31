@@ -276,11 +276,6 @@ def main():
 
     print("Starting training...")
     trainer.train_joint(args.epochs)
-    trainer.evaluate_all(
-        loaders=test_loaders,
-        domain_splits={"LEVIR": "test", "WHU": "test"},
-        header="Final test (held-out)",
-    )
 
 
 if __name__ == "__main__":
