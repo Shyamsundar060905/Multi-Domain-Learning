@@ -1,4 +1,4 @@
-"""U-Net CD: shared trainable decoder + small per-domain residual adapters."""
+"""U-Net CD: frozen shared decoder + small per-domain residual adapters."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ FUSED_CHANNELS = {
 
 
 class ConvBlock(nn.Module):
-    """Trainable Conv-BN-ReLU block."""
+    """Conv-BN-ReLU block (optionally frozen via ``freeze()``)."""
 
     def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3, padding: int = 1):
         super().__init__()
@@ -38,6 +38,13 @@ class ConvBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.block(x)
+
+    def freeze(self) -> None:
+        for p in self.parameters():
+            p.requires_grad = False
+        for m in self.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.eval()
 
 
 class UNetUpStage(nn.Module):
@@ -80,7 +87,7 @@ class UNetUpStage(nn.Module):
 
 
 class UNetDecoder(nn.Module):
-    """Shared U-Net decoder trunk + lightweight per-domain adapters (symmetric to encoder)."""
+    """Frozen shared U-Net decoder trunk + lightweight per-domain adapters."""
 
     def __init__(
         self,
@@ -129,6 +136,29 @@ class UNetDecoder(nn.Module):
             nn.init.normal_(head.weight, std=0.01)
             nn.init.constant_(head.bias, prior_bias)
 
+        self._freeze_trunk()
+
+    def _freeze_trunk(self) -> None:
+        """Freeze shared decoder weights; only per-domain adapters stay trainable."""
+        self.bottleneck.freeze()
+        for p in self.classifier.parameters():
+            p.requires_grad = False
+        for p in self.aux_classifier.parameters():
+            p.requires_grad = False
+        for stage in self.up_stages:
+            for p in stage.upconv.parameters():
+                p.requires_grad = False
+            stage.merge_conv.freeze()
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.bottleneck.eval()
+        self.classifier.train(False)
+        self.aux_classifier.train(False)
+        for stage in self.up_stages:
+            stage.merge_conv.eval()
+        return self
+
     def forward(
         self,
         fused_skips: Dict[str, torch.Tensor],
@@ -158,17 +188,12 @@ class UNetDecoder(nn.Module):
         return params
 
     def shared_parameters(self) -> list:
-        params = list(self.bottleneck.parameters())
-        for stage in self.up_stages:
-            params += list(stage.upconv.parameters())
-            params += list(stage.merge_conv.parameters())
-        params += list(self.classifier.parameters())
-        params += list(self.aux_classifier.parameters())
-        return params
+        """Shared decoder trunk is frozen — no shared trainable params."""
+        return []
 
 
 class ChangeDetectionModel(nn.Module):
-    """Bi-temporal U-Net CD: adapter encoder + shared decoder + decoder adapters."""
+    """Bi-temporal U-Net CD: frozen U-Net encoder/decoder + domain adapters."""
 
     def __init__(
         self,
@@ -223,9 +248,11 @@ class ChangeDetectionModel(nn.Module):
 
     def domain_parameters(self, domain: str) -> list:
         params = self.decoder.domain_parameters(domain)
-        backbone_adapters = getattr(self.backbone, "domain_adapters", None)
-        if backbone_adapters is not None and domain in backbone_adapters:
-            params += list(backbone_adapters[domain].parameters())
+        backbone = self.backbone
+        if hasattr(backbone, "domain_parameters"):
+            params += backbone.domain_parameters(domain)
+        elif getattr(backbone, "domain_adapters", None) is not None and domain in backbone.domain_adapters:
+            params += list(backbone.domain_adapters[domain].parameters())
         return params
 
     def shared_parameters(self) -> list:

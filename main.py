@@ -3,13 +3,12 @@ import json
 
 import torch
 from torch.utils.data import DataLoader, RandomSampler
-from torchvision.models import resnet50, ResNet50_Weights
 
 from src.data.LEVIR_dataset import LEVIRFewShotDataset, list_image_names, verify_levir_splits
 from src.data.WHU_dataset import WHUDataset
 from src.data.transforms import get_test_transform, get_train_transform
 from src.models.ChangeDetection import ChangeDetectionModel
-from src.models.adapter_resnet import ResNetWithAdapters
+from src.models.adapter_resnet import UNetEncoderWithAdapters
 from src.training.trainer import ContinualFewShotTrainer
 from src.utils.helpers import count_parameters, set_seed
 
@@ -222,12 +221,10 @@ def main():
 
     print(f"Image size: {args.image_size}x{args.image_size}")
     print("Initializing model...")
-    base_model = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
-    backbone = ResNetWithAdapters(base_model, domain_list)
+    backbone = UNetEncoderWithAdapters(domain_list)
     model = ChangeDetectionModel(backbone, domain_list=domain_list).to(device)
-    print("Architecture: U-Net encoder (frozen ResNet50 + domain adapters, all 4 stages)")
-    print("              + shared U-Net decoder (ConvTranspose2d + merge convs + classifiers)")
-    print("              + per-domain decoder adapters after bottleneck and each up-stage")
+    print("Architecture: U-Net encoder (frozen down-path + per-domain adapters, l1-l4)")
+    print("              + frozen U-Net decoder + per-domain decoder adapters")
     print("Fusion: concat(f1, f2, |f1-f2|) at each scale  |  deep sup on 1st decoder up-stage")
 
     count_parameters(model)
