@@ -7,6 +7,7 @@ from torchvision.models import resnet50, ResNet50_Weights
 
 from src.data.LEVIR_dataset import LEVIRFewShotDataset
 from src.data.WHU_dataset import WHUDataset
+from src.data.split_utils import list_image_names, verify_levir_split
 from src.data.transforms import get_test_transform, get_train_transform
 from src.models.ChangeDetection import ChangeDetectionModel
 from src.models.adapter_resnet import ResNetWithAdapters
@@ -109,6 +110,14 @@ def _make_loaders(args):
         print(f"[Warning] WHU loading failed: {e}")
 
     try:
+        levir_train_names = list_image_names(args.levir_dir, "train", image_subdir="A")
+        levir_test_names = list_image_names(args.levir_dir, "test", image_subdir="A")
+        verify_levir_split(args.levir_dir, levir_train_names, levir_test_names)
+        print(
+            f"[LEVIR] train/test split OK: {len(levir_train_names)} train, "
+            f"{len(levir_test_names)} test, 0 overlap"
+        )
+
         levir_train = LEVIRFewShotDataset(
             root_dir=args.levir_dir, split="train", transform=train_transform,
             positive_only=args.positive_only, image_size=args.image_size,

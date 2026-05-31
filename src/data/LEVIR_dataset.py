@@ -8,11 +8,16 @@ from typing import Optional
 from PIL import Image
 from torch.utils.data import Dataset
 
+from src.data.split_utils import list_image_names, validate_triplet_files
 from src.data.transforms import PairedCDTransform, get_train_transform, get_test_transform
 
 
 class LEVIRFewShotDataset(Dataset):
     """LEVIR-CD dataset (``root_dir/<split>/{A,B,label}``).
+
+    Uses the official ``train/`` and ``test/`` folders.  Train and test must
+    contain disjoint image filenames — no tile seen during training may appear
+    in evaluation.
 
     Uses a paired transform so the two bitemporal images and the mask share
     identical spatial augmentation parameters every step.
@@ -29,6 +34,11 @@ class LEVIRFewShotDataset(Dataset):
         min_change_pixels: int = 1,
         image_size: int = 512,
     ):
+        if split not in {"train", "test"}:
+            raise ValueError(f"LEVIR split must be 'train' or 'test', got {split!r}")
+
+        self.root_dir = root_dir
+        self.split = split
         self.root = os.path.join(root_dir, split)
         self.k_shot = k_shot
         self.q_query = q_query
@@ -46,7 +56,7 @@ class LEVIRFewShotDataset(Dataset):
         self.B_dir = os.path.join(self.root, "B")
         self.label_dir = os.path.join(self.root, "label")
 
-        all_names = sorted(os.listdir(self.A_dir))
+        all_names = list_image_names(root_dir, split, image_subdir="A")
 
         if positive_only and split == "train":
             self.img_names = self._filter_positives(all_names, min_change_pixels, image_size)
@@ -55,6 +65,8 @@ class LEVIRFewShotDataset(Dataset):
                 self.img_names = all_names
         else:
             self.img_names = all_names
+
+        validate_triplet_files(root_dir, split, self.img_names, "LEVIR", mask_subdir="label")
 
     def _filter_positives(self, names, min_change_pixels: int, image_size: int):
         from torchvision import transforms
