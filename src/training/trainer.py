@@ -359,6 +359,9 @@ class ContinualFewShotTrainer:
             if shared_parameters(self.model):
                 self.decoder_scheduler.step()
 
+            if self.test_loaders:
+                self.evaluate_all(epoch=epoch + 1, total_epochs=epochs)
+
         if self.skip_ewc:
             print("\nSkipping EWC consolidation (--skip-ewc).")
         else:
@@ -373,15 +376,19 @@ class ContinualFewShotTrainer:
                 print("Training weights are kept; continuing to evaluation.")
 
     # ------------------------------------------------------------------
-    def evaluate(self, domain: str, *_):
+    def evaluate(self, domain: str, epoch: int | None = None, total_epochs: int | None = None):
         if domain not in self.test_loaders:
             return 0.0
 
+        was_training = self.model.training
         self.model.eval()
         total_acc = total_dice = total_iou = 0.0
         n = 0
+        desc = f"{domain} test"
+        if epoch is not None and total_epochs is not None:
+            desc = f"{domain} test (ep {epoch}/{total_epochs})"
         with torch.no_grad():
-            for batch in tqdm(self.test_loaders[domain], desc=f"{domain} Eval", leave=False):
+            for batch in tqdm(self.test_loaders[domain], desc=desc, leave=False):
                 img1, img2, mask = batch
                 img1 = img1.to(self.device)
                 img2 = img2.to(self.device)
@@ -402,20 +409,34 @@ class ContinualFewShotTrainer:
                 total_iou += iou.item()
                 n += 1
 
+        if was_training:
+            self.model.train()
+
         n = max(n, 1)
         avg_acc = 100.0 * total_acc / n
         avg_dice = total_dice / n
         avg_iou = total_iou / n
-        print(f"[{domain}] acc={avg_acc:.2f}%  dice={avg_dice:.4f}  iou={avg_iou:.4f}")
+        if epoch is not None:
+            print(f"  [{domain} test] dice={avg_dice:.4f}  iou={avg_iou:.4f}  acc={avg_acc:.2f}%")
+        else:
+            print(f"[{domain}] acc={avg_acc:.2f}%  dice={avg_dice:.4f}  iou={avg_iou:.4f}")
         return avg_dice
 
-    def evaluate_all(self, *_):
-        print("\n--- Evaluating all domains ---")
+    def evaluate_all(self, epoch: int | None = None, total_epochs: int | None = None):
+        if epoch is not None and total_epochs is not None:
+            print(f"\n--- Test eval after epoch {epoch}/{total_epochs} ---")
+        else:
+            print("\n--- Evaluating all domains ---")
+
+        # LEVIR first, then WHU (unseen test split), then any other loaded domains.
+        eval_order = [d for d in ("LEVIR", "WHU") if d in self.test_loaders]
+        eval_order += [d for d in self.domain_list if d in self.test_loaders and d not in eval_order]
+
         results = {}
-        for d in self.domain_list:
-            if d in self.test_loaders:
-                results[d] = self.evaluate(d)
+        for d in eval_order:
+            results[d] = self.evaluate(d, epoch=epoch, total_epochs=total_epochs)
         if results:
             avg = sum(results.values()) / len(results)
-            print(f"Average Dice across domains: {avg:.4f}")
+            label = "Avg test Dice" if epoch is not None else "Average Dice across domains"
+            print(f"  {label}: {avg:.4f}")
         return results
