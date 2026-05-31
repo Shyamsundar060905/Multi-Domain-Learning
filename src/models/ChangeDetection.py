@@ -1,4 +1,4 @@
-"""U-Net CD: frozen shared decoder + small per-domain residual adapters."""
+"""U-Net CD: frozen ResNet encoder + adapters, shared trainable U-Net decoder."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.models.adapter_resnet import ResidualAdapter, STAGE_CHANNELS
+from src.models.adapter_resnet import STAGE_CHANNELS
 
 
 def build_bitemporal_fusion(f1: torch.Tensor, f2: torch.Tensor) -> torch.Tensor:
@@ -21,7 +21,7 @@ FUSED_CHANNELS = {k: 3 * STAGE_CHANNELS[k] for k in ("l1", "l2", "l3", "l4")}
 
 
 class ConvBlock(nn.Module):
-    """Conv-BN-ReLU block (optionally frozen via ``freeze()``)."""
+    """Trainable Conv-BN-ReLU block."""
 
     def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3, padding: int = 1):
         super().__init__()
@@ -34,41 +34,19 @@ class ConvBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.block(x)
 
-    def freeze(self) -> None:
-        for p in self.parameters():
-            p.requires_grad = False
-        for m in self.modules():
-            if isinstance(m, nn.BatchNorm2d):
-                m.eval()
-
 
 class UNetUpStage(nn.Module):
-    """Shared upsample + merge conv, then a per-domain residual adapter."""
+    """ConvTranspose2d upsample → concat skip → trainable merge conv."""
 
-    def __init__(
-        self,
-        in_ch: int,
-        skip_ch: int,
-        out_ch: int,
-        domain_list: Iterable[str],
-        upsample_stride: int = 2,
-        adapter_reduction: int = 8,
-        adapter_dropout: float = 0.1,
-    ):
+    def __init__(self, in_ch: int, skip_ch: int, out_ch: int, upsample_stride: int = 2):
         super().__init__()
         self.upconv = nn.ConvTranspose2d(
             in_ch, in_ch, kernel_size=upsample_stride, stride=upsample_stride
         )
         merge_in = in_ch + skip_ch if skip_ch > 0 else in_ch
         self.merge_conv = ConvBlock(merge_in, out_ch, kernel_size=3, padding=1)
-        self.domain_adapters = nn.ModuleDict({
-            d: ResidualAdapter(out_ch, reduction=adapter_reduction, dropout=adapter_dropout)
-            for d in domain_list
-        })
 
-    def forward(
-        self, x: torch.Tensor, domain: str, skip: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, skip: Optional[torch.Tensor] = None) -> torch.Tensor:
         x = self.upconv(x)
         if skip is not None:
             if x.shape[-2:] != skip.shape[-2:]:
@@ -77,50 +55,22 @@ class UNetUpStage(nn.Module):
                     "Use an input size divisible by 32."
                 )
             x = torch.cat([x, skip], dim=1)
-        x = self.merge_conv(x)
-        return self.domain_adapters[domain](x)
+        return self.merge_conv(x)
 
 
 class UNetDecoder(nn.Module):
-    """Frozen shared U-Net decoder trunk + lightweight per-domain adapters."""
+    """Shared trainable U-Net decoder (no domain adapters)."""
 
-    def __init__(
-        self,
-        domain_list: Iterable[str],
-        prior: float = 0.02,
-        adapter_reduction: int = 8,
-        adapter_dropout: float = 0.1,
-    ):
+    def __init__(self, prior: float = 0.02):
         super().__init__()
-        self.domain_list = list(domain_list)
 
         self.bottleneck = ConvBlock(FUSED_CHANNELS["l4"], 512, kernel_size=1, padding=0)
-        self.bottleneck_adapters = nn.ModuleDict({
-            d: ResidualAdapter(512, reduction=adapter_reduction, dropout=adapter_dropout)
-            for d in self.domain_list
-        })
 
         self.up_stages = nn.ModuleList([
-            UNetUpStage(
-                512, FUSED_CHANNELS["l3"], 256, domain_list,
-                upsample_stride=2, adapter_reduction=adapter_reduction,
-                adapter_dropout=adapter_dropout,
-            ),
-            UNetUpStage(
-                256, FUSED_CHANNELS["l2"], 128, domain_list,
-                upsample_stride=2, adapter_reduction=adapter_reduction,
-                adapter_dropout=adapter_dropout,
-            ),
-            UNetUpStage(
-                128, FUSED_CHANNELS["l1"], 64, domain_list,
-                upsample_stride=2, adapter_reduction=adapter_reduction,
-                adapter_dropout=adapter_dropout,
-            ),
-            UNetUpStage(
-                64, 0, 32, domain_list,
-                upsample_stride=4, adapter_reduction=adapter_reduction,
-                adapter_dropout=adapter_dropout,
-            ),
+            UNetUpStage(512, FUSED_CHANNELS["l3"], 256, upsample_stride=2),
+            UNetUpStage(256, FUSED_CHANNELS["l2"], 128, upsample_stride=2),
+            UNetUpStage(128, FUSED_CHANNELS["l1"], 64, upsample_stride=2),
+            UNetUpStage(64, 0, 32, upsample_stride=4),
         ])
 
         self.classifier = nn.Conv2d(32, 1, kernel_size=1)
@@ -131,64 +81,28 @@ class UNetDecoder(nn.Module):
             nn.init.normal_(head.weight, std=0.01)
             nn.init.constant_(head.bias, prior_bias)
 
-        self._freeze_trunk()
+    def forward(self, fused_skips: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = self.bottleneck(fused_skips["l4"])
 
-    def _freeze_trunk(self) -> None:
-        """Freeze shared decoder weights; only per-domain adapters stay trainable."""
-        self.bottleneck.freeze()
-        for p in self.classifier.parameters():
-            p.requires_grad = False
-        for p in self.aux_classifier.parameters():
-            p.requires_grad = False
-        for stage in self.up_stages:
-            for p in stage.upconv.parameters():
-                p.requires_grad = False
-            stage.merge_conv.freeze()
-
-    def train(self, mode: bool = True):
-        super().train(mode)
-        self.bottleneck.eval()
-        self.classifier.train(False)
-        self.aux_classifier.train(False)
-        for stage in self.up_stages:
-            stage.merge_conv.eval()
-        return self
-
-    def forward(
-        self,
-        fused_skips: Dict[str, torch.Tensor],
-        domain: str,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if domain not in self.bottleneck_adapters:
-            raise KeyError(
-                f"Unknown domain '{domain}'. Known: {list(self.bottleneck_adapters)}"
-            )
-
-        x = self.bottleneck_adapters[domain](self.bottleneck(fused_skips["l4"]))
-
-        x = self.up_stages[0](x, domain, fused_skips["l3"])
+        x = self.up_stages[0](x, fused_skips["l3"])
         aux = self.aux_classifier(x)
 
-        x = self.up_stages[1](x, domain, fused_skips["l2"])
-        x = self.up_stages[2](x, domain, fused_skips["l1"])
-        x = self.up_stages[3](x, domain)
+        x = self.up_stages[1](x, fused_skips["l2"])
+        x = self.up_stages[2](x, fused_skips["l1"])
+        x = self.up_stages[3](x)
 
         logits = self.classifier(x)
         return logits, aux
 
     def domain_parameters(self, domain: str) -> list:
-        params = list(self.bottleneck_adapters[domain].parameters())
-        for stage in self.up_stages:
-            params += list(stage.domain_adapters[domain].parameters())
-        return params
+        return []
 
     def shared_parameters(self) -> list:
-        """Shared decoder trunk is frozen — no shared trainable params."""
-        return []
+        return list(self.parameters())
 
 
 class ChangeDetectionModel(nn.Module):
-    """Bi-temporal U-Net CD: frozen U-Net encoder/decoder + domain adapters."""
+    """Bi-temporal U-Net CD: adapter encoder + shared trainable decoder."""
 
     def __init__(
         self,
@@ -196,8 +110,6 @@ class ChangeDetectionModel(nn.Module):
         domain_list: Iterable[str] | None = None,
         prior: float = 0.02,
         use_deep_supervision: bool = True,
-        adapter_reduction: int = 8,
-        adapter_dropout: float = 0.1,
     ):
         super().__init__()
         self.backbone = backbone
@@ -211,12 +123,7 @@ class ChangeDetectionModel(nn.Module):
             )
         self.domain_list: List[str] = list(domain_list)
 
-        self.decoder = UNetDecoder(
-            self.domain_list,
-            prior=prior,
-            adapter_reduction=adapter_reduction,
-            adapter_dropout=adapter_dropout,
-        )
+        self.decoder = UNetDecoder(prior=prior)
 
     def _fuse_pyramid(
         self, p1: Dict[str, torch.Tensor], p2: Dict[str, torch.Tensor]
@@ -230,7 +137,7 @@ class ChangeDetectionModel(nn.Module):
         pyramid2 = self.backbone.extract_multiscale(img2, domain)
         fused = self._fuse_pyramid(pyramid1, pyramid2)
 
-        logits, aux = self.decoder(fused, domain)
+        logits, aux = self.decoder(fused)
 
         if self.use_deep_supervision and self.training and aux is not None:
             aux = F.interpolate(
@@ -242,7 +149,7 @@ class ChangeDetectionModel(nn.Module):
         return logits, aux
 
     def domain_parameters(self, domain: str) -> list:
-        params = self.decoder.domain_parameters(domain)
+        params: list = []
         backbone = self.backbone
         if hasattr(backbone, "domain_parameters"):
             params += backbone.domain_parameters(domain)
