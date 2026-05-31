@@ -5,9 +5,8 @@ import torch
 from torch.utils.data import DataLoader, RandomSampler
 from torchvision.models import resnet50, ResNet50_Weights
 
-from src.data.LEVIR_dataset import LEVIRFewShotDataset
+from src.data.LEVIR_dataset import LEVIRFewShotDataset, list_image_names, verify_levir_splits
 from src.data.WHU_dataset import WHUDataset
-from src.data.split_utils import list_image_names, verify_levir_splits
 from src.data.transforms import get_test_transform, get_train_transform
 from src.models.ChangeDetection import ChangeDetectionModel
 from src.models.adapter_resnet import ResNetWithAdapters
