@@ -17,12 +17,7 @@ def build_bitemporal_fusion(f1: torch.Tensor, f2: torch.Tensor) -> torch.Tensor:
     return torch.cat([f1, f2, torch.abs(f1 - f2)], dim=1)
 
 
-FUSED_CHANNELS = {
-    "l1": 3 * STAGE_CHANNELS["layer1"],
-    "l2": 3 * STAGE_CHANNELS["layer2"],
-    "l3": 3 * STAGE_CHANNELS["layer3"],
-    "l4": 3 * STAGE_CHANNELS["layer4"],
-}
+FUSED_CHANNELS = {k: 3 * STAGE_CHANNELS[k] for k in ("l1", "l2", "l3", "l4")}
 
 
 class ConvBlock(nn.Module):
