@@ -183,12 +183,15 @@ class ContinualFewShotTrainer:
             )
 
         decoder_params = shared_parameters(self.model)
-        self.decoder_optimizer = torch.optim.AdamW(
-            decoder_params, lr=lr, weight_decay=weight_decay
-        )
-        self.decoder_scheduler = torch.optim.lr_scheduler.StepLR(
-            self.decoder_optimizer, step_size=scheduler_step_size, gamma=scheduler_gamma
-        )
+        self.decoder_optimizer = None
+        self.decoder_scheduler = None
+        if decoder_params:
+            self.decoder_optimizer = torch.optim.AdamW(
+                decoder_params, lr=lr, weight_decay=weight_decay
+            )
+            self.decoder_scheduler = torch.optim.lr_scheduler.StepLR(
+                self.decoder_optimizer, step_size=scheduler_step_size, gamma=scheduler_gamma
+            )
 
         self.ewc = EWC(model, ewc_lambda=ewc_lambda)
 
@@ -208,7 +211,7 @@ class ContinualFewShotTrainer:
         if backbone is None:
             return
         for name, m in backbone.named_modules():
-            if isinstance(m, nn.BatchNorm2d) and "domain_adapters" not in name:
+            if isinstance(m, nn.BatchNorm2d) and "adapter" not in name:
                 m.eval()
                 for p in m.parameters():
                     p.requires_grad = False
@@ -220,7 +223,9 @@ class ContinualFewShotTrainer:
         print(f"Trainable params: {trainable:,} ({100.0 * trainable / total:.2f}%)")
         shared_n = sum(p.numel() for p in shared_parameters(self.model))
         if shared_n:
-            print(f"  - shared decoder: {shared_n:,} params")
+            print(f"  - shared decoder (trainable): {shared_n:,} params")
+        else:
+            print("  - shared decoder: frozen")
         for d in self.domain_list:
             n = sum(p.numel() for p in domain_parameters(self.model, d))
             print(f"  - {d} adapters: {n:,} params")
@@ -242,7 +247,8 @@ class ContinualFewShotTrainer:
 
         opt = self.optimizers[domain]
         opt.zero_grad(set_to_none=True)
-        self.decoder_optimizer.zero_grad(set_to_none=True)
+        if self.decoder_optimizer is not None:
+            self.decoder_optimizer.zero_grad(set_to_none=True)
 
         logits, aux_logits = self.model(img1, img2, domain)
         loss = change_detection_loss(
@@ -268,7 +274,8 @@ class ContinualFewShotTrainer:
         trainable = domain_parameters(self.model, domain) + shared_parameters(self.model)
         torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
         opt.step()
-        self.decoder_optimizer.step()
+        if self.decoder_optimizer is not None:
+            self.decoder_optimizer.step()
 
         with torch.no_grad():
             _, dice, _ = _segmentation_metrics(logits, mask)
@@ -362,7 +369,7 @@ class ContinualFewShotTrainer:
 
             for d in self.domain_list:
                 self.schedulers[d].step()
-            if shared_parameters(self.model):
+            if self.decoder_scheduler is not None:
                 self.decoder_scheduler.step()
 
             if self.eval_loaders:
