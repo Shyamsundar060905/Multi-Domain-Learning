@@ -246,8 +246,10 @@ class ChangeDetectionModel(nn.Module):
         backbone = self.backbone
         if hasattr(backbone, "domain_parameters"):
             params += backbone.domain_parameters(domain)
-        elif getattr(backbone, "domain_adapters", None) is not None and domain in backbone.domain_adapters:
-            params += list(backbone.domain_adapters[domain].parameters())
+        else:
+            adapters = getattr(backbone, "domain_adapters", None)
+            if adapters is not None and domain in adapters:
+                params += list(adapters[domain].parameters())
         return params
 
     def shared_parameters(self) -> list:
