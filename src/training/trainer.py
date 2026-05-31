@@ -117,6 +117,9 @@ class ContinualFewShotTrainer:
         test_loaders,
         domain_list,
         device,
+        eval_loaders=None,
+        eval_domain_splits: Dict[str, str] | None = None,
+        test_domain_splits: Dict[str, str] | None = None,
         lr: float = 1e-4,
         weight_decay: float = 1e-4,
         ewc_lambda: float = 1e4,
@@ -133,7 +136,10 @@ class ContinualFewShotTrainer:
     ):
         self.model = model
         self.train_loaders = train_loaders
+        self.eval_loaders = eval_loaders if eval_loaders is not None else test_loaders
         self.test_loaders = test_loaders
+        self.eval_domain_splits = eval_domain_splits or {d: "test" for d in self.eval_loaders}
+        self.test_domain_splits = test_domain_splits or {d: "test" for d in self.test_loaders}
         self.domain_list = list(domain_list)
         self.device = device
 
@@ -359,8 +365,13 @@ class ContinualFewShotTrainer:
             if shared_parameters(self.model):
                 self.decoder_scheduler.step()
 
-            if self.test_loaders:
-                self.evaluate_all(epoch=epoch + 1, total_epochs=epochs)
+            if self.eval_loaders:
+                self.evaluate_all(
+                    epoch=epoch + 1,
+                    total_epochs=epochs,
+                    loaders=self.eval_loaders,
+                    domain_splits=self.eval_domain_splits,
+                )
 
         if self.skip_ewc:
             print("\nSkipping EWC consolidation (--skip-ewc).")
@@ -376,19 +387,27 @@ class ContinualFewShotTrainer:
                 print("Training weights are kept; continuing to evaluation.")
 
     # ------------------------------------------------------------------
-    def evaluate(self, domain: str, epoch: int | None = None, total_epochs: int | None = None):
-        if domain not in self.test_loaders:
+    def evaluate(
+        self,
+        domain: str,
+        loaders: Dict | None = None,
+        split_label: str = "test",
+        epoch: int | None = None,
+        total_epochs: int | None = None,
+    ):
+        loaders = self.test_loaders if loaders is None else loaders
+        if domain not in loaders:
             return 0.0
 
         was_training = self.model.training
         self.model.eval()
         total_acc = total_dice = total_iou = 0.0
         n = 0
-        desc = f"{domain} test"
+        desc = f"{domain} {split_label}"
         if epoch is not None and total_epochs is not None:
-            desc = f"{domain} test (ep {epoch}/{total_epochs})"
+            desc = f"{domain} {split_label} (ep {epoch}/{total_epochs})"
         with torch.no_grad():
-            for batch in tqdm(self.test_loaders[domain], desc=desc, leave=False):
+            for batch in tqdm(loaders[domain], desc=desc, leave=False):
                 img1, img2, mask = batch
                 img1 = img1.to(self.device)
                 img2 = img2.to(self.device)
@@ -417,26 +436,51 @@ class ContinualFewShotTrainer:
         avg_dice = total_dice / n
         avg_iou = total_iou / n
         if epoch is not None:
-            print(f"  [{domain} test] dice={avg_dice:.4f}  iou={avg_iou:.4f}  acc={avg_acc:.2f}%")
+            print(
+                f"  [{domain} {split_label}] dice={avg_dice:.4f}  "
+                f"iou={avg_iou:.4f}  acc={avg_acc:.2f}%"
+            )
         else:
-            print(f"[{domain}] acc={avg_acc:.2f}%  dice={avg_dice:.4f}  iou={avg_iou:.4f}")
+            print(
+                f"[{domain} {split_label}] acc={avg_acc:.2f}%  "
+                f"dice={avg_dice:.4f}  iou={avg_iou:.4f}"
+            )
         return avg_dice
 
-    def evaluate_all(self, epoch: int | None = None, total_epochs: int | None = None):
-        if epoch is not None and total_epochs is not None:
-            print(f"\n--- Test eval after epoch {epoch}/{total_epochs} ---")
+    def evaluate_all(
+        self,
+        epoch: int | None = None,
+        total_epochs: int | None = None,
+        loaders: Dict | None = None,
+        domain_splits: Dict[str, str] | None = None,
+        header: str | None = None,
+    ):
+        loaders = self.test_loaders if loaders is None else loaders
+        domain_splits = domain_splits or {d: "test" for d in loaders}
+
+        if header:
+            print(f"\n--- {header} ---")
+        elif epoch is not None and total_epochs is not None:
+            print(f"\n--- Eval after epoch {epoch}/{total_epochs} ---")
         else:
             print("\n--- Evaluating all domains ---")
 
-        # LEVIR first, then WHU (unseen test split), then any other loaded domains.
-        eval_order = [d for d in ("LEVIR", "WHU") if d in self.test_loaders]
-        eval_order += [d for d in self.domain_list if d in self.test_loaders and d not in eval_order]
+        eval_order = [d for d in ("LEVIR", "WHU") if d in loaders]
+        eval_order += [d for d in self.domain_list if d in loaders and d not in eval_order]
 
         results = {}
         for d in eval_order:
-            results[d] = self.evaluate(d, epoch=epoch, total_epochs=total_epochs)
+            results[d] = self.evaluate(
+                d,
+                loaders=loaders,
+                split_label=domain_splits.get(d, "test"),
+                epoch=epoch,
+                total_epochs=total_epochs,
+            )
         if results:
             avg = sum(results.values()) / len(results)
-            label = "Avg test Dice" if epoch is not None else "Average Dice across domains"
-            print(f"  {label}: {avg:.4f}")
+            if epoch is not None:
+                print(f"  Avg eval Dice: {avg:.4f}")
+            else:
+                print(f"  Average Dice across domains: {avg:.4f}")
         return results

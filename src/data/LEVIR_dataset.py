@@ -15,9 +15,10 @@ from src.data.transforms import PairedCDTransform, get_train_transform, get_test
 class LEVIRFewShotDataset(Dataset):
     """LEVIR-CD dataset (``root_dir/<split>/{A,B,label}``).
 
-    Uses the official ``train/`` and ``test/`` folders.  Train and test must
-    contain disjoint image filenames — no tile seen during training may appear
-    in evaluation.
+    Uses the official ``train/``, ``val/``, and ``test/`` folders.  All splits
+    must contain disjoint image filenames — tiles in ``train/`` are the only
+    ones used for gradient updates; ``val/`` is for per-epoch monitoring;
+    ``test/`` is held out for final evaluation.
 
     Uses a paired transform so the two bitemporal images and the mask share
     identical spatial augmentation parameters every step.
@@ -34,8 +35,10 @@ class LEVIRFewShotDataset(Dataset):
         min_change_pixels: int = 1,
         image_size: int = 512,
     ):
-        if split not in {"train", "test"}:
-            raise ValueError(f"LEVIR split must be 'train' or 'test', got {split!r}")
+        if split not in {"train", "val", "test"}:
+            raise ValueError(
+                f"LEVIR split must be 'train', 'val', or 'test', got {split!r}"
+            )
 
         self.root_dir = root_dir
         self.split = split

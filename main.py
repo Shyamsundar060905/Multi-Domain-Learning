@@ -7,7 +7,7 @@ from torchvision.models import resnet50, ResNet50_Weights
 
 from src.data.LEVIR_dataset import LEVIRFewShotDataset
 from src.data.WHU_dataset import WHUDataset
-from src.data.split_utils import list_image_names, verify_levir_split
+from src.data.split_utils import list_image_names, verify_levir_splits
 from src.data.transforms import get_test_transform, get_train_transform
 from src.models.ChangeDetection import ChangeDetectionModel
 from src.models.adapter_resnet import ResNetWithAdapters
@@ -81,10 +81,10 @@ def build_parser(defaults=None):
 def _make_loaders(args):
     train_transform = get_train_transform(args.image_size)
     test_transform = get_test_transform(args.image_size)
-    train_loaders, test_loaders = {}, {}
+    train_loaders, eval_loaders, test_loaders = {}, {}, {}
 
     if not args.use_change_datasets:
-        return train_loaders, test_loaders
+        return train_loaders, eval_loaders, test_loaders
 
     print("Loading WHU + LEVIR datasets...")
 
@@ -105,22 +105,31 @@ def _make_loaders(args):
             whu_test, batch_size=args.batch_size, shuffle=False,
             num_workers=args.num_workers,
         )
-        print(f"WHU loaded: {len(whu_train)} train / {len(whu_test)} test")
+        eval_loaders["WHU"] = test_loaders["WHU"]
+        print(f"WHU loaded: {len(whu_train)} train / {len(whu_test)} test (eval each epoch)")
     except Exception as e:
         print(f"[Warning] WHU loading failed: {e}")
 
     try:
-        levir_train_names = list_image_names(args.levir_dir, "train", image_subdir="A")
-        levir_test_names = list_image_names(args.levir_dir, "test", image_subdir="A")
-        verify_levir_split(args.levir_dir, levir_train_names, levir_test_names)
+        levir_splits = {
+            split: list_image_names(args.levir_dir, split, image_subdir="A")
+            for split in ("train", "val", "test")
+        }
+        verify_levir_splits(args.levir_dir, levir_splits)
         print(
-            f"[LEVIR] train/test split OK: {len(levir_train_names)} train, "
-            f"{len(levir_test_names)} test, 0 overlap"
+            f"[LEVIR] splits OK (all disjoint): "
+            f"{len(levir_splits['train'])} train, "
+            f"{len(levir_splits['val'])} val, "
+            f"{len(levir_splits['test'])} test"
         )
 
         levir_train = LEVIRFewShotDataset(
             root_dir=args.levir_dir, split="train", transform=train_transform,
             positive_only=args.positive_only, image_size=args.image_size,
+        )
+        levir_val = LEVIRFewShotDataset(
+            root_dir=args.levir_dir, split="val", transform=test_transform,
+            image_size=args.image_size,
         )
         levir_test = LEVIRFewShotDataset(
             root_dir=args.levir_dir, split="test", transform=test_transform,
@@ -130,18 +139,26 @@ def _make_loaders(args):
             levir_train, batch_size=args.batch_size, shuffle=True,
             num_workers=args.num_workers, pin_memory=True, drop_last=True,
         )
+        eval_loaders["LEVIR"] = DataLoader(
+            levir_val, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers,
+        )
         test_loaders["LEVIR"] = DataLoader(
             levir_test, batch_size=args.batch_size, shuffle=False,
             num_workers=args.num_workers,
         )
-        print(f"LEVIR loaded: {len(levir_train)} train / {len(levir_test)} test")
+        print(
+            f"LEVIR loaded: {len(levir_train)} train | "
+            f"{len(levir_val)} val (eval each epoch) | "
+            f"{len(levir_test)} test (final only)"
+        )
     except Exception as e:
         print(f"[Warning] LEVIR loading failed: {e}")
 
     if args.balance_domain_samples and len(train_loaders) > 1:
         train_loaders = _balance_domain_samples(train_loaders, args)
 
-    return train_loaders, test_loaders
+    return train_loaders, eval_loaders, test_loaders
 
 
 def _balance_domain_samples(train_loaders, args):
@@ -199,7 +216,7 @@ def main():
         torch.set_float32_matmul_precision("high")
     set_seed(args.seed)
 
-    train_loaders, test_loaders = _make_loaders(args)
+    train_loaders, eval_loaders, test_loaders = _make_loaders(args)
     domain_list = list(train_loaders.keys())
     if not domain_list:
         raise SystemExit("No domains loaded -- enable --use-change-datasets and check data paths.")
@@ -238,7 +255,10 @@ def main():
     trainer = ContinualFewShotTrainer(
         model=model,
         train_loaders=train_loaders,
+        eval_loaders=eval_loaders,
         test_loaders=test_loaders,
+        eval_domain_splits={"LEVIR": "val", "WHU": "test"},
+        test_domain_splits={"LEVIR": "test", "WHU": "test"},
         domain_list=domain_list,
         device=device,
         lr=args.lr,
@@ -258,7 +278,11 @@ def main():
 
     print("Starting training...")
     trainer.train_joint(args.epochs)
-    trainer.evaluate_all()
+    trainer.evaluate_all(
+        loaders=test_loaders,
+        domain_splits={"LEVIR": "test", "WHU": "test"},
+        header="Final test (held-out)",
+    )
 
 
 if __name__ == "__main__":
