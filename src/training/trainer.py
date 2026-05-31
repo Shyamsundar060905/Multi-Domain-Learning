@@ -380,6 +380,15 @@ class ContinualFewShotTrainer:
                     domain_splits=self.eval_domain_splits,
                 )
 
+        # Final held-out test before EWC (Fisher passes must not run in train mode
+        # or shared decoder BatchNorm running stats get corrupted).
+        if self.test_loaders:
+            self.evaluate_all(
+                loaders=self.test_loaders,
+                domain_splits=self.test_domain_splits,
+                header="Final test (held-out, pre-EWC)",
+            )
+
         if self.skip_ewc:
             print("\nSkipping EWC consolidation (--skip-ewc).")
         else:

@@ -31,9 +31,9 @@ class EWC:
         if not named_params:
             raise RuntimeError(f"No trainable parameters found for domain '{domain}'.")
 
-        # Use train mode so adapter BN/dropout behave like training; aux head stays
-        # off because forward checks self.training only for deep supervision.
-        self.model.train()
+        # Eval mode keeps shared decoder BatchNorm stats fixed; only domain
+        # adapter params receive gradients for the Fisher estimate.
+        self.model.eval()
         fisher_info = {n: torch.zeros_like(p) for n, p in named_params}
 
         seen = 0
