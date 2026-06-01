@@ -379,6 +379,19 @@ class ContinualFewShotTrainer:
                     loaders=self.eval_loaders,
                     domain_splits=self.eval_domain_splits,
                 )
+            # Also track LEVIR held-out test each epoch (val alone is misleading).
+            if (
+                self.test_loaders
+                and "LEVIR" in self.test_loaders
+                and self.test_loaders.get("LEVIR") is not self.eval_loaders.get("LEVIR")
+            ):
+                self.evaluate(
+                    "LEVIR",
+                    loaders=self.test_loaders,
+                    split_label="test",
+                    epoch=epoch + 1,
+                    total_epochs=epochs,
+                )
 
         # Final held-out test before EWC (Fisher passes must not run in train mode
         # or shared decoder BatchNorm running stats get corrupted).
