@@ -226,7 +226,7 @@ def main():
     backbone = ResNetWithAdapters(base_model, domain_list)
     model = ChangeDetectionModel(backbone, domain_list=domain_list).to(device)
     print("Architecture: U-Net encoder (frozen ImageNet ResNet50 + domain adapters, l1-l4)")
-    print("              + shared trainable U-Net decoder (ConvTranspose2d + merge convs)")
+    print("              + shared trainable U-Net decoder (shared convs + per-domain BN)")
     print("Fusion: concat(f1, f2, |f1-f2|) at each scale  |  deep sup on 1st decoder up-stage")
 
     count_parameters(model)
