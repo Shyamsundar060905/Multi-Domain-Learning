@@ -3,13 +3,11 @@ import json
 
 import torch
 from torch.utils.data import DataLoader, RandomSampler
-from torchvision.models import resnet50, ResNet50_Weights
 
 from src.data.LEVIR_dataset import LEVIRFewShotDataset, list_image_names, verify_levir_splits
 from src.data.WHU_dataset import WHUDataset
 from src.data.transforms import get_test_transform, get_train_transform
-from src.models.ChangeDetection import ChangeDetectionModel
-from src.models.adapter_resnet import ResNetWithAdapters
+from src.models.factory import build_change_detection_model, print_architecture
 from src.training.trainer import ContinualFewShotTrainer
 from src.utils.helpers import count_parameters, set_seed
 
@@ -71,9 +69,18 @@ def build_parser(defaults=None):
                    default=defaults.get("domain_order", ["LEVIR", "WHU"]),
                    help="Order in which domains are trained (sequential mode) "
                         "or rotated (round_robin mode).")
-    p.add_argument("--whu-dir", type=str, default="./Data/WHU")
-    p.add_argument("--levir-dir", type=str, default="./Data/LEVIR CD")
+    p.add_argument("--domains", type=str, nargs="+",
+                   default=defaults.get("domains"),
+                   choices=["WHU", "LEVIR"],
+                   help="Datasets to train on (default: both). "
+                        "Use one name for uni-domain baselines, e.g. --domains WHU.")
+    p.add_argument("--whu-dir", type=str, default=defaults.get("whu_dir", "./Data/WHU"))
+    p.add_argument("--levir-dir", type=str, default=defaults.get("levir_dir", "./Data/LEVIR CD"))
     p.add_argument("--use-change-datasets", action="store_true")
+    if defaults.get("skip_ewc"):
+        p.set_defaults(skip_ewc=True)
+    if "balance_domain_samples" in defaults:
+        p.set_defaults(balance_domain_samples=defaults["balance_domain_samples"])
     return p
 
 
@@ -85,74 +92,77 @@ def _make_loaders(args):
     if not args.use_change_datasets:
         return train_loaders, eval_loaders, test_loaders
 
-    print("Loading WHU + LEVIR datasets...")
+    requested = args.domains or ["WHU", "LEVIR"]
+    print(f"Loading datasets: {', '.join(requested)}...")
 
-    try:
-        whu_train = WHUDataset(
-            root_dir=args.whu_dir, split="train", transform=train_transform,
-            positive_only=args.positive_only, image_size=args.image_size,
-        )
-        whu_test = WHUDataset(
-            root_dir=args.whu_dir, split="test", transform=test_transform,
-            image_size=args.image_size,
-        )
-        train_loaders["WHU"] = DataLoader(
-            whu_train, batch_size=args.batch_size, shuffle=True,
-            num_workers=args.num_workers, pin_memory=True, drop_last=True,
-        )
-        test_loaders["WHU"] = DataLoader(
-            whu_test, batch_size=args.batch_size, shuffle=False,
-            num_workers=args.num_workers,
-        )
-        eval_loaders["WHU"] = test_loaders["WHU"]
-        print(f"WHU loaded: {len(whu_train)} train / {len(whu_test)} test (eval each epoch)")
-    except Exception as e:
-        print(f"[Warning] WHU loading failed: {e}")
+    if "WHU" in requested:
+        try:
+            whu_train = WHUDataset(
+                root_dir=args.whu_dir, split="train", transform=train_transform,
+                positive_only=args.positive_only, image_size=args.image_size,
+            )
+            whu_test = WHUDataset(
+                root_dir=args.whu_dir, split="test", transform=test_transform,
+                image_size=args.image_size,
+            )
+            train_loaders["WHU"] = DataLoader(
+                whu_train, batch_size=args.batch_size, shuffle=True,
+                num_workers=args.num_workers, pin_memory=True, drop_last=True,
+            )
+            test_loaders["WHU"] = DataLoader(
+                whu_test, batch_size=args.batch_size, shuffle=False,
+                num_workers=args.num_workers,
+            )
+            eval_loaders["WHU"] = test_loaders["WHU"]
+            print(f"WHU loaded: {len(whu_train)} train / {len(whu_test)} test (eval each epoch)")
+        except Exception as e:
+            print(f"[Warning] WHU loading failed: {e}")
 
-    try:
-        levir_splits = {
-            split: list_image_names(args.levir_dir, split, image_subdir="A")
-            for split in ("train", "val", "test")
-        }
-        verify_levir_splits(args.levir_dir, levir_splits)
-        print(
-            f"[LEVIR] splits OK (all disjoint): "
-            f"{len(levir_splits['train'])} train, "
-            f"{len(levir_splits['val'])} val, "
-            f"{len(levir_splits['test'])} test"
-        )
+    if "LEVIR" in requested:
+        try:
+            levir_splits = {
+                split: list_image_names(args.levir_dir, split, image_subdir="A")
+                for split in ("train", "val", "test")
+            }
+            verify_levir_splits(args.levir_dir, levir_splits)
+            print(
+                f"[LEVIR] splits OK (all disjoint): "
+                f"{len(levir_splits['train'])} train, "
+                f"{len(levir_splits['val'])} val, "
+                f"{len(levir_splits['test'])} test"
+            )
 
-        levir_train = LEVIRFewShotDataset(
-            root_dir=args.levir_dir, split="train", transform=train_transform,
-            positive_only=args.positive_only, image_size=args.image_size,
-        )
-        levir_val = LEVIRFewShotDataset(
-            root_dir=args.levir_dir, split="val", transform=test_transform,
-            image_size=args.image_size,
-        )
-        levir_test = LEVIRFewShotDataset(
-            root_dir=args.levir_dir, split="test", transform=test_transform,
-            image_size=args.image_size,
-        )
-        train_loaders["LEVIR"] = DataLoader(
-            levir_train, batch_size=args.batch_size, shuffle=True,
-            num_workers=args.num_workers, pin_memory=True, drop_last=True,
-        )
-        eval_loaders["LEVIR"] = DataLoader(
-            levir_val, batch_size=args.batch_size, shuffle=False,
-            num_workers=args.num_workers,
-        )
-        test_loaders["LEVIR"] = DataLoader(
-            levir_test, batch_size=args.batch_size, shuffle=False,
-            num_workers=args.num_workers,
-        )
-        print(
-            f"LEVIR loaded: {len(levir_train)} train | "
-            f"{len(levir_val)} val (eval each epoch) | "
-            f"{len(levir_test)} test (final only)"
-        )
-    except Exception as e:
-        print(f"[Warning] LEVIR loading failed: {e}")
+            levir_train = LEVIRFewShotDataset(
+                root_dir=args.levir_dir, split="train", transform=train_transform,
+                positive_only=args.positive_only, image_size=args.image_size,
+            )
+            levir_val = LEVIRFewShotDataset(
+                root_dir=args.levir_dir, split="val", transform=test_transform,
+                image_size=args.image_size,
+            )
+            levir_test = LEVIRFewShotDataset(
+                root_dir=args.levir_dir, split="test", transform=test_transform,
+                image_size=args.image_size,
+            )
+            train_loaders["LEVIR"] = DataLoader(
+                levir_train, batch_size=args.batch_size, shuffle=True,
+                num_workers=args.num_workers, pin_memory=True, drop_last=True,
+            )
+            eval_loaders["LEVIR"] = DataLoader(
+                levir_val, batch_size=args.batch_size, shuffle=False,
+                num_workers=args.num_workers,
+            )
+            test_loaders["LEVIR"] = DataLoader(
+                levir_test, batch_size=args.batch_size, shuffle=False,
+                num_workers=args.num_workers,
+            )
+            print(
+                f"LEVIR loaded: {len(levir_train)} train | "
+                f"{len(levir_val)} val (eval each epoch) | "
+                f"{len(levir_test)} test (final only)"
+            )
+        except Exception as e:
+            print(f"[Warning] LEVIR loading failed: {e}")
 
     if args.balance_domain_samples and len(train_loaders) > 1:
         train_loaders = _balance_domain_samples(train_loaders, args)
@@ -221,13 +231,11 @@ def main():
         raise SystemExit("No domains loaded -- enable --use-change-datasets and check data paths.")
 
     print(f"Image size: {args.image_size}x{args.image_size}")
+    mode = "uni" if len(domain_list) == 1 else "multi"
+    print(f"Mode: {mode} ({', '.join(domain_list)})")
     print("Initializing model...")
-    base_model = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
-    backbone = ResNetWithAdapters(base_model, domain_list)
-    model = ChangeDetectionModel(backbone, domain_list=domain_list).to(device)
-    print("Architecture: U-Net encoder (frozen ImageNet ResNet50 + domain adapters, l1-l4)")
-    print("              + shared trainable U-Net decoder (shared convs + per-domain BN)")
-    print("Fusion: concat(f1, f2, |f1-f2|) at each scale  |  deep sup on 1st decoder up-stage")
+    model = build_change_detection_model(domain_list, device=device)
+    print_architecture(mode=mode)
 
     count_parameters(model)
 

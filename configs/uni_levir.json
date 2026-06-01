@@ -1,0 +1,22 @@
+{
+  "domains": ["LEVIR"],
+  "epochs": 20,
+  "lr": 0.001,
+  "weight_decay": 0.0001,
+  "batch_size": 4,
+  "image_size": 512,
+  "num_workers": 4,
+  "seed": 42,
+  "skip_ewc": true,
+  "balance_domain_samples": false,
+  "schedule": "per_domain_full_epoch",
+  "scheduler_step_size": 15,
+  "scheduler_gamma": 0.1,
+  "deep_supervision_weight": 0.4,
+  "dice_weight": 0.7,
+  "bce_weight": 0.3,
+  "focal_gamma": 2.0,
+  "pos_weight_per_domain": ["LEVIR=45"],
+  "whu_dir": "./Data/WHU",
+  "levir_dir": "./Data/LEVIR CD"
+}
