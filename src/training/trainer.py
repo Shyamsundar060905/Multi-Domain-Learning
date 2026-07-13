@@ -133,6 +133,7 @@ class ContinualFewShotTrainer:
         scheduler_step_size: int = 15,
         scheduler_gamma: float = 0.1,
         skip_ewc: bool = False,
+        use_tta: bool = False,
     ):
         self.model = model
         self.train_loaders = train_loaders
@@ -142,6 +143,7 @@ class ContinualFewShotTrainer:
         self.test_domain_splits = test_domain_splits or {d: "test" for d in self.test_loaders}
         self.domain_list = list(domain_list)
         self.device = device
+        self.use_tta = use_tta
 
         if isinstance(pos_weight, Mapping):
             self.pos_weight: Dict[str, float] = {
@@ -211,7 +213,7 @@ class ContinualFewShotTrainer:
         if backbone is None:
             return
         for name, m in backbone.named_modules():
-            if isinstance(m, nn.BatchNorm2d) and "adapter" not in name:
+            if isinstance(m, nn.BatchNorm2d) and "adapter" not in name and "domain_bn" not in name:
                 m.eval()
                 for p in m.parameters():
                     p.requires_grad = False
@@ -450,7 +452,31 @@ class ContinualFewShotTrainer:
                     mask = mask.unsqueeze(0).unsqueeze(0)
                 mask = (mask > 0.5).float()
 
-                logits, _ = self.model(img1, img2, domain)
+                if self.use_tta:
+                    # original prediction
+                    logits, _ = self.model(img1, img2, domain)
+                    prob = torch.sigmoid(logits)
+
+                    # horizontal flip
+                    img1_h = torch.flip(img1, dims=[-1])
+                    img2_h = torch.flip(img2, dims=[-1])
+                    logits_h, _ = self.model(img1_h, img2_h, domain)
+                    prob_h = torch.flip(torch.sigmoid(logits_h), dims=[-1])
+
+                    # vertical flip
+                    img1_v = torch.flip(img1, dims=[-2])
+                    img2_v = torch.flip(img2, dims=[-2])
+                    logits_v, _ = self.model(img1_v, img2_v, domain)
+                    prob_v = torch.flip(torch.sigmoid(logits_v), dims=[-2])
+
+                    # average probabilities
+                    avg_prob = (prob + prob_h + prob_v) / 3.0
+                    eps = 1e-7
+                    avg_prob = torch.clamp(avg_prob, eps, 1.0 - eps)
+                    logits = torch.log(avg_prob / (1.0 - avg_prob))
+                else:
+                    logits, _ = self.model(img1, img2, domain)
+
                 acc, dice, iou = _segmentation_metrics(logits, mask)
                 total_acc += acc.item()
                 total_dice += dice.item()

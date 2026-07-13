@@ -33,9 +33,12 @@ class PairedCDTransform:
     resampled with nearest-neighbour so labels stay binary.
     """
 
-    def __init__(self, size: int = 224, train: bool = True):
+    def __init__(self, size: int = 224, train: bool = True, use_color_jitter: bool = False):
         self.size = size
         self.train = train
+        self.use_color_jitter = use_color_jitter
+        if self.train and self.use_color_jitter:
+            self.color_jitter = transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1)
 
     def _resize(self, img: Image.Image, is_mask: bool) -> Image.Image:
         interp = TF.InterpolationMode.NEAREST if is_mask else TF.InterpolationMode.BILINEAR
@@ -62,6 +65,9 @@ class PairedCDTransform:
                 img1 = TF.rotate(img1, angle)
                 img2 = TF.rotate(img2, angle)
                 mask = TF.rotate(mask, angle)
+            if self.use_color_jitter:
+                img1 = self.color_jitter(img1)
+                img2 = self.color_jitter(img2)
 
         img1 = TF.to_tensor(img1)
         img2 = TF.to_tensor(img2)
@@ -73,9 +79,10 @@ class PairedCDTransform:
         return img1, img2, mask
 
 
-def get_train_transform(size: int = 512) -> PairedCDTransform:
-    return PairedCDTransform(size=size, train=True)
+def get_train_transform(size: int = 512, use_color_jitter: bool = False) -> PairedCDTransform:
+    return PairedCDTransform(size=size, train=True, use_color_jitter=use_color_jitter)
 
 
 def get_test_transform(size: int = 512) -> PairedCDTransform:
     return PairedCDTransform(size=size, train=False)
+
