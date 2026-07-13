@@ -77,6 +77,8 @@ def build_parser(defaults=None):
     p.add_argument("--whu-dir", type=str, default=defaults.get("whu_dir", "./Data/WHU"))
     p.add_argument("--levir-dir", type=str, default=defaults.get("levir_dir", "./Data/LEVIR CD"))
     p.add_argument("--use-change-datasets", action="store_true")
+    p.add_argument("--device", type=str, default=defaults.get("device", "cuda" if torch.cuda.is_available() else "cpu"),
+                   help="Device to run on, e.g. cuda, cuda:0, cuda:7, or cpu.")
     p.add_argument("--fusion-type", type=str, default=defaults.get("fusion_type", "abs"),
                    choices=["abs", "abs_prod"], help="Change detection feature fusion strategy.")
     p.add_argument("--domain-bn-in-adapter", action="store_true",
@@ -245,7 +247,7 @@ def main():
 
     args = build_parser(defaults=defaults).parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(args.device)
     print(f"Using device: {device}")
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
