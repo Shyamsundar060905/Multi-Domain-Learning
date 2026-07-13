@@ -171,10 +171,10 @@ class ResNetWithAdapters(nn.Module):
         bns = self.domain_bns[domain] if hasattr(self, "domain_bns") else None
 
         x = self.stem(x)
-        l1 = self._run_stage(self.layer1, ad.get("layer1"), bns.get("layer1") if bns else None, x)
-        l2 = self._run_stage(self.layer2, ad.get("layer2"), bns.get("layer2") if bns else None, l1)
-        l3 = self._run_stage(self.layer3, ad.get("layer3"), bns.get("layer3") if bns else None, l2)
-        l4 = self._run_stage(self.layer4, ad.get("layer4"), bns.get("layer4") if bns else None, l3)
+        l1 = self._run_stage(self.layer1, ad["layer1"] if "layer1" in ad else None, bns["layer1"] if (bns and "layer1" in bns) else None, x)
+        l2 = self._run_stage(self.layer2, ad["layer2"] if "layer2" in ad else None, bns["layer2"] if (bns and "layer2" in bns) else None, l1)
+        l3 = self._run_stage(self.layer3, ad["layer3"] if "layer3" in ad else None, bns["layer3"] if (bns and "layer3" in bns) else None, l2)
+        l4 = self._run_stage(self.layer4, ad["layer4"] if "layer4" in ad else None, bns["layer4"] if (bns and "layer4" in bns) else None, l3)
         return {"l1": l1, "l2": l2, "l3": l3, "l4": l4}
 
     def extract_features(self, x: torch.Tensor, domain: str):
