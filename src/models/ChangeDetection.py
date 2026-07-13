@@ -12,12 +12,58 @@ import torch.nn.functional as F
 from src.models.adapter_resnet import STAGE_CHANNELS
 
 
-def build_bitemporal_fusion(f1: torch.Tensor, f2: torch.Tensor) -> torch.Tensor:
-    """Concatenate both time steps and their absolute difference (3× channels)."""
-    return torch.cat([f1, f2, torch.abs(f1 - f2)], dim=1)
+def build_bitemporal_fusion(f1: torch.Tensor, f2: torch.Tensor, fusion_type: str = "abs") -> torch.Tensor:
+    """Concatenate time steps based on fusion_type."""
+    if fusion_type == "abs_prod":
+        return torch.cat([f1, f2, torch.abs(f1 - f2), f1 * f2], dim=1)
+    else:
+        return torch.cat([f1, f2, torch.abs(f1 - f2)], dim=1)
 
 
 FUSED_CHANNELS = {k: 3 * STAGE_CHANNELS[k] for k in ("l1", "l2", "l3", "l4")}
+
+
+class ChannelAttention(nn.Module):
+    def __init__(self, channels: int, reduction: int = 16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(channels, channels // reduction, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // reduction, channels, 1, bias=False)
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        avg_out = self.fc(self.avg_pool(x))
+        max_out = self.fc(self.max_pool(x))
+        out = avg_out + max_out
+        return x * self.sigmoid(out)
+
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size: int = 7):
+        super().__init__()
+        self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=kernel_size // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        out = torch.cat([avg_out, max_out], dim=1)
+        out = self.conv(out)
+        return x * self.sigmoid(out)
+
+
+class CBAM(nn.Module):
+    def __init__(self, channels: int, reduction: int = 16):
+        super().__init__()
+        self.ca = ChannelAttention(channels, reduction)
+        self.sa = SpatialAttention()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.sa(self.ca(x))
 
 
 class DomainConvBlock(nn.Module):
@@ -84,18 +130,34 @@ class UNetUpStage(nn.Module):
 class UNetDecoder(nn.Module):
     """Shared trainable U-Net decoder; BatchNorm is per-domain to avoid stat clash."""
 
-    def __init__(self, domain_list: Iterable[str], prior: float = 0.02):
+    def __init__(
+        self,
+        domain_list: Iterable[str],
+        prior: float = 0.02,
+        fusion_type: str = "abs",
+        use_attention: bool = False,
+    ):
         super().__init__()
         self.domain_list = list(domain_list)
+        self.fusion_type = fusion_type
+        self.use_attention = use_attention
+
+        mult = 4 if fusion_type == "abs_prod" else 3
+        fused_channels = {k: mult * STAGE_CHANNELS[k] for k in ("l1", "l2", "l3", "l4")}
+
+        if use_attention:
+            self.attention = CBAM(fused_channels["l4"])
+        else:
+            self.attention = nn.Identity()
 
         self.bottleneck = DomainConvBlock(
-            FUSED_CHANNELS["l4"], 512, domain_list, kernel_size=1, padding=0
+            fused_channels["l4"], 512, domain_list, kernel_size=1, padding=0
         )
 
         self.up_stages = nn.ModuleList([
-            UNetUpStage(512, FUSED_CHANNELS["l3"], 256, domain_list, upsample_stride=2),
-            UNetUpStage(256, FUSED_CHANNELS["l2"], 128, domain_list, upsample_stride=2),
-            UNetUpStage(128, FUSED_CHANNELS["l1"], 64, domain_list, upsample_stride=2),
+            UNetUpStage(512, fused_channels["l3"], 256, domain_list, upsample_stride=2),
+            UNetUpStage(256, fused_channels["l2"], 128, domain_list, upsample_stride=2),
+            UNetUpStage(128, fused_channels["l1"], 64, domain_list, upsample_stride=2),
             UNetUpStage(64, 0, 32, domain_list, upsample_stride=4),
         ])
 
@@ -110,7 +172,8 @@ class UNetDecoder(nn.Module):
     def forward(
         self, fused_skips: Dict[str, torch.Tensor], domain: str
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        x = self.bottleneck(fused_skips["l4"], domain)
+        fused_l4 = self.attention(fused_skips["l4"])
+        x = self.bottleneck(fused_l4, domain)
 
         x = self.up_stages[0](x, domain, fused_skips["l3"])
         aux = self.aux_classifier(x)
@@ -145,10 +208,14 @@ class ChangeDetectionModel(nn.Module):
         domain_list: Iterable[str] | None = None,
         prior: float = 0.02,
         use_deep_supervision: bool = True,
+        fusion_type: str = "abs",
+        use_attention: bool = False,
     ):
         super().__init__()
         self.backbone = backbone
         self.use_deep_supervision = use_deep_supervision
+        self.fusion_type = fusion_type
+        self.use_attention = use_attention
 
         if domain_list is None:
             domain_list = getattr(backbone, "domain_list", None)
@@ -158,12 +225,20 @@ class ChangeDetectionModel(nn.Module):
             )
         self.domain_list: List[str] = list(domain_list)
 
-        self.decoder = UNetDecoder(self.domain_list, prior=prior)
+        self.decoder = UNetDecoder(
+            self.domain_list,
+            prior=prior,
+            fusion_type=fusion_type,
+            use_attention=use_attention,
+        )
 
     def _fuse_pyramid(
         self, p1: Dict[str, torch.Tensor], p2: Dict[str, torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
-        return {k: build_bitemporal_fusion(p1[k], p2[k]) for k in p1}
+        return {
+            k: build_bitemporal_fusion(p1[k], p2[k], fusion_type=self.fusion_type)
+            for k in p1
+        }
 
     def forward(
         self, img1: torch.Tensor, img2: torch.Tensor, domain: str
@@ -195,4 +270,9 @@ class ChangeDetectionModel(nn.Module):
         return params
 
     def shared_parameters(self) -> list:
-        return self.decoder.shared_parameters()
+        domain_param_ids = set()
+        for d in self.domain_list:
+            for p in self.domain_parameters(d):
+                domain_param_ids.add(id(p))
+        return [p for p in self.parameters() if p.requires_grad and id(p) not in domain_param_ids]
+

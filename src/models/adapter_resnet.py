@@ -52,6 +52,9 @@ class ResNetWithAdapters(nn.Module):
         domain_list: Iterable[str],
         adapter_dropout: float = 0.1,
         adapter_reduction: int = 16,
+        domain_bn_in_adapter: bool = False,
+        unfreeze_layer4: bool = False,
+        adapter_stages: Iterable[str] = ("layer1", "layer2", "layer3", "layer4"),
     ):
         super().__init__()
 
@@ -63,6 +66,9 @@ class ResNetWithAdapters(nn.Module):
 
         self.feature_channels = STAGE_CHANNELS["l4"]
         self.domain_list = list(domain_list)
+        self.domain_bn_in_adapter = domain_bn_in_adapter
+        self.unfreeze_layer4 = unfreeze_layer4
+        self.adapter_stages = list(adapter_stages)
 
         self.domain_adapters = nn.ModuleDict({
             d: nn.ModuleDict({
@@ -74,27 +80,46 @@ class ResNetWithAdapters(nn.Module):
                     )
                     for _ in getattr(self, stage)
                 ])
-                for stage in _RESNET_STAGES
+                for stage in self.adapter_stages
             })
             for d in self.domain_list
         })
+
+        if self.domain_bn_in_adapter:
+            self.domain_bns = nn.ModuleDict({
+                d: nn.ModuleDict({
+                    stage: nn.ModuleList([
+                        nn.BatchNorm2d(STAGE_CHANNELS[f"l{stage[-1]}"])
+                        for _ in getattr(self, stage)
+                    ])
+                    for stage in self.adapter_stages
+                })
+                for d in self.domain_list
+            })
 
         self._freeze_backbone()
 
     def _freeze_backbone(self) -> None:
         for name, module in self.named_children():
-            if name == "domain_adapters":
+            if name in ("domain_adapters", "domain_bns"):
                 continue
-            for p in module.parameters():
-                p.requires_grad = False
-            for m in module.modules():
-                if isinstance(m, nn.BatchNorm2d):
-                    m.eval()
+            if self.unfreeze_layer4 and name == "layer4":
+                for p in module.parameters():
+                    p.requires_grad = True
+                for m in module.modules():
+                    if isinstance(m, nn.BatchNorm2d):
+                        m.eval()
+            else:
+                for p in module.parameters():
+                    p.requires_grad = False
+                for m in module.modules():
+                    if isinstance(m, nn.BatchNorm2d):
+                        m.eval()
 
     def train(self, mode: bool = True):
         super().train(mode)
         for name, module in self.named_children():
-            if name == "domain_adapters":
+            if name in ("domain_adapters", "domain_bns"):
                 continue
             for m in module.modules():
                 if isinstance(m, nn.BatchNorm2d):
@@ -102,23 +127,39 @@ class ResNetWithAdapters(nn.Module):
         return self
 
     def _run_stage(
-        self, stage: nn.Sequential, adapters: nn.ModuleList, x: torch.Tensor
+        self,
+        stage: nn.Sequential,
+        adapters: nn.ModuleList | None,
+        bns: nn.ModuleList | None,
+        x: torch.Tensor,
     ) -> torch.Tensor:
-        for block, adapter in zip(stage, adapters):
+        for i, block in enumerate(stage):
             x = block(x)
-            x = adapter(x)
+            if bns is not None:
+                x = bns[i](x)
+            if adapters is not None:
+                x = adapters[i](x)
         return x
 
     def domain_parameters(self, domain: str) -> List[torch.nn.Parameter]:
-        return list(self.domain_adapters[domain].parameters())
+        params = list(self.domain_adapters[domain].parameters())
+        if hasattr(self, "domain_bns") and domain in self.domain_bns:
+            params += list(self.domain_bns[domain].parameters())
+        return params
 
     def adapter_parameters(self, domain: str | None = None):
         if domain is None:
             for p in self.domain_adapters.parameters():
                 yield p
+            if hasattr(self, "domain_bns"):
+                for p in self.domain_bns.parameters():
+                    yield p
         else:
             for p in self.domain_adapters[domain].parameters():
                 yield p
+            if hasattr(self, "domain_bns") and domain in self.domain_bns:
+                for p in self.domain_bns[domain].parameters():
+                    yield p
 
     def extract_multiscale(self, x: torch.Tensor, domain: str) -> Dict[str, torch.Tensor]:
         if domain not in self.domain_adapters:
@@ -127,11 +168,13 @@ class ResNetWithAdapters(nn.Module):
             )
 
         ad = self.domain_adapters[domain]
+        bns = self.domain_bns[domain] if hasattr(self, "domain_bns") else None
+
         x = self.stem(x)
-        l1 = self._run_stage(self.layer1, ad["layer1"], x)
-        l2 = self._run_stage(self.layer2, ad["layer2"], l1)
-        l3 = self._run_stage(self.layer3, ad["layer3"], l2)
-        l4 = self._run_stage(self.layer4, ad["layer4"], l3)
+        l1 = self._run_stage(self.layer1, ad.get("layer1"), bns.get("layer1") if bns else None, x)
+        l2 = self._run_stage(self.layer2, ad.get("layer2"), bns.get("layer2") if bns else None, l1)
+        l3 = self._run_stage(self.layer3, ad.get("layer3"), bns.get("layer3") if bns else None, l2)
+        l4 = self._run_stage(self.layer4, ad.get("layer4"), bns.get("layer4") if bns else None, l3)
         return {"l1": l1, "l2": l2, "l3": l3, "l4": l4}
 
     def extract_features(self, x: torch.Tensor, domain: str):

@@ -77,15 +77,42 @@ def build_parser(defaults=None):
     p.add_argument("--whu-dir", type=str, default=defaults.get("whu_dir", "./Data/WHU"))
     p.add_argument("--levir-dir", type=str, default=defaults.get("levir_dir", "./Data/LEVIR CD"))
     p.add_argument("--use-change-datasets", action="store_true")
+    p.add_argument("--fusion-type", type=str, default=defaults.get("fusion_type", "abs"),
+                   choices=["abs", "abs_prod"], help="Change detection feature fusion strategy.")
+    p.add_argument("--domain-bn-in-adapter", action="store_true",
+                   help="Add domain-specific BN in the adapter path.")
+    p.add_argument("--unfreeze-layer4", action="store_true",
+                   help="Unfreeze Layer4 in the ResNet backbone.")
+    p.add_argument("--use-color-jitter", action="store_true",
+                   help="Apply independent color jitter augmentation to images.")
+    p.add_argument("--use-attention", action="store_true",
+                   help="Add CBAM attention block on the fused l4 features.")
+    p.add_argument("--adapter-stages", type=str, nargs="+",
+                   default=defaults.get("adapter_stages", ["layer1", "layer2", "layer3", "layer4"]),
+                   choices=["layer1", "layer2", "layer3", "layer4"],
+                   help="Stages in ResNet backbone to place adapters.")
+    p.add_argument("--use-tta", action="store_true",
+                   help="Enable Test-Time Augmentation (hflip/vflip averaging) during eval.")
+    
     if defaults.get("skip_ewc"):
         p.set_defaults(skip_ewc=True)
     if "balance_domain_samples" in defaults:
         p.set_defaults(balance_domain_samples=defaults["balance_domain_samples"])
+    if defaults.get("domain_bn_in_adapter"):
+        p.set_defaults(domain_bn_in_adapter=True)
+    if defaults.get("unfreeze_layer4"):
+        p.set_defaults(unfreeze_layer4=True)
+    if defaults.get("use_color_jitter"):
+        p.set_defaults(use_color_jitter=True)
+    if defaults.get("use_attention"):
+        p.set_defaults(use_attention=True)
+    if defaults.get("use_tta"):
+        p.set_defaults(use_tta=True)
     return p
 
 
 def _make_loaders(args):
-    train_transform = get_train_transform(args.image_size)
+    train_transform = get_train_transform(args.image_size, use_color_jitter=args.use_color_jitter)
     test_transform = get_test_transform(args.image_size)
     train_loaders, eval_loaders, test_loaders = {}, {}, {}
 
@@ -234,7 +261,15 @@ def main():
     mode = "uni" if len(domain_list) == 1 else "multi"
     print(f"Mode: {mode} ({', '.join(domain_list)})")
     print("Initializing model...")
-    model = build_change_detection_model(domain_list, device=device)
+    model = build_change_detection_model(
+        domain_list,
+        device=device,
+        fusion_type=args.fusion_type,
+        domain_bn_in_adapter=args.domain_bn_in_adapter,
+        unfreeze_layer4=args.unfreeze_layer4,
+        use_attention=args.use_attention,
+        adapter_stages=args.adapter_stages,
+    )
     print_architecture(mode=mode)
 
     count_parameters(model)
@@ -280,6 +315,7 @@ def main():
         scheduler_step_size=args.scheduler_step_size,
         scheduler_gamma=args.scheduler_gamma,
         skip_ewc=args.skip_ewc,
+        use_tta=args.use_tta,
     )
 
     print("Starting training...")
