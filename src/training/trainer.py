@@ -347,10 +347,10 @@ class ContinualFewShotTrainer:
         if self.schedule == "per_domain_full_epoch":
             print("Schedule: outer-epoch loops over domains; each gets a full inner pass.")
         else:
-            batches_per_domain = min(len(l) for l in self.train_loaders.values())
+            batches_per_domain = max(len(l) for l in self.train_loaders.values())
             total = batches_per_domain * len(self.train_loaders)
             print(
-                f"Batches/domain/epoch: {batches_per_domain}  |  total steps/epoch: {total}"
+                f"Batches/domain/epoch (max): {batches_per_domain}  |  total steps/epoch: {total}"
             )
 
         for epoch in range(epochs):
@@ -361,7 +361,7 @@ class ContinualFewShotTrainer:
                 for domain in self.domain_order:
                     self._train_domain_block(domain, self.train_loaders[domain], epoch, epochs)
             else:
-                batches_per_domain = min(len(l) for l in self.train_loaders.values())
+                batches_per_domain = max(len(l) for l in self.train_loaders.values())
                 total = batches_per_domain * len(self.train_loaders)
                 if self.schedule == "round_robin":
                     stream = _round_robin(self.train_loaders, total, self.domain_order)
