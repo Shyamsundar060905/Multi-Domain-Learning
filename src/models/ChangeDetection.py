@@ -232,6 +232,16 @@ class ChangeDetectionModel(nn.Module):
             use_attention=use_attention,
         )
 
+        # Fixed (structural) set of shared-parameter ids, decided once at
+        # construction time. ``freeze_domain`` toggles ``requires_grad`` on
+        # every parameter on every domain switch, so ``shared_parameters``
+        # must NOT be derived from ``requires_grad`` (that state is exactly
+        # what it's used to restore) — it must key off identity instead.
+        shared_ids = {id(p) for p in self.decoder.shared_parameters()}
+        if getattr(self.backbone, "unfreeze_layer4", False):
+            shared_ids |= {id(p) for p in self.backbone.layer4.parameters()}
+        self._shared_param_ids = shared_ids
+
     def _fuse_pyramid(
         self, p1: Dict[str, torch.Tensor], p2: Dict[str, torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
@@ -270,9 +280,5 @@ class ChangeDetectionModel(nn.Module):
         return params
 
     def shared_parameters(self) -> list:
-        domain_param_ids = set()
-        for d in self.domain_list:
-            for p in self.domain_parameters(d):
-                domain_param_ids.add(id(p))
-        return [p for p in self.parameters() if p.requires_grad and id(p) not in domain_param_ids]
+        return [p for p in self.parameters() if id(p) in self._shared_param_ids]
 
