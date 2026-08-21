@@ -21,7 +21,7 @@ def build_change_detection_model(
     use_attention: bool = False,
     adapter_stages: Iterable[str] = ("layer1", "layer2", "layer3", "layer4"),
 ) -> ChangeDetectionModel:
-    """ResNet50 encoder + per-domain adapters + shared U-Net decoder (domain BN)."""
+    """ResNet50 encoder + per-domain adapters + shared U-Net decoder (domain BN + adapters)."""
     domains: List[str] = list(domain_list)
     if not domains:
         raise ValueError("domain_list must contain at least one domain name.")
@@ -50,5 +50,5 @@ def print_architecture(mode: str = "multi") -> None:
     label = "Uni-domain" if mode == "uni" else "Multi-domain"
     print(f"{label} change detection:")
     print("  Encoder: frozen ImageNet ResNet50 + per-domain residual adapters (l1–l4)")
-    print("  Decoder: shared trainable U-Net (shared convs + per-domain BatchNorm)")
+    print("  Decoder: shared trainable U-Net (shared convs + per-domain BatchNorm + per-domain residual adapters)")
     print("  Fusion:  concat(f1, f2, |f1-f2|) at each scale  |  deep sup on 1st up-stage")

@@ -1,4 +1,4 @@
-"""U-Net CD: frozen ResNet encoder + adapters, shared decoder with domain BatchNorm."""
+"""U-Net CD: frozen ResNet encoder + adapters, shared decoder with domain BatchNorm + residual adapters."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.models.adapter_resnet import STAGE_CHANNELS
+from src.models.adapter_resnet import STAGE_CHANNELS, ResidualAdapter
 
 
 def build_bitemporal_fusion(f1: torch.Tensor, f2: torch.Tensor, fusion_type: str = "abs") -> torch.Tensor:
@@ -67,7 +67,7 @@ class CBAM(nn.Module):
 
 
 class DomainConvBlock(nn.Module):
-    """Shared conv + per-domain BatchNorm + ReLU."""
+    """Shared conv + per-domain BatchNorm + ReLU + per-domain residual adapter."""
 
     def __init__(
         self,
@@ -76,6 +76,8 @@ class DomainConvBlock(nn.Module):
         domain_list: Iterable[str],
         kernel_size: int = 3,
         padding: int = 1,
+        adapter_reduction: int = 16,
+        adapter_dropout: float = 0.1,
     ):
         super().__init__()
         self.conv = nn.Conv2d(
@@ -85,13 +87,18 @@ class DomainConvBlock(nn.Module):
             d: nn.BatchNorm2d(out_ch) for d in domain_list
         })
         self.act = nn.ReLU(inplace=True)
+        self.adapters = nn.ModuleDict({
+            d: ResidualAdapter(out_ch, reduction=adapter_reduction, dropout=adapter_dropout)
+            for d in domain_list
+        })
 
     def forward(self, x: torch.Tensor, domain: str) -> torch.Tensor:
-        return self.act(self.norm[domain](self.conv(x)))
+        x = self.act(self.norm[domain](self.conv(x)))
+        return self.adapters[domain](x)
 
 
 class UNetUpStage(nn.Module):
-    """ConvTranspose2d upsample → concat skip → shared conv + domain BN."""
+    """ConvTranspose2d upsample → concat skip → shared conv + domain BN + domain adapter."""
 
     def __init__(
         self,
@@ -100,6 +107,8 @@ class UNetUpStage(nn.Module):
         out_ch: int,
         domain_list: Iterable[str],
         upsample_stride: int = 2,
+        adapter_reduction: int = 16,
+        adapter_dropout: float = 0.1,
     ):
         super().__init__()
         self.upconv = nn.ConvTranspose2d(
@@ -107,8 +116,14 @@ class UNetUpStage(nn.Module):
         )
         merge_in = in_ch + skip_ch if skip_ch > 0 else in_ch
         self.merge_conv = nn.Sequential(
-            DomainConvBlock(merge_in, out_ch, domain_list),
-            DomainConvBlock(out_ch, out_ch, domain_list),
+            DomainConvBlock(
+                merge_in, out_ch, domain_list,
+                adapter_reduction=adapter_reduction, adapter_dropout=adapter_dropout,
+            ),
+            DomainConvBlock(
+                out_ch, out_ch, domain_list,
+                adapter_reduction=adapter_reduction, adapter_dropout=adapter_dropout,
+            ),
         )
 
     def forward(
@@ -128,7 +143,7 @@ class UNetUpStage(nn.Module):
 
 
 class UNetDecoder(nn.Module):
-    """Shared trainable U-Net decoder; BatchNorm is per-domain to avoid stat clash."""
+    """Shared trainable U-Net decoder; BatchNorm + residual adapters are per-domain."""
 
     def __init__(
         self,
@@ -136,6 +151,8 @@ class UNetDecoder(nn.Module):
         prior: float = 0.02,
         fusion_type: str = "abs",
         use_attention: bool = False,
+        adapter_reduction: int = 16,
+        adapter_dropout: float = 0.1,
     ):
         super().__init__()
         self.domain_list = list(domain_list)
@@ -151,14 +168,19 @@ class UNetDecoder(nn.Module):
             self.attention = nn.Identity()
 
         self.bottleneck = DomainConvBlock(
-            fused_channels["l4"], 512, domain_list, kernel_size=1, padding=0
+            fused_channels["l4"], 512, domain_list, kernel_size=1, padding=0,
+            adapter_reduction=adapter_reduction, adapter_dropout=adapter_dropout,
         )
 
         self.up_stages = nn.ModuleList([
-            UNetUpStage(512, fused_channels["l3"], 256, domain_list, upsample_stride=2),
-            UNetUpStage(256, fused_channels["l2"], 128, domain_list, upsample_stride=2),
-            UNetUpStage(128, fused_channels["l1"], 64, domain_list, upsample_stride=2),
-            UNetUpStage(64, 0, 32, domain_list, upsample_stride=4),
+            UNetUpStage(512, fused_channels["l3"], 256, domain_list, upsample_stride=2,
+                        adapter_reduction=adapter_reduction, adapter_dropout=adapter_dropout),
+            UNetUpStage(256, fused_channels["l2"], 128, domain_list, upsample_stride=2,
+                        adapter_reduction=adapter_reduction, adapter_dropout=adapter_dropout),
+            UNetUpStage(128, fused_channels["l1"], 64, domain_list, upsample_stride=2,
+                        adapter_reduction=adapter_reduction, adapter_dropout=adapter_dropout),
+            UNetUpStage(64, 0, 32, domain_list, upsample_stride=4,
+                        adapter_reduction=adapter_reduction, adapter_dropout=adapter_dropout),
         ])
 
         self.classifier = nn.Conv2d(32, 1, kernel_size=1)
@@ -186,21 +208,25 @@ class UNetDecoder(nn.Module):
         return logits, aux
 
     def domain_parameters(self, domain: str) -> list:
+        """Params private to one domain: per-domain BatchNorm + per-domain adapters.
+
+        Any ``nn.ModuleDict`` keyed by domain name (``norm``, ``adapters``, ...)
+        contributes its ``domain`` entry, so new per-domain submodules are
+        picked up automatically without touching this method.
+        """
         params: list = []
         for module in self.modules():
             if isinstance(module, nn.ModuleDict) and domain in module:
-                bn = module[domain]
-                if isinstance(bn, nn.BatchNorm2d):
-                    params += list(bn.parameters())
+                params += list(module[domain].parameters())
         return params
 
     def shared_parameters(self) -> list:
-        bn_ids = {id(p) for d in self.domain_list for p in self.domain_parameters(d)}
-        return [p for p in self.parameters() if id(p) not in bn_ids]
+        domain_param_ids = {id(p) for d in self.domain_list for p in self.domain_parameters(d)}
+        return [p for p in self.parameters() if id(p) not in domain_param_ids]
 
 
 class ChangeDetectionModel(nn.Module):
-    """Bi-temporal U-Net CD: adapter encoder + shared decoder (domain BN)."""
+    """Bi-temporal U-Net CD: adapter encoder + shared decoder (domain BN + adapters)."""
 
     def __init__(
         self,
@@ -210,6 +236,8 @@ class ChangeDetectionModel(nn.Module):
         use_deep_supervision: bool = True,
         fusion_type: str = "abs",
         use_attention: bool = False,
+        decoder_adapter_reduction: int = 16,
+        decoder_adapter_dropout: float = 0.1,
     ):
         super().__init__()
         self.backbone = backbone
@@ -230,6 +258,8 @@ class ChangeDetectionModel(nn.Module):
             prior=prior,
             fusion_type=fusion_type,
             use_attention=use_attention,
+            adapter_reduction=decoder_adapter_reduction,
+            adapter_dropout=decoder_adapter_dropout,
         )
 
         # Fixed (structural) set of shared-parameter ids, decided once at
