@@ -31,7 +31,8 @@ def build_parser(defaults=None):
                    help="Skip post-training EWC Fisher consolidation (safe for joint training).")
     p.add_argument("--pos-weight", type=float, default=defaults.get("pos_weight", 20.0),
                    help="Global pos_weight; overridden by --pos-weight-per-domain if set.")
-    p.add_argument("--pos-weight-per-domain", type=str, nargs="*", default=None,
+    p.add_argument("--pos-weight-per-domain", type=str, nargs="*",
+                   default=defaults.get("pos_weight_per_domain"),
                    help="Per-domain pos_weight overrides, e.g. WHU=7 LEVIR=28.")
     p.add_argument("--focal-gamma", type=float, default=defaults.get("focal_gamma", 2.0))
     p.add_argument("--dice-weight", type=float, default=defaults.get("dice_weight", 0.7))
@@ -98,6 +99,8 @@ def build_parser(defaults=None):
     
     if defaults.get("skip_ewc"):
         p.set_defaults(skip_ewc=True)
+    if defaults.get("positive_only"):
+        p.set_defaults(positive_only=True)
     if "balance_domain_samples" in defaults:
         p.set_defaults(balance_domain_samples=defaults["balance_domain_samples"])
     if defaults.get("domain_bn_in_adapter"):
