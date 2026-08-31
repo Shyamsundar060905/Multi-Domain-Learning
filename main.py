@@ -90,10 +90,13 @@ def build_parser(defaults=None):
                    help="Apply independent color jitter augmentation to images.")
     p.add_argument("--use-attention", action="store_true",
                    help="Add CBAM attention block on the fused l4 features.")
-    p.add_argument("--adapter-stages", type=str, nargs="+",
-                   default=defaults.get("adapter_stages", ["layer1", "layer2", "layer3", "layer4"]),
+    p.add_argument("--adapter-stages", type=str, nargs="*",
+                   default=defaults.get("adapter_stages", []),
                    choices=["layer1", "layer2", "layer3", "layer4"],
-                   help="Stages in ResNet backbone to place adapters.")
+                   help="Stages in ResNet backbone to place per-domain adapters. "
+                        "Empty (default on this branch): encoder is fully shared/frozen, "
+                        "with no per-domain adapters -- all domain-specific capacity "
+                        "lives in the decoder.")
     p.add_argument("--use-tta", action="store_true",
                    help="Enable Test-Time Augmentation (hflip/vflip averaging) during eval.")
     
@@ -275,7 +278,7 @@ def main():
         use_attention=args.use_attention,
         adapter_stages=args.adapter_stages,
     )
-    print_architecture(mode=mode)
+    print_architecture(mode=mode, adapter_stages=args.adapter_stages)
 
     count_parameters(model)
 

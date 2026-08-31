@@ -19,9 +19,14 @@ def build_change_detection_model(
     domain_bn_in_adapter: bool = False,
     unfreeze_layer4: bool = False,
     use_attention: bool = False,
-    adapter_stages: Iterable[str] = ("layer1", "layer2", "layer3", "layer4"),
+    adapter_stages: Iterable[str] = (),
 ) -> ChangeDetectionModel:
-    """ResNet50 encoder + per-domain adapters + shared U-Net decoder (domain BN + adapters)."""
+    """Frozen shared ResNet50 encoder (no per-domain adapters by default) +
+    shared U-Net decoder (domain BN + per-domain adapters).
+
+    Pass ``adapter_stages`` to re-enable per-domain encoder adapters on top of
+    the shared backbone (the previous default behaviour).
+    """
     domains: List[str] = list(domain_list)
     if not domains:
         raise ValueError("domain_list must contain at least one domain name.")
@@ -46,9 +51,15 @@ def build_change_detection_model(
     return model
 
 
-def print_architecture(mode: str = "multi") -> None:
+def print_architecture(mode: str = "multi", adapter_stages: Iterable[str] = ()) -> None:
     label = "Uni-domain" if mode == "uni" else "Multi-domain"
+    stages = list(adapter_stages)
+    encoder_desc = (
+        f"frozen ImageNet ResNet50 + per-domain residual adapters ({', '.join(stages)})"
+        if stages else
+        "frozen ImageNet ResNet50, fully shared (no per-domain adapters)"
+    )
     print(f"{label} change detection:")
-    print("  Encoder: frozen ImageNet ResNet50 + per-domain residual adapters (l1–l4)")
+    print(f"  Encoder: {encoder_desc}")
     print("  Decoder: shared trainable U-Net (shared convs + per-domain BatchNorm + per-domain residual adapters)")
     print("  Fusion:  concat(f1, f2, |f1-f2|) at each scale  |  deep sup on 1st up-stage")
