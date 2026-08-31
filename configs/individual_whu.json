@@ -1,0 +1,20 @@
+{
+  "domain": "WHU",
+  "epochs": 20,
+  "lr": 0.0002,
+  "weight_decay": 0.0001,
+  "batch_size": 4,
+  "image_size": 512,
+  "num_workers": 4,
+  "seed": 42,
+  "positive_only": true,
+  "pos_weight": 3.0,
+  "focal_gamma": 2.0,
+  "dice_weight": 0.7,
+  "bce_weight": 0.3,
+  "deep_supervision_weight": 0.4,
+  "scheduler_step_size": 15,
+  "scheduler_gamma": 0.1,
+  "whu_dir": "./Data/WHU",
+  "levir_dir": "./Data/LEVIR CD"
+}
