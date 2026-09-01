@@ -28,6 +28,49 @@ class ResidualAdapter(nn.Module):
         return x + self.dropout(self.up(self.act(self.bn(self.down(x)))))
 
 
+class ChannelAttention(nn.Module):
+    def __init__(self, channels: int, reduction: int = 16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(channels, channels // reduction, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // reduction, channels, 1, bias=False)
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        avg_out = self.fc(self.avg_pool(x))
+        max_out = self.fc(self.max_pool(x))
+        out = avg_out + max_out
+        return x * self.sigmoid(out)
+
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size: int = 7):
+        super().__init__()
+        self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=kernel_size // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        out = torch.cat([avg_out, max_out], dim=1)
+        out = self.conv(out)
+        return x * self.sigmoid(out)
+
+
+class CBAM(nn.Module):
+    def __init__(self, channels: int, reduction: int = 16):
+        super().__init__()
+        self.ca = ChannelAttention(channels, reduction)
+        self.sa = SpatialAttention()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.sa(self.ca(x))
+
+
 # Pyramid channel widths at each scale (ResNet50 stage outputs).
 STAGE_CHANNELS = {
     "l1": 256,
@@ -55,6 +98,7 @@ class ResNetWithAdapters(nn.Module):
         domain_bn_in_adapter: bool = False,
         unfreeze_layer4: bool = False,
         adapter_stages: Iterable[str] = ("layer1", "layer2", "layer3", "layer4"),
+        use_attention: bool = False,
     ):
         super().__init__()
 
@@ -69,6 +113,7 @@ class ResNetWithAdapters(nn.Module):
         self.domain_bn_in_adapter = domain_bn_in_adapter
         self.unfreeze_layer4 = unfreeze_layer4
         self.adapter_stages = list(adapter_stages)
+        self.use_attention = use_attention
 
         self.domain_adapters = nn.ModuleDict({
             d: nn.ModuleDict({
@@ -97,11 +142,20 @@ class ResNetWithAdapters(nn.Module):
                 for d in self.domain_list
             })
 
+        if self.use_attention:
+            # Per-domain CBAM on the deepest (l4) features -- mirrors where the
+            # decoder's own CBAM sits, on the fused l4 features right before
+            # the bottleneck. One independent CBAM per domain, same spirit as
+            # the per-domain adapters: cheap, trainable, domain-specific.
+            self.domain_attention = nn.ModuleDict({
+                d: CBAM(STAGE_CHANNELS["l4"]) for d in self.domain_list
+            })
+
         self._freeze_backbone()
 
     def _freeze_backbone(self) -> None:
         for name, module in self.named_children():
-            if name in ("domain_adapters", "domain_bns"):
+            if name in ("domain_adapters", "domain_bns", "domain_attention"):
                 continue
             if self.unfreeze_layer4 and name == "layer4":
                 for p in module.parameters():
@@ -119,7 +173,7 @@ class ResNetWithAdapters(nn.Module):
     def train(self, mode: bool = True):
         super().train(mode)
         for name, module in self.named_children():
-            if name in ("domain_adapters", "domain_bns"):
+            if name in ("domain_adapters", "domain_bns", "domain_attention"):
                 continue
             for m in module.modules():
                 if isinstance(m, nn.BatchNorm2d):
@@ -145,6 +199,8 @@ class ResNetWithAdapters(nn.Module):
         params = list(self.domain_adapters[domain].parameters())
         if hasattr(self, "domain_bns") and domain in self.domain_bns:
             params += list(self.domain_bns[domain].parameters())
+        if hasattr(self, "domain_attention") and domain in self.domain_attention:
+            params += list(self.domain_attention[domain].parameters())
         return params
 
     def adapter_parameters(self, domain: str | None = None):
@@ -154,11 +210,17 @@ class ResNetWithAdapters(nn.Module):
             if hasattr(self, "domain_bns"):
                 for p in self.domain_bns.parameters():
                     yield p
+            if hasattr(self, "domain_attention"):
+                for p in self.domain_attention.parameters():
+                    yield p
         else:
             for p in self.domain_adapters[domain].parameters():
                 yield p
             if hasattr(self, "domain_bns") and domain in self.domain_bns:
                 for p in self.domain_bns[domain].parameters():
+                    yield p
+            if hasattr(self, "domain_attention") and domain in self.domain_attention:
+                for p in self.domain_attention[domain].parameters():
                     yield p
 
     def extract_multiscale(self, x: torch.Tensor, domain: str) -> Dict[str, torch.Tensor]:
@@ -175,6 +237,8 @@ class ResNetWithAdapters(nn.Module):
         l2 = self._run_stage(self.layer2, ad["layer2"] if "layer2" in ad else None, bns["layer2"] if (bns and "layer2" in bns) else None, l1)
         l3 = self._run_stage(self.layer3, ad["layer3"] if "layer3" in ad else None, bns["layer3"] if (bns and "layer3" in bns) else None, l2)
         l4 = self._run_stage(self.layer4, ad["layer4"] if "layer4" in ad else None, bns["layer4"] if (bns and "layer4" in bns) else None, l3)
+        if self.use_attention:
+            l4 = self.domain_attention[domain](l4)
         return {"l1": l1, "l2": l2, "l3": l3, "l4": l4}
 
     def extract_features(self, x: torch.Tensor, domain: str):

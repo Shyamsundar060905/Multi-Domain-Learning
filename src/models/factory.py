@@ -18,10 +18,10 @@ def build_change_detection_model(
     fusion_type: str = "abs",
     domain_bn_in_adapter: bool = False,
     unfreeze_layer4: bool = False,
-    use_attention: bool = False,
+    use_attention: bool = True,
     adapter_stages: Iterable[str] = ("layer1", "layer2", "layer3", "layer4"),
 ) -> ChangeDetectionModel:
-    """ResNet50 encoder + per-domain adapters + shared U-Net decoder (domain BN + adapters)."""
+    """ResNet50 encoder + per-domain adapters + CBAM, shared U-Net decoder (domain BN + adapters + CBAM)."""
     domains: List[str] = list(domain_list)
     if not domains:
         raise ValueError("domain_list must contain at least one domain name.")
@@ -33,6 +33,7 @@ def build_change_detection_model(
         domain_bn_in_adapter=domain_bn_in_adapter,
         unfreeze_layer4=unfreeze_layer4,
         adapter_stages=adapter_stages,
+        use_attention=use_attention,
     )
     model = ChangeDetectionModel(
         backbone,
@@ -46,9 +47,19 @@ def build_change_detection_model(
     return model
 
 
-def print_architecture(mode: str = "multi") -> None:
+def print_architecture(mode: str = "multi", adapter_stages: Iterable[str] = (), use_attention: bool = True) -> None:
     label = "Uni-domain" if mode == "uni" else "Multi-domain"
+    stages = list(adapter_stages)
+    encoder_desc = (
+        f"frozen ImageNet ResNet50 + per-domain residual adapters ({', '.join(stages)})"
+        if stages else
+        "frozen ImageNet ResNet50, fully shared (no per-domain adapters)"
+    )
+    if use_attention:
+        encoder_desc += " + per-domain CBAM (l4)"
+    decoder_desc = "shared trainable U-Net (shared convs + per-domain BatchNorm + per-domain residual adapters"
+    decoder_desc += " + shared CBAM (fused l4))" if use_attention else ")"
     print(f"{label} change detection:")
-    print("  Encoder: frozen ImageNet ResNet50 + per-domain residual adapters (l1–l4)")
-    print("  Decoder: shared trainable U-Net (shared convs + per-domain BatchNorm + per-domain residual adapters)")
+    print(f"  Encoder: {encoder_desc}")
+    print(f"  Decoder: {decoder_desc}")
     print("  Fusion:  concat(f1, f2, |f1-f2|) at each scale  |  deep sup on 1st up-stage")

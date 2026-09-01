@@ -88,8 +88,12 @@ def build_parser(defaults=None):
                    help="Unfreeze Layer4 in the ResNet backbone.")
     p.add_argument("--use-color-jitter", action="store_true",
                    help="Apply independent color jitter augmentation to images.")
-    p.add_argument("--use-attention", action="store_true",
-                   help="Add CBAM attention block on the fused l4 features.")
+    p.add_argument("--use-attention", dest="use_attention", action="store_true",
+                   default=defaults.get("use_attention", True),
+                   help="Add per-domain CBAM in the encoder (l4) and shared CBAM in the "
+                        "decoder (fused l4). On by default.")
+    p.add_argument("--no-attention", dest="use_attention", action="store_false",
+                   help="Disable CBAM in both encoder and decoder.")
     p.add_argument("--adapter-stages", type=str, nargs="+",
                    default=defaults.get("adapter_stages", ["layer1", "layer2", "layer3", "layer4"]),
                    choices=["layer1", "layer2", "layer3", "layer4"],
@@ -109,8 +113,6 @@ def build_parser(defaults=None):
         p.set_defaults(unfreeze_layer4=True)
     if defaults.get("use_color_jitter"):
         p.set_defaults(use_color_jitter=True)
-    if defaults.get("use_attention"):
-        p.set_defaults(use_attention=True)
     if defaults.get("use_tta"):
         p.set_defaults(use_tta=True)
     return p
@@ -275,7 +277,7 @@ def main():
         use_attention=args.use_attention,
         adapter_stages=args.adapter_stages,
     )
-    print_architecture(mode=mode)
+    print_architecture(mode=mode, adapter_stages=args.adapter_stages, use_attention=args.use_attention)
 
     count_parameters(model)
 

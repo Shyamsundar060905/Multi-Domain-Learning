@@ -1,4 +1,5 @@
-"""U-Net CD: frozen ResNet encoder + adapters, shared decoder with domain BatchNorm + residual adapters."""
+"""U-Net CD: frozen ResNet encoder + per-domain adapters + CBAM, shared decoder
+with domain BatchNorm + residual adapters + CBAM."""
 
 from __future__ import annotations
 
@@ -9,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.models.adapter_resnet import STAGE_CHANNELS, ResidualAdapter
+from src.models.adapter_resnet import CBAM, STAGE_CHANNELS, ResidualAdapter
 
 
 def build_bitemporal_fusion(f1: torch.Tensor, f2: torch.Tensor, fusion_type: str = "abs") -> torch.Tensor:
@@ -21,49 +22,6 @@ def build_bitemporal_fusion(f1: torch.Tensor, f2: torch.Tensor, fusion_type: str
 
 
 FUSED_CHANNELS = {k: 3 * STAGE_CHANNELS[k] for k in ("l1", "l2", "l3", "l4")}
-
-
-class ChannelAttention(nn.Module):
-    def __init__(self, channels: int, reduction: int = 16):
-        super().__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
-        self.fc = nn.Sequential(
-            nn.Conv2d(channels, channels // reduction, 1, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels // reduction, channels, 1, bias=False)
-        )
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        avg_out = self.fc(self.avg_pool(x))
-        max_out = self.fc(self.max_pool(x))
-        out = avg_out + max_out
-        return x * self.sigmoid(out)
-
-
-class SpatialAttention(nn.Module):
-    def __init__(self, kernel_size: int = 7):
-        super().__init__()
-        self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=kernel_size // 2, bias=False)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        out = torch.cat([avg_out, max_out], dim=1)
-        out = self.conv(out)
-        return x * self.sigmoid(out)
-
-
-class CBAM(nn.Module):
-    def __init__(self, channels: int, reduction: int = 16):
-        super().__init__()
-        self.ca = ChannelAttention(channels, reduction)
-        self.sa = SpatialAttention()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.sa(self.ca(x))
 
 
 class DomainConvBlock(nn.Module):
@@ -150,7 +108,7 @@ class UNetDecoder(nn.Module):
         domain_list: Iterable[str],
         prior: float = 0.02,
         fusion_type: str = "abs",
-        use_attention: bool = False,
+        use_attention: bool = True,
         adapter_reduction: int = 16,
         adapter_dropout: float = 0.1,
     ):
@@ -235,7 +193,7 @@ class ChangeDetectionModel(nn.Module):
         prior: float = 0.02,
         use_deep_supervision: bool = True,
         fusion_type: str = "abs",
-        use_attention: bool = False,
+        use_attention: bool = True,
         decoder_adapter_reduction: int = 16,
         decoder_adapter_dropout: float = 0.1,
     ):
