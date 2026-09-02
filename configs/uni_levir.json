@@ -7,7 +7,6 @@
   "image_size": 512,
   "num_workers": 4,
   "seed": 42,
-  "skip_ewc": true,
   "balance_domain_samples": false,
   "schedule": "per_domain_full_epoch",
   "scheduler_step_size": 15,

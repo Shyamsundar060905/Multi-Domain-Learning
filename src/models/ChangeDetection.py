@@ -1,5 +1,5 @@
 """U-Net CD: frozen ResNet encoder + per-domain adapters + CBAM, shared decoder
-with domain BatchNorm + residual adapters + CBAM."""
+with domain BatchNorm + residual adapters (no decoder attention)."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.models.adapter_resnet import CBAM, STAGE_CHANNELS, ResidualAdapter
+from src.models.adapter_resnet import STAGE_CHANNELS, ResidualAdapter
 
 
 def build_bitemporal_fusion(f1: torch.Tensor, f2: torch.Tensor, fusion_type: str = "abs") -> torch.Tensor:
@@ -19,9 +19,6 @@ def build_bitemporal_fusion(f1: torch.Tensor, f2: torch.Tensor, fusion_type: str
         return torch.cat([f1, f2, torch.abs(f1 - f2), f1 * f2], dim=1)
     else:
         return torch.cat([f1, f2, torch.abs(f1 - f2)], dim=1)
-
-
-FUSED_CHANNELS = {k: 3 * STAGE_CHANNELS[k] for k in ("l1", "l2", "l3", "l4")}
 
 
 class DomainConvBlock(nn.Module):
@@ -101,29 +98,26 @@ class UNetUpStage(nn.Module):
 
 
 class UNetDecoder(nn.Module):
-    """Shared trainable U-Net decoder; BatchNorm + residual adapters are per-domain."""
+    """Shared trainable U-Net decoder; BatchNorm + residual adapters are per-domain.
+
+    No attention here: the fused ``l4`` features go straight into the bottleneck.
+    Channel/spatial recalibration is done once, per domain, on the encoder side
+    (``ResNetWithAdapters.domain_attention``).
+    """
 
     def __init__(
         self,
         domain_list: Iterable[str],
         prior: float = 0.02,
         fusion_type: str = "abs",
-        use_attention: bool = True,
         adapter_reduction: int = 16,
         adapter_dropout: float = 0.1,
     ):
         super().__init__()
         self.domain_list = list(domain_list)
-        self.fusion_type = fusion_type
-        self.use_attention = use_attention
 
         mult = 4 if fusion_type == "abs_prod" else 3
         fused_channels = {k: mult * STAGE_CHANNELS[k] for k in ("l1", "l2", "l3", "l4")}
-
-        if use_attention:
-            self.attention = CBAM(fused_channels["l4"])
-        else:
-            self.attention = nn.Identity()
 
         self.bottleneck = DomainConvBlock(
             fused_channels["l4"], 512, domain_list, kernel_size=1, padding=0,
@@ -152,8 +146,7 @@ class UNetDecoder(nn.Module):
     def forward(
         self, fused_skips: Dict[str, torch.Tensor], domain: str
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        fused_l4 = self.attention(fused_skips["l4"])
-        x = self.bottleneck(fused_l4, domain)
+        x = self.bottleneck(fused_skips["l4"], domain)
 
         x = self.up_stages[0](x, domain, fused_skips["l3"])
         aux = self.aux_classifier(x)
@@ -193,7 +186,6 @@ class ChangeDetectionModel(nn.Module):
         prior: float = 0.02,
         use_deep_supervision: bool = True,
         fusion_type: str = "abs",
-        use_attention: bool = True,
         decoder_adapter_reduction: int = 16,
         decoder_adapter_dropout: float = 0.1,
     ):
@@ -201,7 +193,6 @@ class ChangeDetectionModel(nn.Module):
         self.backbone = backbone
         self.use_deep_supervision = use_deep_supervision
         self.fusion_type = fusion_type
-        self.use_attention = use_attention
 
         if domain_list is None:
             domain_list = getattr(backbone, "domain_list", None)
@@ -215,7 +206,6 @@ class ChangeDetectionModel(nn.Module):
             self.domain_list,
             prior=prior,
             fusion_type=fusion_type,
-            use_attention=use_attention,
             adapter_reduction=decoder_adapter_reduction,
             adapter_dropout=decoder_adapter_dropout,
         )

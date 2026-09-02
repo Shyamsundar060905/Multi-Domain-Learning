@@ -23,15 +23,11 @@ class WHUDataset(Dataset):
         root_dir: str,
         split: str = "train",
         transform: Optional[PairedCDTransform] = None,
-        k_shot: int = 1,
-        q_query: int = 1,
         positive_only: bool = False,
         min_change_pixels: int = 1,
         image_size: int = 512,
     ):
         self.root = os.path.join(root_dir, split)
-        self.k_shot = k_shot
-        self.q_query = q_query
 
         if transform is None:
             transform = get_train_transform(image_size) if split == "train" else get_test_transform(image_size)

@@ -21,7 +21,10 @@ def build_change_detection_model(
     use_attention: bool = True,
     adapter_stages: Iterable[str] = ("layer1", "layer2", "layer3", "layer4"),
 ) -> ChangeDetectionModel:
-    """ResNet50 encoder + per-domain adapters + CBAM, shared U-Net decoder (domain BN + adapters + CBAM)."""
+    """ResNet50 encoder + per-domain adapters + CBAM, shared U-Net decoder (domain BN + adapters).
+
+    ``use_attention`` applies to the encoder only -- the decoder has no attention.
+    """
     domains: List[str] = list(domain_list)
     if not domains:
         raise ValueError("domain_list must contain at least one domain name.")
@@ -40,7 +43,6 @@ def build_change_detection_model(
         domain_list=domains,
         prior=prior,
         fusion_type=fusion_type,
-        use_attention=use_attention,
     )
     if device is not None:
         model = model.to(device)
@@ -57,8 +59,10 @@ def print_architecture(mode: str = "multi", adapter_stages: Iterable[str] = (), 
     )
     if use_attention:
         encoder_desc += " + per-domain CBAM (l4)"
-    decoder_desc = "shared trainable U-Net (shared convs + per-domain BatchNorm + per-domain residual adapters"
-    decoder_desc += " + shared CBAM (fused l4))" if use_attention else ")"
+    decoder_desc = (
+        "shared trainable U-Net (shared convs + per-domain BatchNorm + "
+        "per-domain residual adapters, no attention)"
+    )
     print(f"{label} change detection:")
     print(f"  Encoder: {encoder_desc}")
     print(f"  Decoder: {decoder_desc}")

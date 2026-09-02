@@ -79,9 +79,6 @@ STAGE_CHANNELS = {
     "l4": 2048,
 }
 
-_RESNET_STAGES = ("layer1", "layer2", "layer3", "layer4")
-
-
 class ResNetWithAdapters(nn.Module):
     """Frozen ResNet50 encoder pyramid + trainable per-domain adapters.
 
@@ -108,7 +105,6 @@ class ResNetWithAdapters(nn.Module):
         self.layer3 = base.layer3
         self.layer4 = base.layer4
 
-        self.feature_channels = STAGE_CHANNELS["l4"]
         self.domain_list = list(domain_list)
         self.domain_bn_in_adapter = domain_bn_in_adapter
         self.unfreeze_layer4 = unfreeze_layer4
@@ -143,10 +139,10 @@ class ResNetWithAdapters(nn.Module):
             })
 
         if self.use_attention:
-            # Per-domain CBAM on the deepest (l4) features -- mirrors where the
-            # decoder's own CBAM sits, on the fused l4 features right before
-            # the bottleneck. One independent CBAM per domain, same spirit as
-            # the per-domain adapters: cheap, trainable, domain-specific.
+            # Per-domain CBAM on the deepest (l4) features -- the only attention
+            # in the model; the decoder has none. One independent CBAM per
+            # domain, same spirit as the per-domain adapters: cheap, trainable,
+            # domain-specific.
             self.domain_attention = nn.ModuleDict({
                 d: CBAM(STAGE_CHANNELS["l4"]) for d in self.domain_list
             })
@@ -203,26 +199,6 @@ class ResNetWithAdapters(nn.Module):
             params += list(self.domain_attention[domain].parameters())
         return params
 
-    def adapter_parameters(self, domain: str | None = None):
-        if domain is None:
-            for p in self.domain_adapters.parameters():
-                yield p
-            if hasattr(self, "domain_bns"):
-                for p in self.domain_bns.parameters():
-                    yield p
-            if hasattr(self, "domain_attention"):
-                for p in self.domain_attention.parameters():
-                    yield p
-        else:
-            for p in self.domain_adapters[domain].parameters():
-                yield p
-            if hasattr(self, "domain_bns") and domain in self.domain_bns:
-                for p in self.domain_bns[domain].parameters():
-                    yield p
-            if hasattr(self, "domain_attention") and domain in self.domain_attention:
-                for p in self.domain_attention[domain].parameters():
-                    yield p
-
     def extract_multiscale(self, x: torch.Tensor, domain: str) -> Dict[str, torch.Tensor]:
         if domain not in self.domain_adapters:
             raise KeyError(
@@ -241,13 +217,5 @@ class ResNetWithAdapters(nn.Module):
             l4 = self.domain_attention[domain](l4)
         return {"l1": l1, "l2": l2, "l3": l3, "l4": l4}
 
-    def extract_features(self, x: torch.Tensor, domain: str):
-        feats = self.extract_multiscale(x, domain)
-        return feats["l3"], feats["l4"]
-
     def forward(self, x: torch.Tensor, domain: str) -> torch.Tensor:
         return self.extract_multiscale(x, domain)["l4"]
-
-
-# Alias kept for callers that import this name from main.
-UNetEncoderWithAdapters = ResNetWithAdapters
