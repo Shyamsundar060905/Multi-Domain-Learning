@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import math
 from itertools import cycle
+from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Union
 
 import torch
@@ -134,6 +135,8 @@ class ContinualFewShotTrainer:
         scheduler_gamma: float = 0.1,
         skip_ewc: bool = False,
         use_tta: bool = False,
+        ckpt_dir: str | None = "checkpoints",
+        ckpt_name: str = "best.pt",
     ):
         self.model = model
         self.train_loaders = train_loaders
@@ -144,6 +147,14 @@ class ContinualFewShotTrainer:
         self.domain_list = list(domain_list)
         self.device = device
         self.use_tta = use_tta
+
+        # Best-checkpoint tracking, keyed on the mean eval Dice across domains.
+        self.ckpt_dir = Path(ckpt_dir) if ckpt_dir else None
+        self.ckpt_name = ckpt_name
+        self.best_dice = -1.0
+        self.best_epoch = -1
+        if self.ckpt_dir is not None:
+            self.ckpt_dir.mkdir(parents=True, exist_ok=True)
 
         if isinstance(pos_weight, Mapping):
             self.pos_weight: Dict[str, float] = {
@@ -231,6 +242,56 @@ class ContinualFewShotTrainer:
         for d in self.domain_list:
             n = sum(p.numel() for p in domain_parameters(self.model, d))
             print(f"  - {d} adapters: {n:,} params")
+
+    # ------------------------------------------------------------------
+    @property
+    def ckpt_path(self) -> Path | None:
+        return None if self.ckpt_dir is None else self.ckpt_dir / self.ckpt_name
+
+    def _save_best(self, epoch: int, results: Dict[str, float]) -> bool:
+        """Save the model when mean eval Dice improves. Returns True if saved."""
+        path = self.ckpt_path
+        if path is None or not results:
+            return False
+
+        avg = sum(results.values()) / len(results)
+        if avg <= self.best_dice:
+            return False
+
+        prev = self.best_dice
+        self.best_dice, self.best_epoch = avg, epoch
+
+        payload = {
+            "model": self.model.state_dict(),
+            "epoch": epoch,
+            "avg_eval_dice": avg,
+            "per_domain_dice": dict(results),
+            "domain_list": list(self.domain_list),
+        }
+        # Write to a temp file first: a run killed mid-save leaves the previous
+        # best intact instead of a truncated checkpoint.
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        torch.save(payload, tmp)
+        tmp.replace(path)
+
+        delta = "" if prev < 0 else f" (was {prev:.4f})"
+        print(f"  * new best avg Dice {avg:.4f}{delta} -- saved {path}")
+        return True
+
+    def _load_best(self) -> bool:
+        """Restore the best checkpoint in place. Returns True if one was loaded."""
+        path = self.ckpt_path
+        if path is None or not path.exists():
+            return False
+        ckpt = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(ckpt["model"])
+        self.best_epoch = ckpt.get("epoch", self.best_epoch)
+        self.best_dice = ckpt.get("avg_eval_dice", self.best_dice)
+        print(
+            f"Restored best checkpoint from epoch {self.best_epoch} "
+            f"(avg eval Dice {self.best_dice:.4f})"
+        )
+        return True
 
     # ------------------------------------------------------------------
     def train_step(self, batch, domain: str):
@@ -375,12 +436,13 @@ class ContinualFewShotTrainer:
                 self.decoder_scheduler.step()
 
             if self.eval_loaders:
-                self.evaluate_all(
+                results = self.evaluate_all(
                     epoch=epoch + 1,
                     total_epochs=epochs,
                     loaders=self.eval_loaders,
                     domain_splits=self.eval_domain_splits,
                 )
+                self._save_best(epoch + 1, results)
             # Also track LEVIR held-out test each epoch (val alone is misleading).
             if (
                 self.test_loaders
@@ -398,10 +460,16 @@ class ContinualFewShotTrainer:
         # Final held-out test before EWC (Fisher passes must not run in train mode
         # or shared decoder BatchNorm running stats get corrupted).
         if self.test_loaders:
+            restored = self._load_best()
+            header = (
+                f"Final test (held-out, pre-EWC) -- best checkpoint, epoch {self.best_epoch}"
+                if restored
+                else "Final test (held-out, pre-EWC) -- last epoch, no checkpoint saved"
+            )
             self.evaluate_all(
                 loaders=self.test_loaders,
                 domain_splits=self.test_domain_splits,
-                header="Final test (held-out, pre-EWC)",
+                header=header,
             )
 
         if self.skip_ewc:

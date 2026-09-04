@@ -31,7 +31,8 @@ def build_parser(defaults=None):
                    help="Skip post-training EWC Fisher consolidation (safe for joint training).")
     p.add_argument("--pos-weight", type=float, default=defaults.get("pos_weight", 20.0),
                    help="Global pos_weight; overridden by --pos-weight-per-domain if set.")
-    p.add_argument("--pos-weight-per-domain", type=str, nargs="*", default=None,
+    p.add_argument("--pos-weight-per-domain", type=str, nargs="*",
+                   default=defaults.get("pos_weight_per_domain"),
                    help="Per-domain pos_weight overrides, e.g. WHU=7 LEVIR=28.")
     p.add_argument("--focal-gamma", type=float, default=defaults.get("focal_gamma", 2.0))
     p.add_argument("--dice-weight", type=float, default=defaults.get("dice_weight", 0.7))
@@ -95,9 +96,18 @@ def build_parser(defaults=None):
                    help="Stages in ResNet backbone to place adapters.")
     p.add_argument("--use-tta", action="store_true",
                    help="Enable Test-Time Augmentation (hflip/vflip averaging) during eval.")
-    
+    p.add_argument("--ckpt-dir", type=str, default=defaults.get("ckpt_dir", "checkpoints"),
+                   help="Directory for the best-model checkpoint. The final held-out "
+                        "test runs on this checkpoint, not the last epoch.")
+    p.add_argument("--ckpt-name", type=str, default=defaults.get("ckpt_name", "best.pt"),
+                   help="Filename of the best-model checkpoint inside --ckpt-dir.")
+    p.add_argument("--no-checkpoint", dest="ckpt_dir", action="store_const", const=None,
+                   help="Disable checkpointing entirely.")
+
     if defaults.get("skip_ewc"):
         p.set_defaults(skip_ewc=True)
+    if defaults.get("positive_only"):
+        p.set_defaults(positive_only=True)
     if "balance_domain_samples" in defaults:
         p.set_defaults(balance_domain_samples=defaults["balance_domain_samples"])
     if defaults.get("domain_bn_in_adapter"):
@@ -318,6 +328,8 @@ def main():
         scheduler_gamma=args.scheduler_gamma,
         skip_ewc=args.skip_ewc,
         use_tta=args.use_tta,
+        ckpt_dir=args.ckpt_dir,
+        ckpt_name=args.ckpt_name,
     )
 
     print("Starting training...")
