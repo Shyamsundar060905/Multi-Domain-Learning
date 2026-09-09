@@ -1,17 +1,14 @@
-"""Continual / joint trainer for multi-domain binary change detection.
+"""Joint trainer for multi-domain binary change detection.
 
-Notebook-style architecture:
-- Per-domain optimiser + scheduler (Adam state never crosses domains).
+- Per-domain optimiser + scheduler (Adam state never crosses domains), plus one
+  shared optimiser for the decoder's shared conv weights.
 - ``freeze_domain`` called at the start of every domain block so the active
   domain is the only one with ``requires_grad=True``.
 - Three schedule modes:
-    * ``round_robin``: alternate domains every batch (balanced shared-state
-      experiment; with fully per-domain decoders there is no shared state, so
-      this becomes equivalent to a fine-grained interleaving).
-    * ``sequential``: ``min_len`` batches of the first domain then ``min_len``
-      batches of the next, inside one outer epoch.
-    * ``per_domain_full_epoch``: full inner epoch of each domain per outer
-      epoch (mirrors the notebook's training loop).
+    * ``round_robin``: alternate domains every batch.
+    * ``sequential``: a full block of the first domain then the next, inside one
+      outer epoch (each block sized to the largest domain's loader).
+    * ``per_domain_full_epoch``: full inner epoch of each domain per outer epoch.
 """
 
 from __future__ import annotations
@@ -26,7 +23,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from src.training.ewc import EWC
 from src.utils.helpers import domain_parameters, freeze_domain, shared_parameters
 
 
@@ -108,7 +104,7 @@ def _segmentation_metrics(logits: torch.Tensor, target: torch.Tensor):
 # Trainer
 # ---------------------------------------------------------------------------
 
-class ContinualFewShotTrainer:
+class MultiDomainTrainer:
     """Per-domain optimisers + schedulers for multi-domain CD."""
 
     def __init__(
@@ -123,17 +119,15 @@ class ContinualFewShotTrainer:
         test_domain_splits: Dict[str, str] | None = None,
         lr: float = 1e-4,
         weight_decay: float = 1e-4,
-        ewc_lambda: float = 1e4,
         pos_weight: PosWeightLike = 20.0,
         focal_gamma: float = 2.0,
         dice_weight: float = 0.7,
         bce_weight: float = 0.3,
-        deep_supervision_weight: float = 0.4,
+        deep_supervision_weight: float = 1.0,
         schedule: str = "per_domain_full_epoch",
         domain_order: Iterable[str] | None = None,
         scheduler_step_size: int = 15,
         scheduler_gamma: float = 0.1,
-        skip_ewc: bool = False,
         use_tta: bool = False,
         ckpt_dir: str | None = "checkpoints",
         ckpt_name: str = "best.pt",
@@ -173,7 +167,6 @@ class ContinualFewShotTrainer:
                 "schedule must be one of round_robin, sequential, per_domain_full_epoch"
             )
         self.schedule = schedule
-        self.skip_ewc = skip_ewc
 
         if domain_order is None:
             self.domain_order = list(self.domain_list)
@@ -205,8 +198,6 @@ class ContinualFewShotTrainer:
             self.decoder_scheduler = torch.optim.lr_scheduler.StepLR(
                 self.decoder_optimizer, step_size=scheduler_step_size, gamma=scheduler_gamma
             )
-
-        self.ewc = EWC(model, ewc_lambda=ewc_lambda)
 
         # Keep all backbone BatchNorms in eval mode (they are frozen).
         self._lock_backbone_bn()
@@ -330,10 +321,23 @@ class ContinualFewShotTrainer:
                 bce_weight=self.bce_weight,
             )
             loss = loss + self.deep_supervision_weight * aux_loss
-        ewc_loss = self.ewc.penalty(self.model)
-        total = loss + ewc_loss
 
-        total.backward()
+        # Self-distillation: pull the auxiliary head toward the main head.
+        # Both are pooled to the aux head's *native* resolution (the bottleneck
+        # sits at H/32) -- aux_logits arrives already bilinearly upsampled to
+        # full size, so comparing there would only penalise it for blur it
+        # cannot represent.  The teacher is detached, so gradients move aux
+        # toward main and never the reverse.
+        distill_val = 0.0
+        if aux_logits is not None:
+            size = max(logits.shape[-1] // 32, 1)
+            teacher = F.adaptive_avg_pool2d(logits.detach(), size)
+            student = F.adaptive_avg_pool2d(aux_logits, size)
+            distill = F.mse_loss(student, teacher)
+            loss = loss + distill
+            distill_val = float(distill.detach())
+
+        loss.backward()
         trainable = domain_parameters(self.model, domain) + shared_parameters(self.model)
         torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
         opt.step()
@@ -342,7 +346,7 @@ class ContinualFewShotTrainer:
 
         with torch.no_grad():
             _, dice, _ = _segmentation_metrics(logits, mask)
-        return loss.item(), float(ewc_loss), dice.item(), mask.sum().item()
+        return loss.item(), dice.item(), mask.sum().item(), distill_val
 
     # ------------------------------------------------------------------
     def _train_domain_block(self, domain: str, loader, epoch: int, epochs: int):
@@ -356,14 +360,14 @@ class ContinualFewShotTrainer:
         n = 0
         pbar = tqdm(loader, desc=f"[{domain} | epoch {epoch+1}/{epochs}]", leave=False)
         for batch in pbar:
-            loss, ewc_loss, dice, msum = self.train_step(batch, domain)
+            loss, dice, msum, dst = self.train_step(batch, domain)
             running_loss += loss
             running_dice += dice
             n += 1
             pbar.set_postfix({
                 "loss": f"{loss:.4f}",
                 "dice": f"{dice:.4f}",
-                "ewc":  f"{ewc_loss:.4f}",
+                "dst": f"{dst:.4f}",
                 "msum": int(msum),
             })
 
@@ -385,13 +389,14 @@ class ContinualFewShotTrainer:
             if domain != prev:
                 freeze_domain(self.model, domain)
                 prev = domain
-            loss, ewc_loss, dice, msum = self.train_step(batch, domain)
+            loss, dice, msum, dst = self.train_step(batch, domain)
             running[domain][0] += loss
             running[domain][1] += dice
             running[domain][2] += 1
             pbar.set_postfix({
                 "dom": domain, "loss": f"{loss:.4f}",
-                "dice": f"{dice:.4f}", "msum": int(msum),
+                "dice": f"{dice:.4f}", "dst": f"{dst:.4f}",
+                "msum": int(msum),
             })
         for d, (lsum, dsum, n) in running.items():
             if n:
@@ -457,33 +462,20 @@ class ContinualFewShotTrainer:
                     total_epochs=epochs,
                 )
 
-        # Final held-out test before EWC (Fisher passes must not run in train mode
-        # or shared decoder BatchNorm running stats get corrupted).
+        # Final held-out test on the BEST checkpoint, not whatever the last
+        # epoch happened to land on.
         if self.test_loaders:
             restored = self._load_best()
             header = (
-                f"Final test (held-out, pre-EWC) -- best checkpoint, epoch {self.best_epoch}"
+                f"Final test (held-out) -- best checkpoint, epoch {self.best_epoch}"
                 if restored
-                else "Final test (held-out, pre-EWC) -- last epoch, no checkpoint saved"
+                else "Final test (held-out) -- last epoch, no checkpoint saved"
             )
             self.evaluate_all(
                 loaders=self.test_loaders,
                 domain_splits=self.test_domain_splits,
                 header=header,
             )
-
-        if self.skip_ewc:
-            print("\nSkipping EWC consolidation (--skip-ewc).")
-        else:
-            print("\nConsolidating weights for all domains (EWC)...")
-            try:
-                for domain in self.domain_list:
-                    if domain in self.train_loaders:
-                        self.ewc.remember_task(domain, self.train_loaders[domain], self.device)
-                print("EWC consolidation complete.")
-            except Exception as exc:
-                print(f"[Warning] EWC consolidation failed: {exc}")
-                print("Training weights are kept; continuing to evaluation.")
 
     # ------------------------------------------------------------------
     def evaluate(

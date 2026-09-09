@@ -36,8 +36,6 @@ STAGE_CHANNELS = {
     "l4": 2048,
 }
 
-_RESNET_STAGES = ("layer1", "layer2", "layer3", "layer4")
-
 
 class ResNetWithAdapters(nn.Module):
     """Frozen ResNet50 encoder pyramid + trainable per-domain adapters.
@@ -147,20 +145,6 @@ class ResNetWithAdapters(nn.Module):
             params += list(self.domain_bns[domain].parameters())
         return params
 
-    def adapter_parameters(self, domain: str | None = None):
-        if domain is None:
-            for p in self.domain_adapters.parameters():
-                yield p
-            if hasattr(self, "domain_bns"):
-                for p in self.domain_bns.parameters():
-                    yield p
-        else:
-            for p in self.domain_adapters[domain].parameters():
-                yield p
-            if hasattr(self, "domain_bns") and domain in self.domain_bns:
-                for p in self.domain_bns[domain].parameters():
-                    yield p
-
     def extract_multiscale(self, x: torch.Tensor, domain: str) -> Dict[str, torch.Tensor]:
         if domain not in self.domain_adapters:
             raise KeyError(
@@ -177,13 +161,6 @@ class ResNetWithAdapters(nn.Module):
         l4 = self._run_stage(self.layer4, ad["layer4"] if "layer4" in ad else None, bns["layer4"] if (bns and "layer4" in bns) else None, l3)
         return {"l1": l1, "l2": l2, "l3": l3, "l4": l4}
 
-    def extract_features(self, x: torch.Tensor, domain: str):
-        feats = self.extract_multiscale(x, domain)
-        return feats["l3"], feats["l4"]
-
     def forward(self, x: torch.Tensor, domain: str) -> torch.Tensor:
         return self.extract_multiscale(x, domain)["l4"]
 
-
-# Alias kept for callers that import this name from main.
-UNetEncoderWithAdapters = ResNetWithAdapters

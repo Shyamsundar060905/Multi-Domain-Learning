@@ -80,7 +80,7 @@ def verify_levir_splits(root_dir: str, splits: Dict[str, List[str]]) -> None:
 # Dataset
 # ---------------------------------------------------------------------------
 
-class LEVIRFewShotDataset(Dataset):
+class LEVIRDataset(Dataset):
     """LEVIR-CD dataset (``root_dir/<split>/{A,B,label}``).
 
     Uses the official ``train/``, ``val/``, and ``test/`` folders.  All splits
@@ -97,8 +97,6 @@ class LEVIRFewShotDataset(Dataset):
         root_dir: str,
         split: str = "train",
         transform: Optional[PairedCDTransform] = None,
-        k_shot: int = 1,
-        q_query: int = 1,
         positive_only: bool = False,
         min_change_pixels: int = 1,
         image_size: int = 512,
@@ -111,14 +109,12 @@ class LEVIRFewShotDataset(Dataset):
         self.root_dir = root_dir
         self.split = split
         self.root = os.path.join(root_dir, split)
-        self.k_shot = k_shot
-        self.q_query = q_query
 
         if transform is None:
             transform = get_train_transform(image_size) if split == "train" else get_test_transform(image_size)
         elif not isinstance(transform, PairedCDTransform):
             raise TypeError(
-                "LEVIRFewShotDataset requires a PairedCDTransform (or None) so "
+                "LEVIRDataset requires a PairedCDTransform (or None) so "
                 "image/mask augmentations stay synchronised."
             )
         self.paired_transform = transform

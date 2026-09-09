@@ -4,17 +4,17 @@ import json
 import torch
 from torch.utils.data import DataLoader, RandomSampler
 
-from src.data.LEVIR_dataset import LEVIRFewShotDataset, list_image_names, verify_levir_splits
+from src.data.LEVIR_dataset import LEVIRDataset, list_image_names, verify_levir_splits
 from src.data.WHU_dataset import WHUDataset
 from src.data.transforms import get_test_transform, get_train_transform
 from src.models.factory import build_change_detection_model, print_architecture
-from src.training.trainer import ContinualFewShotTrainer
+from src.training.trainer import MultiDomainTrainer
 from src.utils.helpers import count_parameters, set_seed
 
 
 def build_parser(defaults=None):
     defaults = defaults or {}
-    p = argparse.ArgumentParser(description="Multi-Domain Change Detection (adapters + EWC)")
+    p = argparse.ArgumentParser(description="Multi-Domain Change Detection (per-domain adapters)")
     p.add_argument("--config", type=str, default=None)
     p.add_argument("--epochs", type=int, default=defaults.get("epochs", 10))
     p.add_argument("--lr", type=float, default=defaults.get("lr", 1e-4))
@@ -23,12 +23,6 @@ def build_parser(defaults=None):
     p.add_argument("--image-size", type=int, default=defaults.get("image_size", 512))
     p.add_argument("--num-workers", type=int, default=defaults.get("num_workers", 4))
     p.add_argument("--seed", type=int, default=defaults.get("seed", 42))
-    p.add_argument("--n-way", type=int, default=defaults.get("n_way", 5))
-    p.add_argument("--k-shot", type=int, default=defaults.get("k_shot", 1))
-    p.add_argument("--q-query", type=int, default=defaults.get("q_query", 15))
-    p.add_argument("--ewc-lambda", type=float, default=defaults.get("ewc_lambda", 1000.0))
-    p.add_argument("--skip-ewc", action="store_true",
-                   help="Skip post-training EWC Fisher consolidation (safe for joint training).")
     p.add_argument("--pos-weight", type=float, default=defaults.get("pos_weight", 20.0),
                    help="Global pos_weight; overridden by --pos-weight-per-domain if set.")
     p.add_argument("--pos-weight-per-domain", type=str, nargs="*",
@@ -38,8 +32,8 @@ def build_parser(defaults=None):
     p.add_argument("--dice-weight", type=float, default=defaults.get("dice_weight", 0.7))
     p.add_argument("--bce-weight", type=float, default=defaults.get("bce_weight", 0.3))
     p.add_argument("--deep-supervision-weight", type=float,
-                   default=defaults.get("deep_supervision_weight", 0.4),
-                   help="Weight on the layer3 auxiliary segmentation loss.")
+                   default=defaults.get("deep_supervision_weight", 1.0),
+                   help="Weight on the bottleneck auxiliary segmentation loss.")
     p.add_argument("--oversample-cap", type=float,
                    default=defaults.get("oversample_cap", 4.0),
                    help="Max oversampling factor for smaller domains (e.g. 4 = "
@@ -77,7 +71,6 @@ def build_parser(defaults=None):
                         "Use one name for uni-domain baselines, e.g. --domains WHU.")
     p.add_argument("--whu-dir", type=str, default=defaults.get("whu_dir", "./Data/WHU"))
     p.add_argument("--levir-dir", type=str, default=defaults.get("levir_dir", "./Data/LEVIR CD"))
-    p.add_argument("--use-change-datasets", action="store_true")
     p.add_argument("--device", type=str, default=defaults.get("device", "cuda" if torch.cuda.is_available() else "cpu"),
                    help="Device to run on, e.g. cuda, cuda:0, cuda:7, or cpu.")
     p.add_argument("--fusion-type", type=str, default=defaults.get("fusion_type", "abs"),
@@ -104,8 +97,6 @@ def build_parser(defaults=None):
     p.add_argument("--no-checkpoint", dest="ckpt_dir", action="store_const", const=None,
                    help="Disable checkpointing entirely.")
 
-    if defaults.get("skip_ewc"):
-        p.set_defaults(skip_ewc=True)
     if defaults.get("positive_only"):
         p.set_defaults(positive_only=True)
     if "balance_domain_samples" in defaults:
@@ -127,9 +118,6 @@ def _make_loaders(args):
     train_transform = get_train_transform(args.image_size, use_color_jitter=args.use_color_jitter)
     test_transform = get_test_transform(args.image_size)
     train_loaders, eval_loaders, test_loaders = {}, {}, {}
-
-    if not args.use_change_datasets:
-        return train_loaders, eval_loaders, test_loaders
 
     requested = args.domains or ["WHU", "LEVIR"]
     print(f"Loading datasets: {', '.join(requested)}...")
@@ -171,15 +159,15 @@ def _make_loaders(args):
                 f"{len(levir_splits['test'])} test"
             )
 
-            levir_train = LEVIRFewShotDataset(
+            levir_train = LEVIRDataset(
                 root_dir=args.levir_dir, split="train", transform=train_transform,
                 positive_only=args.positive_only, image_size=args.image_size,
             )
-            levir_val = LEVIRFewShotDataset(
+            levir_val = LEVIRDataset(
                 root_dir=args.levir_dir, split="val", transform=test_transform,
                 image_size=args.image_size,
             )
-            levir_test = LEVIRFewShotDataset(
+            levir_test = LEVIRDataset(
                 root_dir=args.levir_dir, split="test", transform=test_transform,
                 image_size=args.image_size,
             )
@@ -267,7 +255,7 @@ def main():
     train_loaders, eval_loaders, test_loaders = _make_loaders(args)
     domain_list = list(train_loaders.keys())
     if not domain_list:
-        raise SystemExit("No domains loaded -- enable --use-change-datasets and check data paths.")
+        raise SystemExit("No domains loaded -- check --whu-dir / --levir-dir and --domains.")
 
     print(f"Image size: {args.image_size}x{args.image_size}")
     mode = "uni" if len(domain_list) == 1 else "multi"
@@ -305,7 +293,7 @@ def main():
         defaults_pw = {"WHU": 7.0, "LEVIR": 45.0}
         pos_weight_arg = {d: defaults_pw.get(d, args.pos_weight) for d in domain_list}
 
-    trainer = ContinualFewShotTrainer(
+    trainer = MultiDomainTrainer(
         model=model,
         train_loaders=train_loaders,
         eval_loaders=eval_loaders,
@@ -316,7 +304,6 @@ def main():
         device=device,
         lr=args.lr,
         weight_decay=args.weight_decay,
-        ewc_lambda=args.ewc_lambda,
         pos_weight=pos_weight_arg,
         focal_gamma=args.focal_gamma,
         dice_weight=args.dice_weight,
@@ -326,7 +313,6 @@ def main():
         domain_order=domain_order,
         scheduler_step_size=args.scheduler_step_size,
         scheduler_gamma=args.scheduler_gamma,
-        skip_ewc=args.skip_ewc,
         use_tta=args.use_tta,
         ckpt_dir=args.ckpt_dir,
         ckpt_name=args.ckpt_name,

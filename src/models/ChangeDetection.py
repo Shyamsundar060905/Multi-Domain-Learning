@@ -20,9 +20,6 @@ def build_bitemporal_fusion(f1: torch.Tensor, f2: torch.Tensor, fusion_type: str
         return torch.cat([f1, f2, torch.abs(f1 - f2)], dim=1)
 
 
-FUSED_CHANNELS = {k: 3 * STAGE_CHANNELS[k] for k in ("l1", "l2", "l3", "l4")}
-
-
 class ChannelAttention(nn.Module):
     def __init__(self, channels: int, reduction: int = 16):
         super().__init__()
@@ -184,7 +181,9 @@ class UNetDecoder(nn.Module):
         ])
 
         self.classifier = nn.Conv2d(32, 1, kernel_size=1)
-        self.aux_classifier = nn.Conv2d(256, 1, kernel_size=1)
+        # Deep supervision on the bottleneck output (512ch at H/32), before the
+        # first up-stage.  Upsampled to the input size in ChangeDetectionModel.
+        self.aux_classifier = nn.Conv2d(512, 1, kernel_size=1)
 
         prior_bias = math.log(prior / (1.0 - prior))
         for head in (self.classifier, self.aux_classifier):
@@ -196,10 +195,9 @@ class UNetDecoder(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         fused_l4 = self.attention(fused_skips["l4"])
         x = self.bottleneck(fused_l4, domain)
-
-        x = self.up_stages[0](x, domain, fused_skips["l3"])
         aux = self.aux_classifier(x)
 
+        x = self.up_stages[0](x, domain, fused_skips["l3"])
         x = self.up_stages[1](x, domain, fused_skips["l2"])
         x = self.up_stages[2](x, domain, fused_skips["l1"])
         x = self.up_stages[3](x, domain)
