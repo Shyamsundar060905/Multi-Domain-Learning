@@ -139,6 +139,46 @@ class UNetUpStage(nn.Module):
         return x
 
 
+class AuxDecoder(nn.Module):
+    """Lightweight skip-free decoder for the auxiliary head.
+
+    Lifts the bottleneck output (H/32) to full resolution with a stack of
+    stride-2 transposed convolutions, so the auxiliary prediction is made at
+    the same resolution as the main head rather than being a x32 bilinear
+    blur of a 16x16 map.  Deliberately has no skip connections and thin
+    channels -- it is meant to be a cheap exit, not a second decoder.
+
+    Shared transposed convs + per-domain BatchNorm, matching DomainConvBlock's
+    split, but without the residual adapters.
+    """
+
+    def __init__(
+        self,
+        in_ch: int,
+        domain_list: Iterable[str],
+        widths: Tuple[int, ...] = (128, 64, 32, 16, 16),
+    ):
+        super().__init__()
+        self.ups = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        ch = in_ch
+        for w in widths:
+            self.ups.append(
+                nn.ConvTranspose2d(ch, w, kernel_size=2, stride=2, bias=False)
+            )
+            self.norms.append(
+                nn.ModuleDict({d: nn.BatchNorm2d(w) for d in domain_list})
+            )
+            ch = w
+        self.act = nn.ReLU(inplace=True)
+        self.classifier = nn.Conv2d(ch, 1, kernel_size=1)
+
+    def forward(self, x: torch.Tensor, domain: str) -> torch.Tensor:
+        for up, norm in zip(self.ups, self.norms):
+            x = self.act(norm[domain](up(x)))
+        return self.classifier(x)
+
+
 class UNetDecoder(nn.Module):
     """Shared trainable U-Net decoder; BatchNorm + residual adapters are per-domain."""
 
@@ -181,12 +221,14 @@ class UNetDecoder(nn.Module):
         ])
 
         self.classifier = nn.Conv2d(32, 1, kernel_size=1)
-        # Deep supervision on the bottleneck output (512ch at H/32), before the
-        # first up-stage.  Upsampled to the input size in ChangeDetectionModel.
-        self.aux_classifier = nn.Conv2d(512, 1, kernel_size=1)
+        # Auxiliary branch off the bottleneck (512ch at H/32), with its own
+        # cheap transposed-conv stack back to full resolution.  Five stride-2
+        # steps take H/32 -> H, so the aux logits match the main head exactly
+        # and no bilinear upsampling is needed.
+        self.aux_decoder = AuxDecoder(512, domain_list)
 
         prior_bias = math.log(prior / (1.0 - prior))
-        for head in (self.classifier, self.aux_classifier):
+        for head in (self.classifier, self.aux_decoder.classifier):
             nn.init.normal_(head.weight, std=0.01)
             nn.init.constant_(head.bias, prior_bias)
 
@@ -195,7 +237,7 @@ class UNetDecoder(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         fused_l4 = self.attention(fused_skips["l4"])
         x = self.bottleneck(fused_l4, domain)
-        aux = self.aux_classifier(x)
+        aux = self.aux_decoder(x, domain)
 
         x = self.up_stages[0](x, domain, fused_skips["l3"])
         x = self.up_stages[1](x, domain, fused_skips["l2"])
@@ -287,12 +329,17 @@ class ChangeDetectionModel(nn.Module):
 
         logits, aux = self.decoder(fused, domain)
 
-        if self.use_deep_supervision and self.training and aux is not None:
+        # ``aux`` is returned in eval mode too, so the auxiliary head can be
+        # scored as a standalone predictor alongside the main head.  It is
+        # suppressed only when deep supervision is switched off entirely.
+        if not self.use_deep_supervision:
+            aux = None
+        elif aux is not None and aux.shape[-2:] != img1.shape[-2:]:
+            # AuxDecoder already emits full resolution; this only fires if the
+            # input size is not divisible by 32.
             aux = F.interpolate(
                 aux, size=img1.shape[-2:], mode="bilinear", align_corners=False
             )
-        else:
-            aux = None
 
         return logits, aux
 

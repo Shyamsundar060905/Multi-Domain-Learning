@@ -86,6 +86,72 @@ def _sequential(loaders: Dict, batches_per_domain: int, order: List[str]):
 # Metrics
 # ---------------------------------------------------------------------------
 
+class _LossAccum:
+    """Running means of each loss term over an epoch (or a domain block)."""
+
+    KEYS = ("total", "main", "aux", "distill", "dice", "aux_dice")
+
+    def __init__(self):
+        self.sums = {k: 0.0 for k in self.KEYS}
+        self.n = 0
+
+    def add(self, stats: Dict[str, float]) -> None:
+        for k in self.KEYS:
+            self.sums[k] += stats.get(k, 0.0)
+        self.n += 1
+
+    def mean(self, key: str) -> float:
+        return self.sums[key] / max(self.n, 1)
+
+    def summary(self, trainer) -> str:
+        """One line showing every term, weighted as it enters the objective."""
+        w, a = trainer.deep_supervision_weight, trainer.distill_alpha
+        parts = [
+            f"loss={self.mean('total'):.4f}",
+            f"(main={self.mean('main'):.4f}",
+            f"aux={self.mean('aux'):.4f}x{w:g}",
+        ]
+        if a > 0.0:
+            parts.append(f"dst={self.mean('distill'):.4f}x{a:g}")
+        parts[-1] += ")"
+        parts.append(f"dice={self.mean('dice'):.4f}")
+        if self.sums["aux_dice"] > 0.0:
+            parts.append(f"aux_dice={self.mean('aux_dice'):.4f}")
+        return "  ".join(parts)
+
+
+def _tta_logits(model, img1: torch.Tensor, img2: torch.Tensor, domain: str):
+    """Average identity / hflip / vflip predictions, for both heads.
+
+    Averaging is done in probability space and converted back to logits so the
+    caller can keep using the same metric function.
+    """
+    eps = 1e-7
+    views = [
+        (lambda t: t, lambda t: t),                                   # identity
+        (lambda t: torch.flip(t, dims=[-1]), lambda t: torch.flip(t, dims=[-1])),
+        (lambda t: torch.flip(t, dims=[-2]), lambda t: torch.flip(t, dims=[-2])),
+    ]
+
+    main_sum, aux_sum, k = None, None, 0
+    for fwd, inv in views:
+        lo, ax = model(fwd(img1), fwd(img2), domain)
+        p = inv(torch.sigmoid(lo))
+        main_sum = p if main_sum is None else main_sum + p
+        if ax is not None:
+            pa = inv(torch.sigmoid(ax))
+            aux_sum = pa if aux_sum is None else aux_sum + pa
+        k += 1
+
+    def _to_logits(prob_sum):
+        if prob_sum is None:
+            return None
+        p = torch.clamp(prob_sum / k, eps, 1.0 - eps)
+        return torch.log(p / (1.0 - p))
+
+    return _to_logits(main_sum), _to_logits(aux_sum)
+
+
 def _segmentation_metrics(logits: torch.Tensor, target: torch.Tensor):
     probs = torch.sigmoid(logits)
     pred = (probs > 0.5).float()
@@ -289,6 +355,18 @@ class MultiDomainTrainer:
         return True
 
     # ------------------------------------------------------------------
+    def _postfix(self, stats: Dict[str, float]) -> Dict[str, str]:
+        out = {
+            "loss": f"{stats['total']:.4f}",
+            "main": f"{stats['main']:.4f}",
+            "aux": f"{stats['aux']:.4f}",
+        }
+        if self.distill_alpha > 0.0:
+            out["dst"] = f"{stats['distill']:.4f}"
+        out["dice"] = f"{stats['dice']:.4f}"
+        out["msum"] = int(stats["msum"])
+        return out
+
     def train_step(self, batch, domain: str):
         img1, img2, mask = batch
         img1 = img1.to(self.device, non_blocking=True)
@@ -309,13 +387,15 @@ class MultiDomainTrainer:
             self.decoder_optimizer.zero_grad(set_to_none=True)
 
         logits, aux_logits = self.model(img1, img2, domain)
-        loss = change_detection_loss(
+        main_loss = change_detection_loss(
             logits, mask,
             pos_weight=self.pos_weight[domain],
             gamma=self.focal_gamma,
             dice_weight=self.dice_weight,
             bce_weight=self.bce_weight,
         )
+        loss = main_loss
+        aux_val = 0.0
         if aux_logits is not None:
             aux_loss = change_detection_loss(
                 aux_logits, mask,
@@ -325,19 +405,16 @@ class MultiDomainTrainer:
                 bce_weight=self.bce_weight,
             )
             loss = loss + self.deep_supervision_weight * aux_loss
+            aux_val = float(aux_loss.detach())
 
         # Self-distillation: pull the auxiliary head toward the main head.
-        # Both are pooled to the aux head's *native* resolution (the bottleneck
-        # sits at H/32) -- aux_logits arrives already bilinearly upsampled to
-        # full size, so comparing there would only penalise it for blur it
-        # cannot represent.  The teacher is detached, so gradients move aux
-        # toward main and never the reverse.
+        # Both predict at full resolution now (AuxDecoder upsamples with its
+        # own transposed convs), so the comparison is direct -- no pooling.
+        # The teacher is detached, so gradients move aux toward main and
+        # never the reverse.
         distill_val = 0.0
         if aux_logits is not None and self.distill_alpha > 0.0:
-            size = max(logits.shape[-1] // 32, 1)
-            teacher = F.adaptive_avg_pool2d(logits.detach(), size)
-            student = F.adaptive_avg_pool2d(aux_logits, size)
-            distill = F.mse_loss(student, teacher)
+            distill = F.mse_loss(aux_logits, logits.detach())
             loss = loss + self.distill_alpha * distill
             distill_val = float(distill.detach())
 
@@ -350,7 +427,22 @@ class MultiDomainTrainer:
 
         with torch.no_grad():
             _, dice, _ = _segmentation_metrics(logits, mask)
-        return loss.item(), dice.item(), mask.sum().item(), distill_val
+            aux_dice = 0.0
+            if aux_logits is not None:
+                _, ad, _ = _segmentation_metrics(aux_logits, mask)
+                aux_dice = ad.item()
+
+        # Raw (unweighted) values for each term, so the epoch summary can show
+        # how the three parts of the objective actually balance.
+        return {
+            "total": loss.item(),
+            "main": float(main_loss.detach()),
+            "aux": aux_val,
+            "distill": distill_val,
+            "dice": dice.item(),
+            "aux_dice": aux_dice,
+            "msum": mask.sum().item(),
+        }
 
     # ------------------------------------------------------------------
     def _train_domain_block(self, domain: str, loader, epoch: int, epochs: int):
@@ -360,52 +452,36 @@ class MultiDomainTrainer:
         """
         freeze_domain(self.model, domain)
 
-        running_loss = running_dice = 0.0
-        n = 0
+        acc = _LossAccum()
         pbar = tqdm(loader, desc=f"[{domain} | epoch {epoch+1}/{epochs}]", leave=False)
         for batch in pbar:
-            loss, dice, msum, dst = self.train_step(batch, domain)
-            running_loss += loss
-            running_dice += dice
-            n += 1
-            postfix = {"loss": f"{loss:.4f}", "dice": f"{dice:.4f}"}
-            if self.distill_alpha > 0.0:
-                postfix["dst"] = f"{dst:.4f}"
-            postfix["msum"] = int(msum)
-            pbar.set_postfix(postfix)
+            stats = self.train_step(batch, domain)
+            acc.add(stats)
+            pbar.set_postfix(self._postfix(stats))
 
-        n = max(n, 1)
         lr = self.optimizers[domain].param_groups[0]["lr"]
-        print(f"  [{domain}] epoch {epoch+1}: loss={running_loss/n:.4f}  "
-              f"dice={running_dice/n:.4f}  lr={lr:.2e}")
-        return running_loss / n, running_dice / n
+        print(f"  [{domain}] epoch {epoch+1}: {acc.summary(self)}  lr={lr:.2e}")
+        return acc.mean("total"), acc.mean("dice")
 
     def _train_mixed(self, stream, total_steps: int, epoch: int, epochs: int):
         """Used for round_robin / sequential: gradients flow only through the
         domain selected per-batch.  ``freeze_domain`` is called inside the
         loop on every domain switch.
         """
-        running = {d: [0.0, 0.0, 0] for d in self.domain_list}
+        running = {d: _LossAccum() for d in self.domain_list}
         prev = None
         pbar = tqdm(stream, total=total_steps, desc=f"[{self.schedule} | {epoch+1}/{epochs}]")
         for domain, batch in pbar:
             if domain != prev:
                 freeze_domain(self.model, domain)
                 prev = domain
-            loss, dice, msum, dst = self.train_step(batch, domain)
-            running[domain][0] += loss
-            running[domain][1] += dice
-            running[domain][2] += 1
-            postfix = {"dom": domain, "loss": f"{loss:.4f}", "dice": f"{dice:.4f}"}
-            if self.distill_alpha > 0.0:
-                postfix["dst"] = f"{dst:.4f}"
-            postfix["msum"] = int(msum)
-            pbar.set_postfix(postfix)
-        for d, (lsum, dsum, n) in running.items():
-            if n:
+            stats = self.train_step(batch, domain)
+            running[domain].add(stats)
+            pbar.set_postfix({"dom": domain, **self._postfix(stats)})
+        for d, acc in running.items():
+            if acc.n:
                 lr = self.optimizers[d].param_groups[0]["lr"]
-                print(f"  [{d}] epoch {epoch+1}: loss={lsum/n:.4f}  "
-                      f"dice={dsum/n:.4f}  lr={lr:.2e}")
+                print(f"  [{d}] epoch {epoch+1}: {acc.summary(self)}  lr={lr:.2e}")
 
     # ------------------------------------------------------------------
     def train_joint(self, epochs: int, *_):
@@ -451,20 +527,6 @@ class MultiDomainTrainer:
                     domain_splits=self.eval_domain_splits,
                 )
                 self._save_best(epoch + 1, results)
-            # Also track LEVIR held-out test each epoch (val alone is misleading).
-            if (
-                self.test_loaders
-                and "LEVIR" in self.test_loaders
-                and self.test_loaders.get("LEVIR") is not self.eval_loaders.get("LEVIR")
-            ):
-                self.evaluate(
-                    "LEVIR",
-                    loaders=self.test_loaders,
-                    split_label="test",
-                    epoch=epoch + 1,
-                    total_epochs=epochs,
-                )
-
         # Final held-out test on the BEST checkpoint, not whatever the last
         # epoch happened to land on.
         if self.test_loaders:
@@ -496,6 +558,8 @@ class MultiDomainTrainer:
         was_training = self.model.training
         self.model.eval()
         total_acc = total_dice = total_iou = 0.0
+        aux_acc = aux_dice = aux_iou = 0.0
+        has_aux = False
         n = 0
         desc = f"{domain} {split_label}"
         if epoch is not None and total_epochs is not None:
@@ -516,34 +580,21 @@ class MultiDomainTrainer:
                 mask = (mask > 0.5).float()
 
                 if self.use_tta:
-                    # original prediction
-                    logits, _ = self.model(img1, img2, domain)
-                    prob = torch.sigmoid(logits)
-
-                    # horizontal flip
-                    img1_h = torch.flip(img1, dims=[-1])
-                    img2_h = torch.flip(img2, dims=[-1])
-                    logits_h, _ = self.model(img1_h, img2_h, domain)
-                    prob_h = torch.flip(torch.sigmoid(logits_h), dims=[-1])
-
-                    # vertical flip
-                    img1_v = torch.flip(img1, dims=[-2])
-                    img2_v = torch.flip(img2, dims=[-2])
-                    logits_v, _ = self.model(img1_v, img2_v, domain)
-                    prob_v = torch.flip(torch.sigmoid(logits_v), dims=[-2])
-
-                    # average probabilities
-                    avg_prob = (prob + prob_h + prob_v) / 3.0
-                    eps = 1e-7
-                    avg_prob = torch.clamp(avg_prob, eps, 1.0 - eps)
-                    logits = torch.log(avg_prob / (1.0 - avg_prob))
+                    logits, aux_logits = _tta_logits(self.model, img1, img2, domain)
                 else:
-                    logits, _ = self.model(img1, img2, domain)
+                    logits, aux_logits = self.model(img1, img2, domain)
 
                 acc, dice, iou = _segmentation_metrics(logits, mask)
                 total_acc += acc.item()
                 total_dice += dice.item()
                 total_iou += iou.item()
+
+                if aux_logits is not None:
+                    has_aux = True
+                    a_acc, a_dice, a_iou = _segmentation_metrics(aux_logits, mask)
+                    aux_acc += a_acc.item()
+                    aux_dice += a_dice.item()
+                    aux_iou += a_iou.item()
                 n += 1
 
         if was_training:
@@ -555,14 +606,28 @@ class MultiDomainTrainer:
         avg_iou = total_iou / n
         if epoch is not None:
             print(
-                f"  [{domain} {split_label}] dice={avg_dice:.4f}  "
+                f"  [{domain} {split_label}] main: dice={avg_dice:.4f}  "
                 f"iou={avg_iou:.4f}  acc={avg_acc:.2f}%"
             )
         else:
             print(
-                f"[{domain} {split_label}] acc={avg_acc:.2f}%  "
+                f"[{domain} {split_label}] main: acc={avg_acc:.2f}%  "
                 f"dice={avg_dice:.4f}  iou={avg_iou:.4f}"
             )
+
+        if has_aux:
+            a_acc = 100.0 * aux_acc / n
+            a_dice = aux_dice / n
+            a_iou = aux_iou / n
+            gap = avg_dice - a_dice
+            indent = "  " if epoch is not None else ""
+            print(
+                f"{indent}[{domain} {split_label}] aux : dice={a_dice:.4f}  "
+                f"iou={a_iou:.4f}  acc={a_acc:.2f}%  (gap {gap:+.4f})"
+            )
+
+        # Checkpoint selection tracks the MAIN head -- that is the deployed
+        # prediction; the aux head is reported for the early-exit comparison.
         return avg_dice
 
     def evaluate_all(
