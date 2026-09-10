@@ -124,6 +124,7 @@ class MultiDomainTrainer:
         dice_weight: float = 0.7,
         bce_weight: float = 0.3,
         deep_supervision_weight: float = 1.0,
+        distill_alpha: float = 0.0,
         schedule: str = "per_domain_full_epoch",
         domain_order: Iterable[str] | None = None,
         scheduler_step_size: int = 15,
@@ -161,6 +162,7 @@ class MultiDomainTrainer:
         self.dice_weight = dice_weight
         self.bce_weight = bce_weight
         self.deep_supervision_weight = deep_supervision_weight
+        self.distill_alpha = distill_alpha
 
         if schedule not in {"round_robin", "sequential", "per_domain_full_epoch"}:
             raise ValueError(
@@ -204,6 +206,8 @@ class MultiDomainTrainer:
 
         print(f"Per-domain pos_weight: {self.pos_weight}")
         print(f"Deep supervision weight: {self.deep_supervision_weight}")
+        print(f"Distill alpha:         {self.distill_alpha}"
+              f"{'  (off)' if self.distill_alpha <= 0 else ''}")
         print(f"Domain order:          {self.domain_order}")
         print(f"Schedule:              {self.schedule}")
         self._log_trainable()
@@ -329,12 +333,12 @@ class MultiDomainTrainer:
         # cannot represent.  The teacher is detached, so gradients move aux
         # toward main and never the reverse.
         distill_val = 0.0
-        if aux_logits is not None:
+        if aux_logits is not None and self.distill_alpha > 0.0:
             size = max(logits.shape[-1] // 32, 1)
             teacher = F.adaptive_avg_pool2d(logits.detach(), size)
             student = F.adaptive_avg_pool2d(aux_logits, size)
             distill = F.mse_loss(student, teacher)
-            loss = loss + distill
+            loss = loss + self.distill_alpha * distill
             distill_val = float(distill.detach())
 
         loss.backward()
@@ -364,12 +368,11 @@ class MultiDomainTrainer:
             running_loss += loss
             running_dice += dice
             n += 1
-            pbar.set_postfix({
-                "loss": f"{loss:.4f}",
-                "dice": f"{dice:.4f}",
-                "dst": f"{dst:.4f}",
-                "msum": int(msum),
-            })
+            postfix = {"loss": f"{loss:.4f}", "dice": f"{dice:.4f}"}
+            if self.distill_alpha > 0.0:
+                postfix["dst"] = f"{dst:.4f}"
+            postfix["msum"] = int(msum)
+            pbar.set_postfix(postfix)
 
         n = max(n, 1)
         lr = self.optimizers[domain].param_groups[0]["lr"]
@@ -393,11 +396,11 @@ class MultiDomainTrainer:
             running[domain][0] += loss
             running[domain][1] += dice
             running[domain][2] += 1
-            pbar.set_postfix({
-                "dom": domain, "loss": f"{loss:.4f}",
-                "dice": f"{dice:.4f}", "dst": f"{dst:.4f}",
-                "msum": int(msum),
-            })
+            postfix = {"dom": domain, "loss": f"{loss:.4f}", "dice": f"{dice:.4f}"}
+            if self.distill_alpha > 0.0:
+                postfix["dst"] = f"{dst:.4f}"
+            postfix["msum"] = int(msum)
+            pbar.set_postfix(postfix)
         for d, (lsum, dsum, n) in running.items():
             if n:
                 lr = self.optimizers[d].param_groups[0]["lr"]

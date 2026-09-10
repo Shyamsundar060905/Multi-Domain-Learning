@@ -34,6 +34,11 @@ def build_parser(defaults=None):
     p.add_argument("--deep-supervision-weight", type=float,
                    default=defaults.get("deep_supervision_weight", 1.0),
                    help="Weight on the bottleneck auxiliary segmentation loss.")
+    p.add_argument("--distill-alpha", type=float,
+                   default=defaults.get("distill_alpha", 0.0),
+                   help="alpha in L = L_main + w*L_aux + alpha*L_distill. "
+                        "L_distill is MSE on logits between the aux and main heads, "
+                        "both pooled to H/32, teacher detached. 0 disables it.")
     p.add_argument("--oversample-cap", type=float,
                    default=defaults.get("oversample_cap", 4.0),
                    help="Max oversampling factor for smaller domains (e.g. 4 = "
@@ -309,6 +314,7 @@ def main():
         dice_weight=args.dice_weight,
         bce_weight=args.bce_weight,
         deep_supervision_weight=args.deep_supervision_weight,
+        distill_alpha=args.distill_alpha,
         schedule=args.schedule,
         domain_order=domain_order,
         scheduler_step_size=args.scheduler_step_size,
