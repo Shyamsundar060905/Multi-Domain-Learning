@@ -37,8 +37,16 @@ def build_parser(defaults=None):
     p.add_argument("--distill-alpha", type=float,
                    default=defaults.get("distill_alpha", 0.0),
                    help="alpha in L = L_main + w*L_aux + alpha*L_distill. "
-                        "L_distill is MSE on logits between the aux and main heads, "
-                        "both pooled to H/32, teacher detached. 0 disables it.")
+                        "L_distill is MSE on logits between the aux and main heads "
+                        "at full resolution, teacher detached. 0 disables it.")
+    p.add_argument("--ewc-lambda", type=float, default=defaults.get("ewc_lambda", 0.0),
+                   help="EWC strength on the SHARED decoder weights. Each domain's "
+                        "steps are penalised for moving weights the other domains "
+                        "rely on (diagonal Fisher). 0 disables it.")
+    p.add_argument("--ewc-fisher-batches", type=int,
+                   default=defaults.get("ewc_fisher_batches", 50),
+                   help="Batches per domain used to estimate the Fisher at each "
+                        "consolidation.")
     p.add_argument("--oversample-cap", type=float,
                    default=defaults.get("oversample_cap", 4.0),
                    help="Max oversampling factor for smaller domains (e.g. 4 = "
@@ -315,6 +323,8 @@ def main():
         bce_weight=args.bce_weight,
         deep_supervision_weight=args.deep_supervision_weight,
         distill_alpha=args.distill_alpha,
+        ewc_lambda=args.ewc_lambda,
+        ewc_fisher_batches=args.ewc_fisher_batches,
         schedule=args.schedule,
         domain_order=domain_order,
         scheduler_step_size=args.scheduler_step_size,
