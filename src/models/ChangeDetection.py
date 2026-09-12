@@ -142,11 +142,11 @@ class UNetUpStage(nn.Module):
 class AuxDecoder(nn.Module):
     """Lightweight skip-free decoder for the auxiliary head.
 
-    Lifts the bottleneck output (H/32) to full resolution with a stack of
-    stride-2 transposed convolutions, so the auxiliary prediction is made at
-    the same resolution as the main head rather than being a x32 bilinear
-    blur of a 16x16 map.  Deliberately has no skip connections and thin
-    channels -- it is meant to be a cheap exit, not a second decoder.
+    Lifts its input to full resolution with a stack of stride-2 transposed
+    convolutions -- one per entry in ``widths`` -- so the auxiliary prediction
+    is made at the same resolution as the main head instead of being a bilinear
+    blur of a small map.  Deliberately has no skip connections and thin
+    channels: it is meant to be a cheap exit, not a second decoder.
 
     Shared transposed convs + per-domain BatchNorm, matching DomainConvBlock's
     split, but without the residual adapters.
@@ -221,11 +221,11 @@ class UNetDecoder(nn.Module):
         ])
 
         self.classifier = nn.Conv2d(32, 1, kernel_size=1)
-        # Auxiliary branch off the bottleneck (512ch at H/32), with its own
-        # cheap transposed-conv stack back to full resolution.  Five stride-2
-        # steps take H/32 -> H, so the aux logits match the main head exactly
+        # Auxiliary branch off the FIRST up-stage (256ch at H/16), with its own
+        # cheap transposed-conv stack back to full resolution.  Four stride-2
+        # steps take H/16 -> H, so the aux logits match the main head exactly
         # and no bilinear upsampling is needed.
-        self.aux_decoder = AuxDecoder(512, domain_list)
+        self.aux_decoder = AuxDecoder(256, domain_list, widths=(128, 64, 32, 16))
 
         prior_bias = math.log(prior / (1.0 - prior))
         for head in (self.classifier, self.aux_decoder.classifier):
@@ -237,9 +237,10 @@ class UNetDecoder(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         fused_l4 = self.attention(fused_skips["l4"])
         x = self.bottleneck(fused_l4, domain)
-        aux = self.aux_decoder(x, domain)
 
         x = self.up_stages[0](x, domain, fused_skips["l3"])
+        aux = self.aux_decoder(x, domain)
+
         x = self.up_stages[1](x, domain, fused_skips["l2"])
         x = self.up_stages[2](x, domain, fused_skips["l1"])
         x = self.up_stages[3](x, domain)
