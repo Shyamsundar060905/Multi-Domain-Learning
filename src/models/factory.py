@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Iterable, List
+from typing import Iterable, List, Optional
 
 import torch
 from torchvision.models import ResNet50_Weights, resnet50
@@ -20,8 +20,13 @@ def build_change_detection_model(
     unfreeze_layer4: bool = False,
     use_attention: bool = False,
     adapter_stages: Iterable[str] = ("layer1", "layer2", "layer3", "layer4"),
+    adapter_type: str = "guided",
+    guided_granularity: str = "stage",
+    num_experts: int = 4,
+    guided_reduction: int = 16,
+    router_top_k: Optional[int] = 2,
 ) -> ChangeDetectionModel:
-    """ResNet50 encoder + per-domain adapters + shared U-Net decoder (domain BN + adapters)."""
+    """ResNet50 encoder + per-domain adapters (simple or change-guided) + shared U-Net decoder."""
     domains: List[str] = list(domain_list)
     if not domains:
         raise ValueError("domain_list must contain at least one domain name.")
@@ -33,6 +38,11 @@ def build_change_detection_model(
         domain_bn_in_adapter=domain_bn_in_adapter,
         unfreeze_layer4=unfreeze_layer4,
         adapter_stages=adapter_stages,
+        adapter_type=adapter_type,
+        guided_granularity=guided_granularity,
+        num_experts=num_experts,
+        guided_reduction=guided_reduction,
+        router_top_k=router_top_k,
     )
     model = ChangeDetectionModel(
         backbone,
@@ -46,9 +56,24 @@ def build_change_detection_model(
     return model
 
 
-def print_architecture(mode: str = "multi") -> None:
+def print_architecture(
+    mode: str = "multi",
+    adapter_type: str = "guided",
+    guided_granularity: str = "stage",
+    num_experts: int = 4,
+    router_top_k: Optional[int] = 2,
+) -> None:
     label = "Uni-domain" if mode == "uni" else "Multi-domain"
+    if adapter_type == "guided":
+        where = "every ResNet stage" if guided_granularity == "stage" else "every bottleneck block"
+        routing = f"top-{router_top_k}" if router_top_k else "dense"
+        encoder = (
+            "frozen ImageNet ResNet50 + per-domain change-guided adapters "
+            f"({num_experts} experts, {routing} routing) after {where}"
+        )
+    else:
+        encoder = "frozen ImageNet ResNet50 + per-domain residual adapters after every bottleneck block"
     print(f"{label} change detection:")
-    print("  Encoder: frozen ImageNet ResNet50 + per-domain residual adapters (l1–l4)")
+    print(f"  Encoder: {encoder}")
     print("  Decoder: shared trainable U-Net (shared convs + per-domain BatchNorm + per-domain residual adapters)")
-    print("  Fusion:  concat(f1, f2, |f1-f2|) at each scale  |  deep sup on 1st up-stage")
+    print("  Fusion:  concat(f1, f2, |f1-f2|) at each scale  |  aux decoder on 1st up-stage")

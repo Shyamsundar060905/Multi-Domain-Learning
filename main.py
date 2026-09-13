@@ -100,6 +100,27 @@ def build_parser(defaults=None):
                    default=defaults.get("adapter_stages", ["layer1", "layer2", "layer3", "layer4"]),
                    choices=["layer1", "layer2", "layer3", "layer4"],
                    help="Stages in ResNet backbone to place adapters.")
+    p.add_argument("--adapter-type", type=str, default=defaults.get("adapter_type", "guided"),
+                   choices=["simple", "guided"],
+                   help="Encoder adapter. 'simple' = ResidualAdapter on each temporal stream "
+                        "independently; 'guided' = change-guided mixture-of-experts adapter "
+                        "that sees both timesteps and adapts them jointly.")
+    p.add_argument("--guided-granularity", type=str,
+                   default=defaults.get("guided_granularity", "stage"),
+                   choices=["stage", "block"],
+                   help="Guided adapters only: one per ResNet stage, or one after every "
+                        "bottleneck block ('block' is ~3.6x the parameters and far more "
+                        "activation memory).")
+    p.add_argument("--num-experts", type=int, default=defaults.get("num_experts", 4),
+                   help="Adapter experts per guided adapter.")
+    p.add_argument("--guided-reduction", type=int, default=defaults.get("guided_reduction", 16),
+                   help="Bottleneck reduction inside guided adapters (the reference code used 4).")
+    p.add_argument("--router-top-k", type=int, default=defaults.get("router_top_k", 2),
+                   help="Experts kept per sample. 0 = use all experts (dense routing).")
+    p.add_argument("--routing-balance-weight", type=float,
+                   default=defaults.get("routing_balance_weight", 0.01),
+                   help="Weight of the load-balancing loss that stops top-k routing collapsing "
+                        "onto a single expert. 0 disables it.")
     p.add_argument("--use-tta", action="store_true",
                    help="Enable Test-Time Augmentation (hflip/vflip averaging) during eval.")
     p.add_argument("--ckpt-dir", type=str, default=defaults.get("ckpt_dir", "checkpoints"),
@@ -282,8 +303,19 @@ def main():
         unfreeze_layer4=args.unfreeze_layer4,
         use_attention=args.use_attention,
         adapter_stages=args.adapter_stages,
+        adapter_type=args.adapter_type,
+        guided_granularity=args.guided_granularity,
+        num_experts=args.num_experts,
+        guided_reduction=args.guided_reduction,
+        router_top_k=(args.router_top_k or None),
     )
-    print_architecture(mode=mode)
+    print_architecture(
+        mode=mode,
+        adapter_type=args.adapter_type,
+        guided_granularity=args.guided_granularity,
+        num_experts=args.num_experts,
+        router_top_k=(args.router_top_k or None),
+    )
 
     count_parameters(model)
 
@@ -325,6 +357,7 @@ def main():
         distill_alpha=args.distill_alpha,
         ewc_lambda=args.ewc_lambda,
         ewc_fisher_batches=args.ewc_fisher_batches,
+        routing_balance_weight=args.routing_balance_weight,
         schedule=args.schedule,
         domain_order=domain_order,
         scheduler_step_size=args.scheduler_step_size,

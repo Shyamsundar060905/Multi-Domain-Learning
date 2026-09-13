@@ -89,7 +89,7 @@ def _sequential(loaders: Dict, batches_per_domain: int, order: List[str]):
 class _LossAccum:
     """Running means of each loss term over an epoch (or a domain block)."""
 
-    KEYS = ("total", "main", "aux", "distill", "ewc", "dice", "aux_dice")
+    KEYS = ("total", "main", "aux", "distill", "ewc", "route", "dice", "aux_dice")
 
     def __init__(self):
         self.sums = {k: 0.0 for k in self.KEYS}
@@ -117,6 +117,9 @@ class _LossAccum:
         if e > 0.0:
             # Raw Fisher-weighted penalty and the lambda/2 it is scaled by.
             parts.append(f"ewc={self.mean('ewc'):.3e}x{e / 2:g}")
+        r = trainer.routing_balance_weight
+        if r > 0.0 and self.sums["route"] > 0.0:
+            parts.append(f"route={self.mean('route'):.4f}x{r:g}")
         parts[-1] += ")"
         parts.append(f"dice={self.mean('dice'):.4f}")
         if self.sums["aux_dice"] > 0.0:
@@ -197,6 +200,7 @@ class MultiDomainTrainer:
         distill_alpha: float = 0.0,
         ewc_lambda: float = 0.0,
         ewc_fisher_batches: int = 50,
+        routing_balance_weight: float = 0.0,
         schedule: str = "per_domain_full_epoch",
         domain_order: Iterable[str] | None = None,
         scheduler_step_size: int = 15,
@@ -239,6 +243,7 @@ class MultiDomainTrainer:
         # snapshot per domain, refreshed by _ewc_consolidate.
         self.ewc_lambda = ewc_lambda
         self.ewc_fisher_batches = ewc_fisher_batches
+        self.routing_balance_weight = routing_balance_weight
         self._ewc: Dict[str, Dict[str, list]] = {}
         self._ewc_shared: list = []
 
@@ -291,6 +296,9 @@ class MultiDomainTrainer:
                   f"({self.ewc_fisher_batches} Fisher batches/domain, shared params only)")
         else:
             print(f"EWC lambda:            {self.ewc_lambda}  (off)")
+        if getattr(getattr(self.model, "backbone", None), "adapter_type", "simple") == "guided":
+            print(f"Routing balance weight: {self.routing_balance_weight}"
+                  f"{'  (off)' if self.routing_balance_weight <= 0 else ''}")
         print(f"Domain order:          {self.domain_order}")
         print(f"Schedule:              {self.schedule}")
         self._log_trainable()
@@ -474,6 +482,8 @@ class MultiDomainTrainer:
             out["dst"] = f"{stats['distill']:.4f}"
         if self.ewc_lambda > 0.0:
             out["ewc"] = f"{stats['ewc']:.2e}"
+        if self.routing_balance_weight > 0.0 and stats.get("route", 0.0) > 0.0:
+            out["route"] = f"{stats['route']:.4f}"
         out["dice"] = f"{stats['dice']:.4f}"
         out["msum"] = int(stats["msum"])
         return out
@@ -538,6 +548,16 @@ class MultiDomainTrainer:
                 loss = loss + 0.5 * self.ewc_lambda * pen
                 ewc_val = float(pen.detach())
 
+        # Load balancing for the change-guided adapters' top-k routing: without
+        # it experts tend to collapse onto one.  Computed by the backbone during
+        # this forward pass, averaged over every guided adapter that ran.
+        route_val = 0.0
+        route = getattr(getattr(self.model, "backbone", None), "routing_balance", None)
+        if route is not None:
+            route_val = float(route.detach())
+            if self.routing_balance_weight > 0.0:
+                loss = loss + self.routing_balance_weight * route
+
         loss.backward()
         trainable = domain_parameters(self.model, domain) + shared_parameters(self.model)
         torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
@@ -560,6 +580,7 @@ class MultiDomainTrainer:
             "aux": aux_val,
             "distill": distill_val,
             "ewc": ewc_val,
+            "route": route_val,
             "dice": dice.item(),
             "aux_dice": aux_dice,
             "msum": mask.sum().item(),

@@ -324,8 +324,9 @@ class ChangeDetectionModel(nn.Module):
     def forward(
         self, img1: torch.Tensor, img2: torch.Tensor, domain: str
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        pyramid1 = self.backbone.extract_multiscale(img1, domain)
-        pyramid2 = self.backbone.extract_multiscale(img2, domain)
+        # Both timesteps go through the encoder together: change-guided
+        # adapters need x1 and x2 at the same point in the network.
+        pyramid1, pyramid2 = self.backbone.extract_multiscale_pair(img1, img2, domain)
         fused = self._fuse_pyramid(pyramid1, pyramid2)
 
         logits, aux = self.decoder(fused, domain)
