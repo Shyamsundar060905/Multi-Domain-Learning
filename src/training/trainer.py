@@ -299,6 +299,11 @@ class MultiDomainTrainer:
         if getattr(getattr(self.model, "backbone", None), "adapter_type", "simple") == "guided":
             print(f"Routing balance weight: {self.routing_balance_weight}"
                   f"{'  (off)' if self.routing_balance_weight <= 0 else ''}")
+        sel_label = (
+            self._selection_label(self._selection_domains(self.eval_loaders))
+            if self.eval_loaders else "none"
+        )
+        print(f"Checkpoint selection:  {sel_label}")
         print(f"Domain order:          {self.domain_order}")
         print(f"Schedule:              {self.schedule}")
         self._log_trainable()
@@ -334,23 +339,44 @@ class MultiDomainTrainer:
     def ckpt_path(self) -> Path | None:
         return None if self.ckpt_dir is None else self.ckpt_dir / self.ckpt_name
 
+    def _selection_domains(self, domains: Iterable[str]) -> List[str]:
+        """Domains allowed to choose the best checkpoint.
+
+        Only domains evaluated on a validation split vote.  A domain whose eval
+        loader is its test set (currently WHU) would otherwise leak test data
+        into model selection -- and its epoch-to-epoch swings would decide which
+        checkpoint is kept.  Falls back to every domain when none has a
+        validation split (e.g. a WHU-only run), so something is still saved.
+        """
+        held_out = [d for d in domains if self.eval_domain_splits.get(d, "test") != "test"]
+        return held_out or list(domains)
+
+    def _selection_label(self, domains: Iterable[str]) -> str:
+        return " + ".join(f"{d} {self.eval_domain_splits.get(d, 'test')}" for d in domains)
+
     def _save_best(self, epoch: int, results: Dict[str, float]) -> bool:
-        """Save the model when mean eval Dice improves. Returns True if saved."""
+        """Save the model when the selection Dice improves. Returns True if saved.
+
+        The selection score uses only validation-split domains (see
+        _selection_domains); every domain's score is still stored.
+        """
         path = self.ckpt_path
         if path is None or not results:
             return False
 
-        avg = sum(results.values()) / len(results)
-        if avg <= self.best_dice:
+        sel = self._selection_domains(results)
+        score = sum(results[d] for d in sel) / len(sel)
+        if score <= self.best_dice:
             return False
 
         prev = self.best_dice
-        self.best_dice, self.best_epoch = avg, epoch
+        self.best_dice, self.best_epoch = score, epoch
 
         payload = {
             "model": self.model.state_dict(),
             "epoch": epoch,
-            "avg_eval_dice": avg,
+            "selection_dice": score,
+            "selection_domains": sel,
             "per_domain_dice": dict(results),
             "domain_list": list(self.domain_list),
         }
@@ -361,7 +387,7 @@ class MultiDomainTrainer:
         tmp.replace(path)
 
         delta = "" if prev < 0 else f" (was {prev:.4f})"
-        print(f"  * new best avg Dice {avg:.4f}{delta} -- saved {path}")
+        print(f"  * new best {self._selection_label(sel)} Dice {score:.4f}{delta} -- saved {path}")
         return True
 
     def _load_best(self) -> bool:
@@ -372,10 +398,12 @@ class MultiDomainTrainer:
         ckpt = torch.load(path, map_location=self.device)
         self.model.load_state_dict(ckpt["model"])
         self.best_epoch = ckpt.get("epoch", self.best_epoch)
-        self.best_dice = ckpt.get("avg_eval_dice", self.best_dice)
+        self.best_dice = ckpt.get("selection_dice", ckpt.get("avg_eval_dice", self.best_dice))
+        sel = ckpt.get("selection_domains")
+        label = self._selection_label(sel) if sel else "avg eval"
         print(
             f"Restored best checkpoint from epoch {self.best_epoch} "
-            f"(avg eval Dice {self.best_dice:.4f})"
+            f"({label} Dice {self.best_dice:.4f})"
         )
         return True
 
