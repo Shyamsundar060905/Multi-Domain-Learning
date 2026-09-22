@@ -223,6 +223,118 @@ class ChangeGuidedDynamicAdapter(nn.Module):
         return adapted_1, adapted_2, info
 
 
+def _top_k_renorm(weights: torch.Tensor, top_k: Optional[int], num_experts: int) -> torch.Tensor:
+    if top_k is None or top_k == num_experts:
+        return weights
+    values, indices = torch.topk(weights, k=top_k, dim=1)
+    sparse = torch.zeros_like(weights).scatter_(1, indices, values)
+    return sparse / sparse.sum(dim=1, keepdim=True).clamp_min(1e-8)
+
+
+class ContextGuidedAdapter(nn.Module):
+    """Change-guided adapter for the single-stream decoder features.
+
+    By the time the decoder runs, the two timesteps have been merged, so there
+    is no x1 / x2 pair left to take a difference of.  This variant is instead
+    conditioned on the encoder's change map for the matching scale -- the
+    ``|f1 - f2|`` block already carried inside the fused skip -- and applies the
+    same machinery as ChangeGuidedDynamicAdapter: mixture weights over experts,
+    a spatial gate, and FiLM, all predicted from that change context.
+
+    Like the two-stream version, it is an exact identity at initialisation:
+    the experts' last conv is zero and FiLM starts at gamma = 1, beta = 0.
+
+    Args:
+        channels: channels of the decoder feature being adapted.
+        context_channels: channels of the change map (C of that pyramid level).
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        context_channels: int,
+        num_experts: int = 4,
+        reduction: int = 16,
+        temperature: float = 1.0,
+        top_k: Optional[int] = 2,
+    ) -> None:
+        super().__init__()
+        if top_k is not None and not 1 <= top_k <= num_experts:
+            raise ValueError("top_k must be in [1, num_experts].")
+
+        self.channels = channels
+        self.num_experts = num_experts
+        self.temperature = temperature
+        self.top_k = top_k
+
+        hidden = max(channels // reduction, 16)
+
+        self.change_encoder = nn.Sequential(
+            ConvNormAct(context_channels, hidden, kernel_size=1),
+            ConvNormAct(hidden, hidden, kernel_size=3),
+        )
+        self.router = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(1),
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, num_experts),
+        )
+        self.spatial_gate = nn.Sequential(
+            nn.Conv2d(hidden, hidden, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(_num_groups(hidden), hidden),
+            nn.GELU(),
+            nn.Conv2d(hidden, 1, kernel_size=1),
+            nn.Sigmoid(),
+        )
+        self.film = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(1),
+            nn.Linear(hidden, 2 * channels),
+        )
+        film_out = self.film[-1]
+        nn.init.zeros_(film_out.weight)
+        with torch.no_grad():
+            film_out.bias.zero_()
+            film_out.bias[:channels].fill_(1.0)
+
+        self.experts = nn.ModuleList(
+            [ResidualAdapterExpert(channels, reduction=reduction) for _ in range(num_experts)]
+        )
+        self.residual_scale = nn.Parameter(torch.tensor(1.0))
+
+    def forward(
+        self, x: torch.Tensor, context: torch.Tensor
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        if context.shape[-2:] != x.shape[-2:]:
+            raise ValueError(
+                f"context must match the feature map spatially; got "
+                f"{tuple(context.shape[-2:])} and {tuple(x.shape[-2:])}."
+            )
+
+        change_context = self.change_encoder(context)
+
+        router_logits = self.router(change_context)
+        routing_weights = F.softmax(router_logits / self.temperature, dim=1)
+        routing_weights = _top_k_renorm(routing_weights, self.top_k, self.num_experts)
+
+        gate = self.spatial_gate(change_context)
+        gamma, beta = self.film(change_context).chunk(2, dim=1)
+        gamma = gamma.unsqueeze(-1).unsqueeze(-1)
+        beta = beta.unsqueeze(-1).unsqueeze(-1)
+
+        stacked = torch.stack([expert(x) for expert in self.experts], dim=1)
+        residual = (stacked * routing_weights[:, :, None, None, None]).sum(dim=1)
+        residual = gate * (gamma * residual + beta)
+
+        info = {
+            "routing_weights": routing_weights,
+            "routing_logits": router_logits,
+            "change_gate": gate,
+        }
+        return x + self.residual_scale * residual, info
+
+
 def routing_balance_loss(routing_weights: torch.Tensor) -> torch.Tensor:
     """Encourages all experts to receive traffic across a mini-batch."""
     mean_prob = routing_weights.mean(dim=0)

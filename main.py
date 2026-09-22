@@ -105,6 +105,12 @@ def build_parser(defaults=None):
                    help="Encoder adapter. 'simple' = ResidualAdapter on each temporal stream "
                         "independently; 'guided' = change-guided mixture-of-experts adapter "
                         "that sees both timesteps and adapts them jointly.")
+    p.add_argument("--decoder-adapter-type", type=str,
+                   default=defaults.get("decoder_adapter_type", "simple"),
+                   choices=["simple", "guided"],
+                   help="Decoder adapter. 'guided' conditions each decoder stage on the "
+                        "encoder's |f1-f2| change map at that scale; up-stage 4 runs at full "
+                        "resolution where no change map exists, so it keeps residual adapters.")
     p.add_argument("--guided-granularity", type=str,
                    default=defaults.get("guided_granularity", "stage"),
                    choices=["stage", "block"],
@@ -308,6 +314,7 @@ def main():
         num_experts=args.num_experts,
         guided_reduction=args.guided_reduction,
         router_top_k=(args.router_top_k or None),
+        decoder_adapter_type=args.decoder_adapter_type,
     )
     print_architecture(
         mode=mode,
@@ -315,6 +322,7 @@ def main():
         guided_granularity=args.guided_granularity,
         num_experts=args.num_experts,
         router_top_k=(args.router_top_k or None),
+        decoder_adapter_type=args.decoder_adapter_type,
     )
 
     count_parameters(model)

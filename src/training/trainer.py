@@ -580,7 +580,9 @@ class MultiDomainTrainer:
         # it experts tend to collapse onto one.  Computed by the backbone during
         # this forward pass, averaged over every guided adapter that ran.
         route_val = 0.0
-        route = getattr(getattr(self.model, "backbone", None), "routing_balance", None)
+        route = getattr(self.model, "routing_balance", None)
+        if route is None:
+            route = getattr(getattr(self.model, "backbone", None), "routing_balance", None)
         if route is not None:
             route_val = float(route.detach())
             if self.routing_balance_weight > 0.0:

@@ -25,6 +25,7 @@ def build_change_detection_model(
     num_experts: int = 4,
     guided_reduction: int = 16,
     router_top_k: Optional[int] = 2,
+    decoder_adapter_type: str = "simple",
 ) -> ChangeDetectionModel:
     """ResNet50 encoder + per-domain adapters (simple or change-guided) + shared U-Net decoder."""
     domains: List[str] = list(domain_list)
@@ -50,6 +51,10 @@ def build_change_detection_model(
         prior=prior,
         fusion_type=fusion_type,
         use_attention=use_attention,
+        decoder_adapter_type=decoder_adapter_type,
+        decoder_adapter_reduction=guided_reduction if decoder_adapter_type == "guided" else 16,
+        num_experts=num_experts,
+        router_top_k=router_top_k,
     )
     if device is not None:
         model = model.to(device)
@@ -62,6 +67,7 @@ def print_architecture(
     guided_granularity: str = "stage",
     num_experts: int = 4,
     router_top_k: Optional[int] = 2,
+    decoder_adapter_type: str = "simple",
 ) -> None:
     label = "Uni-domain" if mode == "uni" else "Multi-domain"
     if adapter_type == "guided":
@@ -75,5 +81,11 @@ def print_architecture(
         encoder = "frozen ImageNet ResNet50 + per-domain residual adapters after every bottleneck block"
     print(f"{label} change detection:")
     print(f"  Encoder: {encoder}")
-    print("  Decoder: shared trainable U-Net (shared convs + per-domain BatchNorm + per-domain residual adapters)")
+    if decoder_adapter_type == "guided":
+        decoder = ("shared trainable U-Net (shared convs + per-domain BatchNorm + per-domain "
+                   "change-guided adapters conditioned on |f1-f2| at each scale; up-stage 4 "
+                   "keeps residual adapters)")
+    else:
+        decoder = "shared trainable U-Net (shared convs + per-domain BatchNorm + per-domain residual adapters)"
+    print(f"  Decoder: {decoder}")
     print("  Fusion:  concat(f1, f2, |f1-f2|) at each scale  |  aux decoder on 1st up-stage")
