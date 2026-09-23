@@ -234,6 +234,7 @@ class UNetDecoder(nn.Module):
         num_experts: int = 4,
         router_top_k: Optional[int] = 2,
         router_temperature: float = 1.0,
+        use_deep_supervision: bool = True,
     ):
         super().__init__()
         self.domain_list = list(domain_list)
@@ -284,10 +285,18 @@ class UNetDecoder(nn.Module):
         # cheap transposed-conv stack back to full resolution.  Four stride-2
         # steps take H/16 -> H, so the aux logits match the main head exactly
         # and no bilinear upsampling is needed.
-        self.aux_decoder = AuxDecoder(256, domain_list, widths=(128, 64, 32, 16))
+        # Built only when deep supervision is on, so switching it off removes
+        # the branch entirely rather than computing and discarding it.
+        self.aux_decoder = (
+            AuxDecoder(256, domain_list, widths=(128, 64, 32, 16))
+            if use_deep_supervision else None
+        )
 
         prior_bias = math.log(prior / (1.0 - prior))
-        for head in (self.classifier, self.aux_decoder.classifier):
+        heads = [self.classifier]
+        if self.aux_decoder is not None:
+            heads.append(self.aux_decoder.classifier)
+        for head in heads:
             nn.init.normal_(head.weight, std=0.01)
             nn.init.constant_(head.bias, prior_bias)
 
@@ -307,7 +316,7 @@ class UNetDecoder(nn.Module):
 
         x, r = self.up_stages[0](x, domain, fused_skips["l3"], change_map("l3"))
         routing.extend(r)
-        aux = self.aux_decoder(x, domain)
+        aux = self.aux_decoder(x, domain) if self.aux_decoder is not None else None
 
         x, r = self.up_stages[1](x, domain, fused_skips["l2"], change_map("l2"))
         routing.extend(r)
@@ -383,6 +392,7 @@ class ChangeDetectionModel(nn.Module):
             num_experts=num_experts,
             router_top_k=router_top_k,
             router_temperature=router_temperature,
+            use_deep_supervision=use_deep_supervision,
         )
         # Mean routing-balance loss over encoder and decoder guided adapters.
         self.routing_balance: Optional[torch.Tensor] = None

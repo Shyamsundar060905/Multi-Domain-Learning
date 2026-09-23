@@ -26,6 +26,7 @@ def build_change_detection_model(
     guided_reduction: int = 16,
     router_top_k: Optional[int] = 2,
     decoder_adapter_type: str = "simple",
+    use_deep_supervision: bool = True,
 ) -> ChangeDetectionModel:
     """ResNet50 encoder + per-domain adapters (simple or change-guided) + shared U-Net decoder."""
     domains: List[str] = list(domain_list)
@@ -51,6 +52,7 @@ def build_change_detection_model(
         prior=prior,
         fusion_type=fusion_type,
         use_attention=use_attention,
+        use_deep_supervision=use_deep_supervision,
         decoder_adapter_type=decoder_adapter_type,
         decoder_adapter_reduction=guided_reduction if decoder_adapter_type == "guided" else 16,
         num_experts=num_experts,

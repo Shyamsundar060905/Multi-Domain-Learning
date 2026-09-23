@@ -105,6 +105,10 @@ def build_parser(defaults=None):
                    help="Encoder adapter. 'simple' = ResidualAdapter on each temporal stream "
                         "independently; 'guided' = change-guided mixture-of-experts adapter "
                         "that sees both timesteps and adapts them jointly.")
+    p.add_argument("--no-deep-supervision", dest="use_deep_supervision",
+                   action="store_false", default=defaults.get("use_deep_supervision", True),
+                   help="Remove the auxiliary head entirely: no AuxDecoder is built, no "
+                        "auxiliary loss, and nothing to distil from.")
     p.add_argument("--decoder-adapter-type", type=str,
                    default=defaults.get("decoder_adapter_type", "simple"),
                    choices=["simple", "guided"],
@@ -127,6 +131,11 @@ def build_parser(defaults=None):
                    default=defaults.get("routing_balance_weight", 0.01),
                    help="Weight of the load-balancing loss that stops top-k routing collapsing "
                         "onto a single expert. 0 disables it.")
+    p.add_argument("--select-metric", type=str, default=defaults.get("select_metric", "dice"),
+                   choices=["dice", "f1"],
+                   help="Which validation score picks the best checkpoint: 'dice' = the "
+                        "per-image mean Dice used so far, 'f1' = aggregate F1 over the whole "
+                        "split (what the CD literature reports, and far less noisy).")
     p.add_argument("--use-tta", action="store_true",
                    help="Enable Test-Time Augmentation (hflip/vflip averaging) during eval.")
     p.add_argument("--ckpt-dir", type=str, default=defaults.get("ckpt_dir", "checkpoints"),
@@ -168,6 +177,10 @@ def _make_loaders(args):
                 root_dir=args.whu_dir, split="train", transform=train_transform,
                 positive_only=args.positive_only, image_size=args.image_size,
             )
+            whu_val = WHUDataset(
+                root_dir=args.whu_dir, split="val", transform=test_transform,
+                image_size=args.image_size,
+            )
             whu_test = WHUDataset(
                 root_dir=args.whu_dir, split="test", transform=test_transform,
                 image_size=args.image_size,
@@ -176,12 +189,19 @@ def _make_loaders(args):
                 whu_train, batch_size=args.batch_size, shuffle=True,
                 num_workers=args.num_workers, pin_memory=True, drop_last=True,
             )
+            eval_loaders["WHU"] = DataLoader(
+                whu_val, batch_size=args.batch_size, shuffle=False,
+                num_workers=args.num_workers,
+            )
             test_loaders["WHU"] = DataLoader(
                 whu_test, batch_size=args.batch_size, shuffle=False,
                 num_workers=args.num_workers,
             )
-            eval_loaders["WHU"] = test_loaders["WHU"]
-            print(f"WHU loaded: {len(whu_train)} train / {len(whu_test)} test (eval each epoch)")
+            print(
+                f"WHU loaded: {len(whu_train)} train | "
+                f"{len(whu_val)} val (eval each epoch) | "
+                f"{len(whu_test)} test (final only)"
+            )
         except Exception as e:
             print(f"[Warning] WHU loading failed: {e}")
 
@@ -315,6 +335,7 @@ def main():
         guided_reduction=args.guided_reduction,
         router_top_k=(args.router_top_k or None),
         decoder_adapter_type=args.decoder_adapter_type,
+        use_deep_supervision=args.use_deep_supervision,
     )
     print_architecture(
         mode=mode,
@@ -343,15 +364,19 @@ def main():
             pos_weight_arg[d] = float(v)
     else:
         # Sensible defaults tuned for WHU (~13% pos) vs LEVIR (~3% pos).
-        defaults_pw = {"WHU": 7.0, "LEVIR": 45.0}
-        pos_weight_arg = {d: defaults_pw.get(d, args.pos_weight) for d in domain_list}
+        # No per-domain values given: use the single --pos-weight for every
+        # domain and say so.  Hidden per-domain constants here would silently
+        # change the objective when a config key is missing.
+        pos_weight_arg = {d: args.pos_weight for d in domain_list}
+        print(f"[warn] pos_weight_per_domain not set; using --pos-weight "
+              f"{args.pos_weight} for all domains.")
 
     trainer = MultiDomainTrainer(
         model=model,
         train_loaders=train_loaders,
         eval_loaders=eval_loaders,
         test_loaders=test_loaders,
-        eval_domain_splits={"LEVIR": "val", "WHU": "test"},
+        eval_domain_splits={"LEVIR": "val", "WHU": "val"},
         test_domain_splits={"LEVIR": "test", "WHU": "test"},
         domain_list=domain_list,
         device=device,
@@ -371,6 +396,7 @@ def main():
         scheduler_step_size=args.scheduler_step_size,
         scheduler_gamma=args.scheduler_gamma,
         use_tta=args.use_tta,
+        select_metric=args.select_metric,
         ckpt_dir=args.ckpt_dir,
         ckpt_name=args.ckpt_name,
     )
