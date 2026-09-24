@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 import math
-from itertools import cycle
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Union
 
@@ -68,8 +67,23 @@ def change_detection_loss(
 # Schedule helpers
 # ---------------------------------------------------------------------------
 
+def _endless(loader):
+    """Yield batches forever, re-entering the loader whenever it is exhausted.
+
+    ``itertools.cycle`` must not be used here.  It caches every batch and then
+    replays the cached copies, so a domain that wraps inside an epoch would see
+    the same samples in the same order with the same flips and rotations each
+    time -- augmentation silently switched off for the repeated passes -- and
+    the whole epoch's batches would be pinned in memory.  Re-entering the
+    DataLoader reshuffles and re-augments, and caches nothing.
+    """
+    while True:
+        for batch in loader:
+            yield batch
+
+
 def _round_robin(loaders: Dict, steps: int, order: List[str]):
-    iters = {d: cycle(loaders[d]) for d in order}
+    iters = {d: _endless(loaders[d]) for d in order}
     for i in range(steps):
         d = order[i % len(order)]
         yield d, next(iters[d])
@@ -77,7 +91,7 @@ def _round_robin(loaders: Dict, steps: int, order: List[str]):
 
 def _sequential(loaders: Dict, batches_per_domain: int, order: List[str]):
     for d in order:
-        it = cycle(loaders[d])
+        it = _endless(loaders[d])
         for _ in range(batches_per_domain):
             yield d, next(it)
 

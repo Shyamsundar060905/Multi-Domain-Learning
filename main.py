@@ -188,6 +188,7 @@ def _make_loaders(args):
             train_loaders["WHU"] = DataLoader(
                 whu_train, batch_size=args.batch_size, shuffle=True,
                 num_workers=args.num_workers, pin_memory=True, drop_last=True,
+                persistent_workers=args.num_workers > 0,
             )
             eval_loaders["WHU"] = DataLoader(
                 whu_val, batch_size=args.batch_size, shuffle=False,
@@ -234,6 +235,7 @@ def _make_loaders(args):
             train_loaders["LEVIR"] = DataLoader(
                 levir_train, batch_size=args.batch_size, shuffle=True,
                 num_workers=args.num_workers, pin_memory=True, drop_last=True,
+                persistent_workers=args.num_workers > 0,
             )
             eval_loaders["LEVIR"] = DataLoader(
                 levir_val, batch_size=args.batch_size, shuffle=False,
