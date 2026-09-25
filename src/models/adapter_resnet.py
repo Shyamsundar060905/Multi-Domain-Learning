@@ -1,11 +1,31 @@
-"""U-Net-style encoder: frozen ImageNet ResNet50 pyramid + per-domain adapters."""
+"""U-Net-style encoder: frozen ImageNet ResNet50 pyramid + per-domain adapters.
+
+Two encoder adapter types, both per-domain:
+
+- ``simple``: ResidualAdapter after every bottleneck block, applied to each
+  temporal stream independently.
+- ``guided``: ChangeGuidedDynamicAdapter, which takes BOTH temporal streams and
+  adapts them jointly, conditioned on their difference.  Placed either once per
+  ResNet stage (at the stage output) or after every bottleneck block.
+
+A guided adapter needs x1 and x2 at the same point in the network, so the
+encoder runs the two timesteps in lockstep, block by block, instead of as two
+independent passes.  For ``simple`` adapters this is the same computation as
+before: every frozen block and adapter still sees one stream at a time, so
+adapter BatchNorm statistics stay per stream.  Only the order in which dropout
+masks are drawn changes.
+"""
 
 from __future__ import annotations
 
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+
+from src.models.guided_adapter import ChangeGuidedDynamicAdapter, routing_balance_loss
+
+_STAGES = ("layer1", "layer2", "layer3", "layer4")
 
 
 class ResidualAdapter(nn.Module):
@@ -36,14 +56,12 @@ STAGE_CHANNELS = {
     "l4": 2048,
 }
 
-_RESNET_STAGES = ("layer1", "layer2", "layer3", "layer4")
-
 
 class ResNetWithAdapters(nn.Module):
     """Frozen ResNet50 encoder pyramid + trainable per-domain adapters.
 
-    Adapters sit after every ResNet bottleneck block.  Outputs ``{l1..l4}`` at
-    H/4, H/8, H/16, H/32 for U-Net skip connections.
+    Outputs ``{l1..l4}`` at H/4, H/8, H/16, H/32 for each timestep, for the
+    U-Net skip connections.
     """
 
     def __init__(
@@ -54,9 +72,21 @@ class ResNetWithAdapters(nn.Module):
         adapter_reduction: int = 16,
         domain_bn_in_adapter: bool = False,
         unfreeze_layer4: bool = False,
-        adapter_stages: Iterable[str] = ("layer1", "layer2", "layer3", "layer4"),
+        adapter_stages: Iterable[str] = _STAGES,
+        adapter_type: str = "guided",
+        guided_granularity: str = "stage",
+        num_experts: int = 4,
+        guided_reduction: int = 16,
+        router_top_k: Optional[int] = 2,
+        router_temperature: float = 1.0,
     ):
         super().__init__()
+        if adapter_type not in {"simple", "guided"}:
+            raise ValueError(f"adapter_type must be 'simple' or 'guided', got {adapter_type!r}")
+        if guided_granularity not in {"stage", "block"}:
+            raise ValueError(
+                f"guided_granularity must be 'stage' or 'block', got {guided_granularity!r}"
+            )
 
         self.stem = nn.Sequential(base.conv1, base.bn1, base.relu, base.maxpool)
         self.layer1 = base.layer1
@@ -69,16 +99,35 @@ class ResNetWithAdapters(nn.Module):
         self.domain_bn_in_adapter = domain_bn_in_adapter
         self.unfreeze_layer4 = unfreeze_layer4
         self.adapter_stages = list(adapter_stages)
+        self.adapter_type = adapter_type
+        self.guided_granularity = guided_granularity
+        # Simple adapters always sit after every block; guided adapters follow
+        # guided_granularity.
+        self.adapter_per_block = adapter_type == "simple" or guided_granularity == "block"
+        # Load-balancing loss over guided routing, refreshed on every forward.
+        self.routing_balance: Optional[torch.Tensor] = None
+
+        def make_adapter(channels: int) -> nn.Module:
+            if adapter_type == "simple":
+                return ResidualAdapter(
+                    channels, reduction=adapter_reduction, dropout=adapter_dropout
+                )
+            return ChangeGuidedDynamicAdapter(
+                channels,
+                num_experts=num_experts,
+                reduction=guided_reduction,
+                temperature=router_temperature,
+                top_k=router_top_k,
+            )
+
+        def n_adapters(stage: str) -> int:
+            return len(getattr(self, stage)) if self.adapter_per_block else 1
 
         self.domain_adapters = nn.ModuleDict({
             d: nn.ModuleDict({
                 stage: nn.ModuleList([
-                    ResidualAdapter(
-                        STAGE_CHANNELS[f"l{stage[-1]}"],
-                        reduction=adapter_reduction,
-                        dropout=adapter_dropout,
-                    )
-                    for _ in getattr(self, stage)
+                    make_adapter(STAGE_CHANNELS[f"l{stage[-1]}"])
+                    for _ in range(n_adapters(stage))
                 ])
                 for stage in self.adapter_stages
             })
@@ -126,20 +175,39 @@ class ResNetWithAdapters(nn.Module):
                     m.eval()
         return self
 
-    def _run_stage(
+    def _run_stage_pair(
         self,
         stage: nn.Sequential,
         adapters: nn.ModuleList | None,
         bns: nn.ModuleList | None,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
+        x1: torch.Tensor,
+        x2: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+        """Run one ResNet stage on both timesteps in lockstep.
+
+        Returns both stage outputs and the routing weights of any guided
+        adapters that ran, for the load-balancing loss.
+        """
+        routing: List[torch.Tensor] = []
+        last = len(stage) - 1
         for i, block in enumerate(stage):
-            x = block(x)
+            x1, x2 = block(x1), block(x2)
             if bns is not None:
-                x = bns[i](x)
-            if adapters is not None:
-                x = adapters[i](x)
-        return x
+                x1, x2 = bns[i](x1), bns[i](x2)
+            if adapters is None:
+                continue
+            if self.adapter_per_block:
+                adapter = adapters[i]
+            elif i == last:
+                adapter = adapters[0]
+            else:
+                continue
+            if self.adapter_type == "simple":
+                x1, x2 = adapter(x1), adapter(x2)
+            else:
+                x1, x2, info = adapter(x1, x2)
+                routing.append(info["routing_weights"])
+        return x1, x2, routing
 
     def domain_parameters(self, domain: str) -> List[torch.nn.Parameter]:
         params = list(self.domain_adapters[domain].parameters())
@@ -147,21 +215,10 @@ class ResNetWithAdapters(nn.Module):
             params += list(self.domain_bns[domain].parameters())
         return params
 
-    def adapter_parameters(self, domain: str | None = None):
-        if domain is None:
-            for p in self.domain_adapters.parameters():
-                yield p
-            if hasattr(self, "domain_bns"):
-                for p in self.domain_bns.parameters():
-                    yield p
-        else:
-            for p in self.domain_adapters[domain].parameters():
-                yield p
-            if hasattr(self, "domain_bns") and domain in self.domain_bns:
-                for p in self.domain_bns[domain].parameters():
-                    yield p
-
-    def extract_multiscale(self, x: torch.Tensor, domain: str) -> Dict[str, torch.Tensor]:
+    def extract_multiscale_pair(
+        self, x1: torch.Tensor, x2: torch.Tensor, domain: str
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        """Pyramids ``{l1..l4}`` for both timesteps, run through the encoder together."""
         if domain not in self.domain_adapters:
             raise KeyError(
                 f"Unknown domain '{domain}'. Known: {list(self.domain_adapters)}"
@@ -170,20 +227,26 @@ class ResNetWithAdapters(nn.Module):
         ad = self.domain_adapters[domain]
         bns = self.domain_bns[domain] if hasattr(self, "domain_bns") else None
 
-        x = self.stem(x)
-        l1 = self._run_stage(self.layer1, ad["layer1"] if "layer1" in ad else None, bns["layer1"] if (bns and "layer1" in bns) else None, x)
-        l2 = self._run_stage(self.layer2, ad["layer2"] if "layer2" in ad else None, bns["layer2"] if (bns and "layer2" in bns) else None, l1)
-        l3 = self._run_stage(self.layer3, ad["layer3"] if "layer3" in ad else None, bns["layer3"] if (bns and "layer3" in bns) else None, l2)
-        l4 = self._run_stage(self.layer4, ad["layer4"] if "layer4" in ad else None, bns["layer4"] if (bns and "layer4" in bns) else None, l3)
-        return {"l1": l1, "l2": l2, "l3": l3, "l4": l4}
+        x1, x2 = self.stem(x1), self.stem(x2)
+        p1: Dict[str, torch.Tensor] = {}
+        p2: Dict[str, torch.Tensor] = {}
+        routing: List[torch.Tensor] = []
+        for k, stage_name in enumerate(_STAGES, start=1):
+            adapters = ad[stage_name] if stage_name in ad else None
+            stage_bns = bns[stage_name] if (bns is not None and stage_name in bns) else None
+            x1, x2, r = self._run_stage_pair(
+                getattr(self, stage_name), adapters, stage_bns, x1, x2
+            )
+            p1[f"l{k}"], p2[f"l{k}"] = x1, x2
+            routing.extend(r)
 
-    def extract_features(self, x: torch.Tensor, domain: str):
-        feats = self.extract_multiscale(x, domain)
-        return feats["l3"], feats["l4"]
+        self.routing_balance = (
+            torch.stack([routing_balance_loss(w) for w in routing]).mean()
+            if routing else None
+        )
+        return p1, p2
 
-    def forward(self, x: torch.Tensor, domain: str) -> torch.Tensor:
-        return self.extract_multiscale(x, domain)["l4"]
-
-
-# Alias kept for callers that import this name from main.
-UNetEncoderWithAdapters = ResNetWithAdapters
+    def forward(
+        self, x1: torch.Tensor, x2: torch.Tensor, domain: str
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        return self.extract_multiscale_pair(x1, x2, domain)

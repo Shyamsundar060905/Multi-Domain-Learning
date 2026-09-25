@@ -1,23 +1,20 @@
-"""Continual / joint trainer for multi-domain binary change detection.
+"""Joint trainer for multi-domain binary change detection.
 
-Notebook-style architecture:
-- Per-domain optimiser + scheduler (Adam state never crosses domains).
+- Per-domain optimiser + scheduler (Adam state never crosses domains), plus one
+  shared optimiser for the decoder's shared conv weights.
 - ``freeze_domain`` called at the start of every domain block so the active
   domain is the only one with ``requires_grad=True``.
 - Three schedule modes:
-    * ``round_robin``: alternate domains every batch (balanced shared-state
-      experiment; with fully per-domain decoders there is no shared state, so
-      this becomes equivalent to a fine-grained interleaving).
-    * ``sequential``: ``min_len`` batches of the first domain then ``min_len``
-      batches of the next, inside one outer epoch.
-    * ``per_domain_full_epoch``: full inner epoch of each domain per outer
-      epoch (mirrors the notebook's training loop).
+    * ``round_robin``: alternate domains every batch.
+    * ``sequential``: a full block of the first domain then the next, inside one
+      outer epoch (each block sized to the largest domain's loader).
+    * ``per_domain_full_epoch``: full inner epoch of each domain per outer epoch.
 """
 
 from __future__ import annotations
 
 import math
-from itertools import cycle
+from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Union
 
 import torch
@@ -25,7 +22,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from src.training.ewc import EWC
 from src.utils.helpers import domain_parameters, freeze_domain, shared_parameters
 
 
@@ -71,8 +67,23 @@ def change_detection_loss(
 # Schedule helpers
 # ---------------------------------------------------------------------------
 
+def _endless(loader):
+    """Yield batches forever, re-entering the loader whenever it is exhausted.
+
+    ``itertools.cycle`` must not be used here.  It caches every batch and then
+    replays the cached copies, so a domain that wraps inside an epoch would see
+    the same samples in the same order with the same flips and rotations each
+    time -- augmentation silently switched off for the repeated passes -- and
+    the whole epoch's batches would be pinned in memory.  Re-entering the
+    DataLoader reshuffles and re-augments, and caches nothing.
+    """
+    while True:
+        for batch in loader:
+            yield batch
+
+
 def _round_robin(loaders: Dict, steps: int, order: List[str]):
-    iters = {d: cycle(loaders[d]) for d in order}
+    iters = {d: _endless(loaders[d]) for d in order}
     for i in range(steps):
         d = order[i % len(order)]
         yield d, next(iters[d])
@@ -80,7 +91,7 @@ def _round_robin(loaders: Dict, steps: int, order: List[str]):
 
 def _sequential(loaders: Dict, batches_per_domain: int, order: List[str]):
     for d in order:
-        it = cycle(loaders[d])
+        it = _endless(loaders[d])
         for _ in range(batches_per_domain):
             yield d, next(it)
 
@@ -88,6 +99,79 @@ def _sequential(loaders: Dict, batches_per_domain: int, order: List[str]):
 # ---------------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------------
+
+class _LossAccum:
+    """Running means of each loss term over an epoch (or a domain block)."""
+
+    KEYS = ("total", "main", "aux", "distill", "ewc", "route", "dice", "aux_dice")
+
+    def __init__(self):
+        self.sums = {k: 0.0 for k in self.KEYS}
+        self.n = 0
+
+    def add(self, stats: Dict[str, float]) -> None:
+        for k in self.KEYS:
+            self.sums[k] += stats.get(k, 0.0)
+        self.n += 1
+
+    def mean(self, key: str) -> float:
+        return self.sums[key] / max(self.n, 1)
+
+    def summary(self, trainer) -> str:
+        """One line showing every term, weighted as it enters the objective."""
+        w, a = trainer.deep_supervision_weight, trainer.distill_alpha
+        parts = [
+            f"loss={self.mean('total'):.4f}",
+            f"(main={self.mean('main'):.4f}",
+            f"aux={self.mean('aux'):.4f}x{w:g}",
+        ]
+        if a > 0.0:
+            parts.append(f"dst={self.mean('distill'):.4f}x{a:g}")
+        e = trainer.ewc_lambda
+        if e > 0.0:
+            # Raw Fisher-weighted penalty and the lambda/2 it is scaled by.
+            parts.append(f"ewc={self.mean('ewc'):.3e}x{e / 2:g}")
+        r = trainer.routing_balance_weight
+        if r > 0.0 and self.sums["route"] > 0.0:
+            parts.append(f"route={self.mean('route'):.4f}x{r:g}")
+        parts[-1] += ")"
+        parts.append(f"dice={self.mean('dice'):.4f}")
+        if self.sums["aux_dice"] > 0.0:
+            parts.append(f"aux_dice={self.mean('aux_dice'):.4f}")
+        return "  ".join(parts)
+
+
+def _tta_logits(model, img1: torch.Tensor, img2: torch.Tensor, domain: str):
+    """Average identity / hflip / vflip predictions, for both heads.
+
+    Averaging is done in probability space and converted back to logits so the
+    caller can keep using the same metric function.
+    """
+    eps = 1e-7
+    views = [
+        (lambda t: t, lambda t: t),                                   # identity
+        (lambda t: torch.flip(t, dims=[-1]), lambda t: torch.flip(t, dims=[-1])),
+        (lambda t: torch.flip(t, dims=[-2]), lambda t: torch.flip(t, dims=[-2])),
+    ]
+
+    main_sum, aux_sum, k = None, None, 0
+    for fwd, inv in views:
+        lo, ax = model(fwd(img1), fwd(img2), domain)
+        p = inv(torch.sigmoid(lo))
+        main_sum = p if main_sum is None else main_sum + p
+        if ax is not None:
+            pa = inv(torch.sigmoid(ax))
+            aux_sum = pa if aux_sum is None else aux_sum + pa
+        k += 1
+
+    def _to_logits(prob_sum):
+        if prob_sum is None:
+            return None
+        p = torch.clamp(prob_sum / k, eps, 1.0 - eps)
+        return torch.log(p / (1.0 - p))
+
+    return _to_logits(main_sum), _to_logits(aux_sum)
+
 
 def _segmentation_metrics(logits: torch.Tensor, target: torch.Tensor):
     probs = torch.sigmoid(logits)
@@ -103,11 +187,42 @@ def _segmentation_metrics(logits: torch.Tensor, target: torch.Tensor):
     return acc.mean(), dice.mean(), iou.mean()
 
 
+def _confusion(logits: torch.Tensor, target: torch.Tensor):
+    """Pixel counts (tp, fp, fn, tn) for one batch, at threshold 0.5.
+
+    Accumulated over a whole split these give the *aggregate* precision,
+    recall, F1 and IoU that the LEVIR-CD and WHU-CD literature reports.  That
+    differs from averaging a per-image Dice: an empty tile scores 1.0 or ~0
+    under the per-image metric and dominates the mean, whereas here it simply
+    contributes no positives.
+    """
+    pred = (torch.sigmoid(logits) > 0.5).float()
+    target = target.float()
+    tp = (pred * target).sum()
+    fp = (pred * (1.0 - target)).sum()
+    fn = ((1.0 - pred) * target).sum()
+    tn = ((1.0 - pred) * (1.0 - target)).sum()
+    return tp.item(), fp.item(), fn.item(), tn.item()
+
+
+def _aggregate_scores(tp: float, fp: float, fn: float, tn: float) -> Dict[str, float]:
+    eps = 1e-9
+    precision = tp / max(tp + fp, eps)
+    recall = tp / max(tp + fn, eps)
+    return {
+        "precision": precision,
+        "recall": recall,
+        "f1": 2.0 * tp / max(2.0 * tp + fp + fn, eps),
+        "iou": tp / max(tp + fp + fn, eps),
+        "acc": (tp + tn) / max(tp + tn + fp + fn, eps),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Trainer
 # ---------------------------------------------------------------------------
 
-class ContinualFewShotTrainer:
+class MultiDomainTrainer:
     """Per-domain optimisers + schedulers for multi-domain CD."""
 
     def __init__(
@@ -122,18 +237,23 @@ class ContinualFewShotTrainer:
         test_domain_splits: Dict[str, str] | None = None,
         lr: float = 1e-4,
         weight_decay: float = 1e-4,
-        ewc_lambda: float = 1e4,
         pos_weight: PosWeightLike = 20.0,
         focal_gamma: float = 2.0,
         dice_weight: float = 0.7,
         bce_weight: float = 0.3,
-        deep_supervision_weight: float = 0.4,
+        deep_supervision_weight: float = 1.0,
+        distill_alpha: float = 0.0,
+        ewc_lambda: float = 0.0,
+        ewc_fisher_batches: int = 50,
+        routing_balance_weight: float = 0.0,
         schedule: str = "per_domain_full_epoch",
         domain_order: Iterable[str] | None = None,
         scheduler_step_size: int = 15,
         scheduler_gamma: float = 0.1,
-        skip_ewc: bool = False,
         use_tta: bool = False,
+        select_metric: str = "dice",
+        ckpt_dir: str | None = "checkpoints",
+        ckpt_name: str = "best.pt",
     ):
         self.model = model
         self.train_loaders = train_loaders
@@ -144,6 +264,17 @@ class ContinualFewShotTrainer:
         self.domain_list = list(domain_list)
         self.device = device
         self.use_tta = use_tta
+        if select_metric not in {"dice", "f1"}:
+            raise ValueError(f"select_metric must be 'dice' or 'f1', got {select_metric!r}")
+        self.select_metric = select_metric
+
+        # Best-checkpoint tracking, keyed on the mean eval Dice across domains.
+        self.ckpt_dir = Path(ckpt_dir) if ckpt_dir else None
+        self.ckpt_name = ckpt_name
+        self.best_dice = -1.0
+        self.best_epoch = -1
+        if self.ckpt_dir is not None:
+            self.ckpt_dir.mkdir(parents=True, exist_ok=True)
 
         if isinstance(pos_weight, Mapping):
             self.pos_weight: Dict[str, float] = {
@@ -156,13 +287,20 @@ class ContinualFewShotTrainer:
         self.dice_weight = dice_weight
         self.bce_weight = bce_weight
         self.deep_supervision_weight = deep_supervision_weight
+        self.distill_alpha = distill_alpha
+        # EWC over the shared decoder weights: a diagonal Fisher and an anchor
+        # snapshot per domain, refreshed by _ewc_consolidate.
+        self.ewc_lambda = ewc_lambda
+        self.ewc_fisher_batches = ewc_fisher_batches
+        self.routing_balance_weight = routing_balance_weight
+        self._ewc: Dict[str, Dict[str, list]] = {}
+        self._ewc_shared: list = []
 
         if schedule not in {"round_robin", "sequential", "per_domain_full_epoch"}:
             raise ValueError(
                 "schedule must be one of round_robin, sequential, per_domain_full_epoch"
             )
         self.schedule = schedule
-        self.skip_ewc = skip_ewc
 
         if domain_order is None:
             self.domain_order = list(self.domain_list)
@@ -195,13 +333,27 @@ class ContinualFewShotTrainer:
                 self.decoder_optimizer, step_size=scheduler_step_size, gamma=scheduler_gamma
             )
 
-        self.ewc = EWC(model, ewc_lambda=ewc_lambda)
-
         # Keep all backbone BatchNorms in eval mode (they are frozen).
         self._lock_backbone_bn()
 
         print(f"Per-domain pos_weight: {self.pos_weight}")
         print(f"Deep supervision weight: {self.deep_supervision_weight}")
+        print(f"Distill alpha:         {self.distill_alpha}"
+              f"{'  (off)' if self.distill_alpha <= 0 else ''}")
+        if self.ewc_lambda > 0:
+            print(f"EWC lambda:            {self.ewc_lambda}  "
+                  f"({self.ewc_fisher_batches} Fisher batches/domain, shared params only)")
+        else:
+            print(f"EWC lambda:            {self.ewc_lambda}  (off)")
+        if getattr(getattr(self.model, "backbone", None), "adapter_type", "simple") == "guided":
+            print(f"Routing balance weight: {self.routing_balance_weight}"
+                  f"{'  (off)' if self.routing_balance_weight <= 0 else ''}")
+        sel_label = (
+            self._selection_label(self._selection_domains(self.eval_loaders))
+            if self.eval_loaders else "none"
+        )
+        metric_label = "aggregate F1" if self.select_metric == "f1" else "per-image Dice"
+        print(f"Checkpoint selection:  {sel_label}  ({metric_label})")
         print(f"Domain order:          {self.domain_order}")
         print(f"Schedule:              {self.schedule}")
         self._log_trainable()
@@ -233,6 +385,187 @@ class ContinualFewShotTrainer:
             print(f"  - {d} adapters: {n:,} params")
 
     # ------------------------------------------------------------------
+    @property
+    def ckpt_path(self) -> Path | None:
+        return None if self.ckpt_dir is None else self.ckpt_dir / self.ckpt_name
+
+    def _selection_domains(self, domains: Iterable[str]) -> List[str]:
+        """Domains allowed to choose the best checkpoint.
+
+        Only domains evaluated on a validation split vote.  A domain whose eval
+        loader is its test set (currently WHU) would otherwise leak test data
+        into model selection -- and its epoch-to-epoch swings would decide which
+        checkpoint is kept.  Falls back to every domain when none has a
+        validation split (e.g. a WHU-only run), so something is still saved.
+        """
+        held_out = [d for d in domains if self.eval_domain_splits.get(d, "test") != "test"]
+        return held_out or list(domains)
+
+    def _selection_label(self, domains: Iterable[str]) -> str:
+        return " + ".join(f"{d} {self.eval_domain_splits.get(d, 'test')}" for d in domains)
+
+    def _save_best(self, epoch: int, results: Dict[str, float]) -> bool:
+        """Save the model when the selection Dice improves. Returns True if saved.
+
+        The selection score uses only validation-split domains (see
+        _selection_domains); every domain's score is still stored.
+        """
+        path = self.ckpt_path
+        if path is None or not results:
+            return False
+
+        sel = self._selection_domains(results)
+        score = sum(results[d] for d in sel) / len(sel)
+        if score <= self.best_dice:
+            return False
+
+        prev = self.best_dice
+        self.best_dice, self.best_epoch = score, epoch
+
+        payload = {
+            "model": self.model.state_dict(),
+            "epoch": epoch,
+            "selection_dice": score,
+            "selection_domains": sel,
+            "per_domain_dice": dict(results),
+            "domain_list": list(self.domain_list),
+        }
+        # Write to a temp file first: a run killed mid-save leaves the previous
+        # best intact instead of a truncated checkpoint.
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        torch.save(payload, tmp)
+        tmp.replace(path)
+
+        delta = "" if prev < 0 else f" (was {prev:.4f})"
+        print(f"  * new best {self._selection_label(sel)} Dice {score:.4f}{delta} -- saved {path}")
+        return True
+
+    def _load_best(self) -> bool:
+        """Restore the best checkpoint in place. Returns True if one was loaded."""
+        path = self.ckpt_path
+        if path is None or not path.exists():
+            return False
+        ckpt = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(ckpt["model"])
+        self.best_epoch = ckpt.get("epoch", self.best_epoch)
+        self.best_dice = ckpt.get("selection_dice", ckpt.get("avg_eval_dice", self.best_dice))
+        sel = ckpt.get("selection_domains")
+        label = self._selection_label(sel) if sel else "avg eval"
+        print(
+            f"Restored best checkpoint from epoch {self.best_epoch} "
+            f"({label} Dice {self.best_dice:.4f})"
+        )
+        return True
+
+    # ------------------------------------------------------------------
+    def _prepare_batch(self, batch):
+        img1, img2, mask = batch
+        img1 = img1.to(self.device, non_blocking=True)
+        img2 = img2.to(self.device, non_blocking=True)
+        mask = mask.to(self.device, non_blocking=True).float()
+        if img1.dim() == 3:
+            img1 = img1.unsqueeze(0)
+            img2 = img2.unsqueeze(0)
+        if mask.dim() == 3:
+            mask = mask.unsqueeze(0) if mask.shape[0] == img1.shape[0] else mask.unsqueeze(1)
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(0).unsqueeze(0)
+        return img1, img2, (mask > 0.5).float()
+
+    # ------------------------------------------------------------------
+    # EWC over the shared parameters
+    # ------------------------------------------------------------------
+    def _ewc_consolidate(self, domains: Iterable[str]) -> None:
+        """Estimate each domain's diagonal Fisher over the SHARED parameters and
+        snapshot their current values as that domain's anchor.
+
+        Only shared weights are protected: per-domain adapters / BatchNorm are
+        private (no other domain can overwrite them) and the backbone is frozen.
+        Runs in eval mode so the Fisher passes neither update BatchNorm running
+        statistics nor apply dropout.  Uses the batch-level empirical Fisher
+        (squared gradient of the batch loss), the usual cheap approximation.
+        """
+        if self.ewc_lambda <= 0.0:
+            return
+        shared = shared_parameters(self.model)
+        if not shared:
+            return
+        self._ewc_shared = shared
+
+        was_training = self.model.training
+        self.model.eval()
+        for d in domains:
+            loader = self.train_loaders.get(d)
+            if loader is None:
+                continue
+            fisher = [torch.zeros_like(p) for p in shared]
+            n = 0
+            for batch in loader:
+                if n >= self.ewc_fisher_batches:
+                    break
+                img1, img2, mask = self._prepare_batch(batch)
+                self.model.zero_grad(set_to_none=True)
+                with torch.enable_grad():
+                    logits, aux_logits = self.model(img1, img2, d)
+                    kw = dict(pos_weight=self.pos_weight[d], gamma=self.focal_gamma,
+                              dice_weight=self.dice_weight, bce_weight=self.bce_weight)
+                    obj = change_detection_loss(logits, mask, **kw)
+                    if aux_logits is not None:
+                        obj = obj + self.deep_supervision_weight * change_detection_loss(
+                            aux_logits, mask, **kw)
+                    obj.backward()
+                for f, p in zip(fisher, shared):
+                    if p.grad is not None:
+                        f += p.grad.detach() ** 2
+                n += 1
+            if n == 0:
+                continue
+            for f in fisher:
+                f /= n
+            self._ewc[d] = {
+                "fisher": fisher,
+                "anchor": [p.detach().clone() for p in shared],
+            }
+            numel = sum(f.numel() for f in fisher)
+            mean_f = sum(float(f.sum()) for f in fisher) / max(numel, 1)
+            print(f"  [EWC] consolidated {d}: {n} batches, mean Fisher {mean_f:.3e}")
+
+        # Leave no stale gradients for the optimisers.
+        self.model.zero_grad(set_to_none=True)
+        if was_training:
+            self.model.train()
+
+    def _ewc_penalty(self, domain: str):
+        """sum over the OTHER domains d' of  sum_i F_d'[i] * (theta_i - theta*_d'[i])^2.
+
+        A domain's own Fisher never restrains its own steps; it only protects the
+        shared weights from being moved by the other domains.
+        """
+        others = [s for d, s in self._ewc.items() if d != domain]
+        if not others or not self._ewc_shared:
+            return None
+        total = self._ewc_shared[0].new_zeros(())
+        for s in others:
+            for p, f, a in zip(self._ewc_shared, s["fisher"], s["anchor"]):
+                total = total + (f * (p - a) ** 2).sum()
+        return total
+
+    def _postfix(self, stats: Dict[str, float]) -> Dict[str, str]:
+        out = {
+            "loss": f"{stats['total']:.4f}",
+            "main": f"{stats['main']:.4f}",
+            "aux": f"{stats['aux']:.4f}",
+        }
+        if self.distill_alpha > 0.0:
+            out["dst"] = f"{stats['distill']:.4f}"
+        if self.ewc_lambda > 0.0:
+            out["ewc"] = f"{stats['ewc']:.2e}"
+        if self.routing_balance_weight > 0.0 and stats.get("route", 0.0) > 0.0:
+            out["route"] = f"{stats['route']:.4f}"
+        out["dice"] = f"{stats['dice']:.4f}"
+        out["msum"] = int(stats["msum"])
+        return out
+
     def train_step(self, batch, domain: str):
         img1, img2, mask = batch
         img1 = img1.to(self.device, non_blocking=True)
@@ -253,13 +586,15 @@ class ContinualFewShotTrainer:
             self.decoder_optimizer.zero_grad(set_to_none=True)
 
         logits, aux_logits = self.model(img1, img2, domain)
-        loss = change_detection_loss(
+        main_loss = change_detection_loss(
             logits, mask,
             pos_weight=self.pos_weight[domain],
             gamma=self.focal_gamma,
             dice_weight=self.dice_weight,
             bce_weight=self.bce_weight,
         )
+        loss = main_loss
+        aux_val = 0.0
         if aux_logits is not None:
             aux_loss = change_detection_loss(
                 aux_logits, mask,
@@ -269,10 +604,41 @@ class ContinualFewShotTrainer:
                 bce_weight=self.bce_weight,
             )
             loss = loss + self.deep_supervision_weight * aux_loss
-        ewc_loss = self.ewc.penalty(self.model)
-        total = loss + ewc_loss
+            aux_val = float(aux_loss.detach())
 
-        total.backward()
+        # Self-distillation: pull the auxiliary head toward the main head.
+        # Both predict at full resolution now (AuxDecoder upsamples with its
+        # own transposed convs), so the comparison is direct -- no pooling.
+        # The teacher is detached, so gradients move aux toward main and
+        # never the reverse.
+        distill_val = 0.0
+        if aux_logits is not None and self.distill_alpha > 0.0:
+            distill = F.mse_loss(aux_logits, logits.detach())
+            loss = loss + self.distill_alpha * distill
+            distill_val = float(distill.detach())
+
+        # EWC: keep the shared weights near the values the OTHER domains rely on.
+        # Zero until the first consolidation (end of epoch 1 / first block).
+        ewc_val = 0.0
+        if self.ewc_lambda > 0.0:
+            pen = self._ewc_penalty(domain)
+            if pen is not None:
+                loss = loss + 0.5 * self.ewc_lambda * pen
+                ewc_val = float(pen.detach())
+
+        # Load balancing for the change-guided adapters' top-k routing: without
+        # it experts tend to collapse onto one.  Computed by the backbone during
+        # this forward pass, averaged over every guided adapter that ran.
+        route_val = 0.0
+        route = getattr(self.model, "routing_balance", None)
+        if route is None:
+            route = getattr(getattr(self.model, "backbone", None), "routing_balance", None)
+        if route is not None:
+            route_val = float(route.detach())
+            if self.routing_balance_weight > 0.0:
+                loss = loss + self.routing_balance_weight * route
+
+        loss.backward()
         trainable = domain_parameters(self.model, domain) + shared_parameters(self.model)
         torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
         opt.step()
@@ -281,7 +647,24 @@ class ContinualFewShotTrainer:
 
         with torch.no_grad():
             _, dice, _ = _segmentation_metrics(logits, mask)
-        return loss.item(), float(ewc_loss), dice.item(), mask.sum().item()
+            aux_dice = 0.0
+            if aux_logits is not None:
+                _, ad, _ = _segmentation_metrics(aux_logits, mask)
+                aux_dice = ad.item()
+
+        # Raw (unweighted) values for each term, so the epoch summary can show
+        # how the three parts of the objective actually balance.
+        return {
+            "total": loss.item(),
+            "main": float(main_loss.detach()),
+            "aux": aux_val,
+            "distill": distill_val,
+            "ewc": ewc_val,
+            "route": route_val,
+            "dice": dice.item(),
+            "aux_dice": aux_dice,
+            "msum": mask.sum().item(),
+        }
 
     # ------------------------------------------------------------------
     def _train_domain_block(self, domain: str, loader, epoch: int, epochs: int):
@@ -291,52 +674,36 @@ class ContinualFewShotTrainer:
         """
         freeze_domain(self.model, domain)
 
-        running_loss = running_dice = 0.0
-        n = 0
+        acc = _LossAccum()
         pbar = tqdm(loader, desc=f"[{domain} | epoch {epoch+1}/{epochs}]", leave=False)
         for batch in pbar:
-            loss, ewc_loss, dice, msum = self.train_step(batch, domain)
-            running_loss += loss
-            running_dice += dice
-            n += 1
-            pbar.set_postfix({
-                "loss": f"{loss:.4f}",
-                "dice": f"{dice:.4f}",
-                "ewc":  f"{ewc_loss:.4f}",
-                "msum": int(msum),
-            })
+            stats = self.train_step(batch, domain)
+            acc.add(stats)
+            pbar.set_postfix(self._postfix(stats))
 
-        n = max(n, 1)
         lr = self.optimizers[domain].param_groups[0]["lr"]
-        print(f"  [{domain}] epoch {epoch+1}: loss={running_loss/n:.4f}  "
-              f"dice={running_dice/n:.4f}  lr={lr:.2e}")
-        return running_loss / n, running_dice / n
+        print(f"  [{domain}] epoch {epoch+1}: {acc.summary(self)}  lr={lr:.2e}")
+        return acc.mean("total"), acc.mean("dice")
 
     def _train_mixed(self, stream, total_steps: int, epoch: int, epochs: int):
         """Used for round_robin / sequential: gradients flow only through the
         domain selected per-batch.  ``freeze_domain`` is called inside the
         loop on every domain switch.
         """
-        running = {d: [0.0, 0.0, 0] for d in self.domain_list}
+        running = {d: _LossAccum() for d in self.domain_list}
         prev = None
         pbar = tqdm(stream, total=total_steps, desc=f"[{self.schedule} | {epoch+1}/{epochs}]")
         for domain, batch in pbar:
             if domain != prev:
                 freeze_domain(self.model, domain)
                 prev = domain
-            loss, ewc_loss, dice, msum = self.train_step(batch, domain)
-            running[domain][0] += loss
-            running[domain][1] += dice
-            running[domain][2] += 1
-            pbar.set_postfix({
-                "dom": domain, "loss": f"{loss:.4f}",
-                "dice": f"{dice:.4f}", "msum": int(msum),
-            })
-        for d, (lsum, dsum, n) in running.items():
-            if n:
+            stats = self.train_step(batch, domain)
+            running[domain].add(stats)
+            pbar.set_postfix({"dom": domain, **self._postfix(stats)})
+        for d, acc in running.items():
+            if acc.n:
                 lr = self.optimizers[d].param_groups[0]["lr"]
-                print(f"  [{d}] epoch {epoch+1}: loss={lsum/n:.4f}  "
-                      f"dice={dsum/n:.4f}  lr={lr:.2e}")
+                print(f"  [{d}] epoch {epoch+1}: {acc.summary(self)}  lr={lr:.2e}")
 
     # ------------------------------------------------------------------
     def train_joint(self, epochs: int, *_):
@@ -360,6 +727,9 @@ class ContinualFewShotTrainer:
                 # Notebook style: full inner epoch per domain, in domain_order.
                 for domain in self.domain_order:
                     self._train_domain_block(domain, self.train_loaders[domain], epoch, epochs)
+                    # Consolidate right after this domain's block, so the next
+                    # domain is anchored to the weights this one just produced.
+                    self._ewc_consolidate([domain])
             else:
                 batches_per_domain = max(len(l) for l in self.train_loaders.values())
                 total = batches_per_domain * len(self.train_loaders)
@@ -368,6 +738,9 @@ class ContinualFewShotTrainer:
                 else:  # sequential
                     stream = _sequential(self.train_loaders, batches_per_domain, self.domain_order)
                 self._train_mixed(stream, total, epoch, epochs)
+                # Domains are interleaved, so there is no per-domain boundary:
+                # consolidate every domain once per epoch.
+                self._ewc_consolidate(self.domain_list)
 
             for d in self.domain_list:
                 self.schedulers[d].step()
@@ -375,47 +748,27 @@ class ContinualFewShotTrainer:
                 self.decoder_scheduler.step()
 
             if self.eval_loaders:
-                self.evaluate_all(
+                results = self.evaluate_all(
                     epoch=epoch + 1,
                     total_epochs=epochs,
                     loaders=self.eval_loaders,
                     domain_splits=self.eval_domain_splits,
                 )
-            # Also track LEVIR held-out test each epoch (val alone is misleading).
-            if (
-                self.test_loaders
-                and "LEVIR" in self.test_loaders
-                and self.test_loaders.get("LEVIR") is not self.eval_loaders.get("LEVIR")
-            ):
-                self.evaluate(
-                    "LEVIR",
-                    loaders=self.test_loaders,
-                    split_label="test",
-                    epoch=epoch + 1,
-                    total_epochs=epochs,
-                )
-
-        # Final held-out test before EWC (Fisher passes must not run in train mode
-        # or shared decoder BatchNorm running stats get corrupted).
+                self._save_best(epoch + 1, results)
+        # Final held-out test on the BEST checkpoint, not whatever the last
+        # epoch happened to land on.
         if self.test_loaders:
+            restored = self._load_best()
+            header = (
+                f"Final test (held-out) -- best checkpoint, epoch {self.best_epoch}"
+                if restored
+                else "Final test (held-out) -- last epoch, no checkpoint saved"
+            )
             self.evaluate_all(
                 loaders=self.test_loaders,
                 domain_splits=self.test_domain_splits,
-                header="Final test (held-out, pre-EWC)",
+                header=header,
             )
-
-        if self.skip_ewc:
-            print("\nSkipping EWC consolidation (--skip-ewc).")
-        else:
-            print("\nConsolidating weights for all domains (EWC)...")
-            try:
-                for domain in self.domain_list:
-                    if domain in self.train_loaders:
-                        self.ewc.remember_task(domain, self.train_loaders[domain], self.device)
-                print("EWC consolidation complete.")
-            except Exception as exc:
-                print(f"[Warning] EWC consolidation failed: {exc}")
-                print("Training weights are kept; continuing to evaluation.")
 
     # ------------------------------------------------------------------
     def evaluate(
@@ -433,7 +786,11 @@ class ContinualFewShotTrainer:
         was_training = self.model.training
         self.model.eval()
         total_acc = total_dice = total_iou = 0.0
+        aux_acc = aux_dice = aux_iou = 0.0
+        has_aux = False
         n = 0
+        # Running pixel counts for the aggregate (dataset-level) scores.
+        agg = {"main": [0.0, 0.0, 0.0, 0.0], "aux": [0.0, 0.0, 0.0, 0.0]}
         desc = f"{domain} {split_label}"
         if epoch is not None and total_epochs is not None:
             desc = f"{domain} {split_label} (ep {epoch}/{total_epochs})"
@@ -453,34 +810,25 @@ class ContinualFewShotTrainer:
                 mask = (mask > 0.5).float()
 
                 if self.use_tta:
-                    # original prediction
-                    logits, _ = self.model(img1, img2, domain)
-                    prob = torch.sigmoid(logits)
-
-                    # horizontal flip
-                    img1_h = torch.flip(img1, dims=[-1])
-                    img2_h = torch.flip(img2, dims=[-1])
-                    logits_h, _ = self.model(img1_h, img2_h, domain)
-                    prob_h = torch.flip(torch.sigmoid(logits_h), dims=[-1])
-
-                    # vertical flip
-                    img1_v = torch.flip(img1, dims=[-2])
-                    img2_v = torch.flip(img2, dims=[-2])
-                    logits_v, _ = self.model(img1_v, img2_v, domain)
-                    prob_v = torch.flip(torch.sigmoid(logits_v), dims=[-2])
-
-                    # average probabilities
-                    avg_prob = (prob + prob_h + prob_v) / 3.0
-                    eps = 1e-7
-                    avg_prob = torch.clamp(avg_prob, eps, 1.0 - eps)
-                    logits = torch.log(avg_prob / (1.0 - avg_prob))
+                    logits, aux_logits = _tta_logits(self.model, img1, img2, domain)
                 else:
-                    logits, _ = self.model(img1, img2, domain)
+                    logits, aux_logits = self.model(img1, img2, domain)
 
                 acc, dice, iou = _segmentation_metrics(logits, mask)
                 total_acc += acc.item()
                 total_dice += dice.item()
                 total_iou += iou.item()
+                for i, v in enumerate(_confusion(logits, mask)):
+                    agg["main"][i] += v
+
+                if aux_logits is not None:
+                    has_aux = True
+                    a_acc, a_dice, a_iou = _segmentation_metrics(aux_logits, mask)
+                    aux_acc += a_acc.item()
+                    aux_dice += a_dice.item()
+                    aux_iou += a_iou.item()
+                    for i, v in enumerate(_confusion(aux_logits, mask)):
+                        agg["aux"][i] += v
                 n += 1
 
         if was_training:
@@ -492,15 +840,42 @@ class ContinualFewShotTrainer:
         avg_iou = total_iou / n
         if epoch is not None:
             print(
-                f"  [{domain} {split_label}] dice={avg_dice:.4f}  "
+                f"  [{domain} {split_label}] main: dice={avg_dice:.4f}  "
                 f"iou={avg_iou:.4f}  acc={avg_acc:.2f}%"
             )
         else:
             print(
-                f"[{domain} {split_label}] acc={avg_acc:.2f}%  "
+                f"[{domain} {split_label}] main: acc={avg_acc:.2f}%  "
                 f"dice={avg_dice:.4f}  iou={avg_iou:.4f}"
             )
-        return avg_dice
+
+        main_agg = _aggregate_scores(*agg["main"])
+        indent = "  " if epoch is not None else ""
+        print(
+            f"{indent}[{domain} {split_label}] main aggregate: "
+            f"F1={main_agg['f1']:.4f}  IoU={main_agg['iou']:.4f}  "
+            f"P={main_agg['precision']:.4f}  R={main_agg['recall']:.4f}"
+        )
+
+        if has_aux:
+            a_acc = 100.0 * aux_acc / n
+            a_dice = aux_dice / n
+            a_iou = aux_iou / n
+            gap = avg_dice - a_dice
+            print(
+                f"{indent}[{domain} {split_label}] aux : dice={a_dice:.4f}  "
+                f"iou={a_iou:.4f}  acc={a_acc:.2f}%  (gap {gap:+.4f})"
+            )
+            aux_agg = _aggregate_scores(*agg["aux"])
+            print(
+                f"{indent}[{domain} {split_label}] aux  aggregate: "
+                f"F1={aux_agg['f1']:.4f}  IoU={aux_agg['iou']:.4f}  "
+                f"P={aux_agg['precision']:.4f}  R={aux_agg['recall']:.4f}"
+            )
+
+        # Checkpoint selection tracks the MAIN head -- that is the deployed
+        # prediction; the aux head is reported for the early-exit comparison.
+        return main_agg["f1"] if self.select_metric == "f1" else avg_dice
 
     def evaluate_all(
         self,

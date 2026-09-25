@@ -1,24 +1,39 @@
 """Plain single-domain change detection: frozen ResNet50 encoder + plain
 trainable U-Net decoder.
 
-No per-domain adapters, no per-domain BatchNorm, no domain argument anywhere
--- this is the "individual" baseline, one model trained and evaluated on a
-single dataset (LEVIR or WHU), independent of the multi-domain architectures
-in ``ChangeDetection.py``.
+This is the "individual" baseline -- one model trained and evaluated on a
+single dataset -- against which the multi-domain adapter architectures are
+compared.  It has no per-domain adapters and no per-domain BatchNorm.
+
+Everything else is deliberately identical to ``ChangeDetection.py``: the same
+frozen backbone, the same bi-temporal fusion, the same decoder shape and
+strides, the same AuxDecoder on the first up-stage, the same prior-biased
+heads.  The only difference is that nothing is per-domain.  Keeping the two
+models structurally identical is what makes the baseline comparable.
+
+The model exposes the same interface as ChangeDetectionModel -- a ``domain``
+argument it ignores, plus ``domain_parameters`` / ``shared_parameters`` -- so
+it can be driven by the same MultiDomainTrainer and therefore go through the
+identical evaluation, checkpointing and metric code.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Dict, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import ResNet50_Weights, resnet50
 
-from src.models.ChangeDetection import CBAM, build_bitemporal_fusion
+from src.models.ChangeDetection import AuxDecoder, CBAM, build_bitemporal_fusion
 from src.models.adapter_resnet import STAGE_CHANNELS
+
+# The AuxDecoder keys its BatchNorms by domain.  With a single key it is an
+# ordinary BatchNorm, so the plain model reuses that module rather than
+# duplicating it -- identical parameters, identical behaviour.
+_SINGLE = "_"
 
 
 class PlainResNetEncoder(nn.Module):
@@ -34,9 +49,13 @@ class PlainResNetEncoder(nn.Module):
         self.layer4 = base.layer4
         for p in self.parameters():
             p.requires_grad = False
+        for m in self.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.eval()
 
     def train(self, mode: bool = True):
         super().train(mode)
+        # Frozen BatchNorms must never update their running statistics.
         for m in self.modules():
             if isinstance(m, nn.BatchNorm2d):
                 m.eval()
@@ -91,9 +110,19 @@ class PlainUpStage(nn.Module):
 
 
 class SimpleUNetDecoder(nn.Module):
-    """Plain trainable U-Net decoder -- ordinary BatchNorm, no adapters."""
+    """Plain trainable U-Net decoder -- ordinary BatchNorm, no adapters.
 
-    def __init__(self, prior: float = 0.02, fusion_type: str = "abs", use_attention: bool = False):
+    Same shape as UNetDecoder: 1x1 bottleneck, four up-stages at strides
+    2, 2, 2, 4, and the auxiliary decoder branching off the first up-stage.
+    """
+
+    def __init__(
+        self,
+        prior: float = 0.02,
+        fusion_type: str = "abs",
+        use_attention: bool = False,
+        use_deep_supervision: bool = True,
+    ):
         super().__init__()
         self.fusion_type = fusion_type
         mult = 4 if fusion_type == "abs_prod" else 3
@@ -110,19 +139,30 @@ class SimpleUNetDecoder(nn.Module):
         ])
 
         self.classifier = nn.Conv2d(32, 1, kernel_size=1)
-        self.aux_classifier = nn.Conv2d(256, 1, kernel_size=1)
+        # Auxiliary branch off the FIRST up-stage (256ch at H/16), lifted back to
+        # full resolution by four stride-2 transposed convs -- the same AuxDecoder
+        # the multi-domain model uses, with a single BatchNorm key.
+        self.aux_decoder = (
+            AuxDecoder(256, [_SINGLE], widths=(128, 64, 32, 16))
+            if use_deep_supervision else None
+        )
 
         prior_bias = math.log(prior / (1.0 - prior))
-        for head in (self.classifier, self.aux_classifier):
+        heads = [self.classifier]
+        if self.aux_decoder is not None:
+            heads.append(self.aux_decoder.classifier)
+        for head in heads:
             nn.init.normal_(head.weight, std=0.01)
             nn.init.constant_(head.bias, prior_bias)
 
-    def forward(self, fused_skips: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, fused_skips: Dict[str, torch.Tensor]
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         fused_l4 = self.attention(fused_skips["l4"])
         x = self.bottleneck(fused_l4)
 
         x = self.up_stages[0](x, fused_skips["l3"])
-        aux = self.aux_classifier(x)
+        aux = self.aux_decoder(x, _SINGLE) if self.aux_decoder is not None else None
 
         x = self.up_stages[1](x, fused_skips["l2"])
         x = self.up_stages[2](x, fused_skips["l1"])
@@ -135,14 +175,14 @@ class SimpleUNetDecoder(nn.Module):
 class SimpleChangeDetectionModel(nn.Module):
     """Bi-temporal U-Net CD: one frozen encoder + one plain trainable decoder.
 
-    No ``domain`` argument anywhere -- meant to be instantiated fresh and
-    trained independently for each dataset (LEVIR-only, WHU-only), as the
-    "individual" baseline to compare against the multi-domain adapter
-    architectures.
+    Instantiated fresh and trained independently for each dataset, as the
+    "individual" baseline.  ``forward`` takes a ``domain`` argument purely so
+    that MultiDomainTrainer can drive it unchanged; the value is ignored.
     """
 
     def __init__(
         self,
+        domain_list: Iterable[str] | None = None,
         prior: float = 0.02,
         use_deep_supervision: bool = True,
         fusion_type: str = "abs",
@@ -150,12 +190,26 @@ class SimpleChangeDetectionModel(nn.Module):
     ):
         super().__init__()
         self.encoder = PlainResNetEncoder()
-        self.decoder = SimpleUNetDecoder(prior=prior, fusion_type=fusion_type, use_attention=use_attention)
+        self.decoder = SimpleUNetDecoder(
+            prior=prior,
+            fusion_type=fusion_type,
+            use_attention=use_attention,
+            use_deep_supervision=use_deep_supervision,
+        )
         self.use_deep_supervision = use_deep_supervision
         self.fusion_type = fusion_type
+        self.domain_list: List[str] = list(domain_list) if domain_list else []
+        # No guided adapters here; the trainer reads this and finds nothing.
+        self.routing_balance: Optional[torch.Tensor] = None
+
+        # Fixed set of trainable parameter ids, decided once.  freeze_domain
+        # flips requires_grad on every parameter each step, so this must key
+        # off identity rather than the current requires_grad state -- and it
+        # must exclude the frozen encoder, which would otherwise be unfrozen.
+        self._trainable_ids = {id(p) for p in self.decoder.parameters()}
 
     def forward(
-        self, img1: torch.Tensor, img2: torch.Tensor
+        self, img1: torch.Tensor, img2: torch.Tensor, domain: str | None = None
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         p1 = self.encoder.extract_multiscale(img1)
         p2 = self.encoder.extract_multiscale(img2)
@@ -164,9 +218,21 @@ class SimpleChangeDetectionModel(nn.Module):
         }
         logits, aux = self.decoder(fused)
 
-        if self.use_deep_supervision and self.training and aux is not None:
-            aux = F.interpolate(aux, size=img1.shape[-2:], mode="bilinear", align_corners=False)
-        else:
+        if not self.use_deep_supervision:
             aux = None
-
+        elif aux is not None and aux.shape[-2:] != img1.shape[-2:]:
+            # AuxDecoder already emits full resolution; this only fires if the
+            # input size is not divisible by 32.
+            aux = F.interpolate(
+                aux, size=img1.shape[-2:], mode="bilinear", align_corners=False
+            )
         return logits, aux
+
+    # -- MultiDomainTrainer interface -------------------------------------
+    def domain_parameters(self, domain: str | None = None) -> list:
+        """Everything trainable belongs to the single domain being trained."""
+        return [p for p in self.parameters() if id(p) in self._trainable_ids]
+
+    def shared_parameters(self) -> list:
+        """Nothing is shared: there is only one domain."""
+        return []

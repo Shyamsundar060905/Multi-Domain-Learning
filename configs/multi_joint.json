@@ -7,7 +7,6 @@
   "image_size": 512,
   "num_workers": 4,
   "seed": 42,
-  "skip_ewc": true,
   "balance_domain_samples": true,
   "oversample_cap": 4,
   "schedule": "per_domain_full_epoch",
