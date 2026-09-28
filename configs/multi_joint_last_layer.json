@@ -20,6 +20,7 @@
   "pos_weight_per_domain": ["WHU=3.0", "LEVIR=10.0"],
   "adapter_stages": ["layer4"],
   "adapter_type": "guided",
+  "decoder_adapter_stages": ["bottleneck", "up4"],
   "whu_dir": "./Data/WHU",
   "levir_dir": "./Data/LEVIR CD"
 }

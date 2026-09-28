@@ -224,6 +224,30 @@ class AuxDecoder(nn.Module):
         return self.classifier(x)
 
 
+DECODER_STAGES = ("bottleneck", "up1", "up2", "up3", "up4")
+
+
+def normalize_decoder_stage(s: str) -> str:
+    alias_map = {
+        "b": "bottleneck",
+        "bottleneck": "bottleneck",
+        "up1": "up1",
+        "up_stage0": "up1",
+        "up0": "up1",
+        "stage0": "up1",
+        "up2": "up2",
+        "up_stage1": "up2",
+        "stage1": "up2",
+        "up3": "up3",
+        "up_stage2": "up3",
+        "stage2": "up3",
+        "up4": "up4",
+        "up_stage3": "up4",
+        "stage3": "up4",
+    }
+    return alias_map.get(s.lower().strip(), s.lower().strip())
+
+
 class UNetDecoder(nn.Module):
     """Shared trainable U-Net decoder; BatchNorm + residual adapters are per-domain."""
 
@@ -240,12 +264,19 @@ class UNetDecoder(nn.Module):
         router_top_k: Optional[int] = 2,
         router_temperature: float = 1.0,
         use_deep_supervision: bool = True,
+        adapter_stages: Optional[Iterable[str]] = None,
     ):
         super().__init__()
         self.domain_list = list(domain_list)
         self.fusion_type = fusion_type
         self.use_attention = use_attention
         self.adapter_type = adapter_type
+        if adapter_type == "none":
+            self.adapter_stages = []
+        elif adapter_stages is None:
+            self.adapter_stages = list(DECODER_STAGES)
+        else:
+            self.adapter_stages = [normalize_decoder_stage(s) for s in adapter_stages]
         # Load-balancing loss over this decoder's guided routing, per forward.
         self.routing_balance: Optional[torch.Tensor] = None
 
@@ -257,33 +288,46 @@ class UNetDecoder(nn.Module):
         else:
             self.attention = nn.Identity()
 
+        def _stage_adapter_type(stage_name: str, default_type: str) -> str:
+            if adapter_type == "none" or stage_name not in self.adapter_stages:
+                return "none"
+            return default_type
+
         # Each decoder stage is conditioned on the change map of the pyramid
         # level it works at: |f1 - f2| has STAGE_CHANNELS[level] channels and
         # already matches that stage's spatial size.  Up-stage 4 runs at full
         # resolution, where no change map exists, so it keeps simple adapters.
         guided_kw = dict(
-            adapter_type=adapter_type, num_experts=num_experts,
+            num_experts=num_experts,
             router_top_k=router_top_k, router_temperature=router_temperature,
         )
         self.bottleneck = DomainConvBlock(
             fused_channels["l4"], 512, domain_list, kernel_size=1, padding=0,
             adapter_reduction=adapter_reduction, adapter_dropout=adapter_dropout,
-            context_channels=STAGE_CHANNELS["l4"], **guided_kw,
+            context_channels=STAGE_CHANNELS["l4"],
+            adapter_type=_stage_adapter_type("bottleneck", adapter_type),
+            **guided_kw,
         )
 
         self.up_stages = nn.ModuleList([
             UNetUpStage(512, fused_channels["l3"], 256, domain_list, upsample_stride=2,
                         adapter_reduction=adapter_reduction, adapter_dropout=adapter_dropout,
-                        context_channels=STAGE_CHANNELS["l3"], **guided_kw),
+                        context_channels=STAGE_CHANNELS["l3"],
+                        adapter_type=_stage_adapter_type("up1", adapter_type),
+                        **guided_kw),
             UNetUpStage(256, fused_channels["l2"], 128, domain_list, upsample_stride=2,
                         adapter_reduction=adapter_reduction, adapter_dropout=adapter_dropout,
-                        context_channels=STAGE_CHANNELS["l2"], **guided_kw),
+                        context_channels=STAGE_CHANNELS["l2"],
+                        adapter_type=_stage_adapter_type("up2", adapter_type),
+                        **guided_kw),
             UNetUpStage(128, fused_channels["l1"], 64, domain_list, upsample_stride=2,
                         adapter_reduction=adapter_reduction, adapter_dropout=adapter_dropout,
-                        context_channels=STAGE_CHANNELS["l1"], **guided_kw),
+                        context_channels=STAGE_CHANNELS["l1"],
+                        adapter_type=_stage_adapter_type("up3", adapter_type),
+                        **guided_kw),
             UNetUpStage(64, 0, 32, domain_list, upsample_stride=4,
                         adapter_reduction=adapter_reduction, adapter_dropout=adapter_dropout,
-                        adapter_type="none" if adapter_type == "none" else "simple"),
+                        adapter_type=_stage_adapter_type("up4", "simple")),
         ])
 
         self.classifier = nn.Conv2d(32, 1, kernel_size=1)
@@ -369,6 +413,7 @@ class ChangeDetectionModel(nn.Module):
         decoder_adapter_reduction: int = 16,
         decoder_adapter_dropout: float = 0.1,
         decoder_adapter_type: str = "simple",
+        decoder_adapter_stages: Optional[Iterable[str]] = None,
         num_experts: int = 4,
         router_top_k: Optional[int] = 2,
         router_temperature: float = 1.0,
@@ -399,6 +444,7 @@ class ChangeDetectionModel(nn.Module):
             router_top_k=router_top_k,
             router_temperature=router_temperature,
             use_deep_supervision=use_deep_supervision,
+            adapter_stages=decoder_adapter_stages,
         )
         # Mean routing-balance loss over encoder and decoder guided adapters.
         self.routing_balance: Optional[torch.Tensor] = None

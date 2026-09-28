@@ -29,6 +29,7 @@ def test_last_layer_adapter():
         adapter_stages=["layer4"],
         adapter_type="guided",
         decoder_adapter_type="simple",
+        decoder_adapter_stages=["bottleneck", "up4"],
     )
     print_architecture(
         mode="multi",
@@ -36,9 +37,10 @@ def test_last_layer_adapter():
         guided_granularity="stage",
         adapter_stages=["layer4"],
         decoder_adapter_type="simple",
+        decoder_adapter_stages=["bottleneck", "up4"],
     )
 
-    # 1. Verify backbone domain_adapters structure
+    # 1. Verify backbone domain_adapters structure (layer4 only)
     for d in domains:
         ad = model.backbone.domain_adapters[d]
         stages_present = list(ad.keys())
@@ -59,6 +61,15 @@ def test_last_layer_adapter():
         for p in model.backbone.domain_adapters[d]["layer4"].parameters():
             assert p.requires_grad, f"Layer 4 adapter for domain {d} must have requires_grad=True"
     print("[OK] Backbone layer 4 adapters are trainable (requires_grad=True)")
+
+    # 4. Verify decoder adapters: bottleneck and up4 ONLY, up1..up3 have none
+    assert model.decoder.bottleneck.adapters is not None, "Decoder bottleneck must have adapters"
+    for idx in [0, 1, 2]:
+        for block in model.decoder.up_stages[idx].merge_conv:
+            assert block.adapters is None, f"Decoder up_stage {idx} must NOT have adapters"
+    for block in model.decoder.up_stages[3].merge_conv:
+        assert block.adapters is not None, "Decoder up_stage 3 (up4, last layer) must have adapters"
+    print("[OK] Decoder adapter placement strictly verified: bottleneck + up4 (last layer) ONLY, up1..up3 have none")
 
     print("\n" + "=" * 80)
     print("TEST 2: Forward pass with bi-temporal dummy inputs (2, 3, 512, 512)")
@@ -121,37 +132,50 @@ def test_last_layer_adapter():
     print("[OK] freeze_domain properly unfreezes WHU and freezes LEVIR, keeping shared decoder trainable")
 
     print("\n" + "=" * 80)
-    print("TEST 5: Decoder adapter modes (simple, guided, none)")
+    print("TEST 5: Decoder adapter modes (simple, guided, none, single-layer)")
     print("=" * 80)
     m_simple = build_change_detection_model(domains, adapter_stages=["layer4"], decoder_adapter_type="simple")
     m_guided = build_change_detection_model(domains, adapter_stages=["layer4"], decoder_adapter_type="guided")
     m_none = build_change_detection_model(domains, adapter_stages=["layer4"], decoder_adapter_type="none")
+    m_single_btn = build_change_detection_model(domains, adapter_stages=["layer4"], decoder_adapter_type="guided", decoder_adapter_stages=["bottleneck"])
+    m_single_up4 = build_change_detection_model(domains, adapter_stages=["layer4"], decoder_adapter_type="simple", decoder_adapter_stages=["up4"])
 
-    print(f"[OK] Decoder adapter 'simple': {sum(p.numel() for p in m_simple.decoder.domain_parameters('LEVIR')):,} domain params/domain")
-    print(f"[OK] Decoder adapter 'guided': {sum(p.numel() for p in m_guided.decoder.domain_parameters('LEVIR')):,} domain params/domain")
-    print(f"[OK] Decoder adapter 'none':   {sum(p.numel() for p in m_none.decoder.domain_parameters('LEVIR')):,} domain params/domain (BN only)")
+    # Verify bottleneck only has adapters in bottleneck
+    assert m_single_btn.decoder.bottleneck.adapters is not None, "Bottleneck adapter missing"
+    for up_st in m_single_btn.decoder.up_stages:
+        for block in up_st.merge_conv:
+            assert block.adapters is None, "Up stage should have no adapters when decoder_adapter_stages=['bottleneck']"
+    print("[OK] Single-layer decoder adapter verified: only bottleneck has adapters, up-stages have none")
+
+    print(f"[OK] Decoder adapter 'simple' (all stages):     {sum(p.numel() for p in m_simple.decoder.domain_parameters('LEVIR')):,} domain params/domain")
+    print(f"[OK] Decoder adapter 'guided' (all stages):     {sum(p.numel() for p in m_guided.decoder.domain_parameters('LEVIR')):,} domain params/domain")
+    print(f"[OK] Decoder adapter 'none':                     {sum(p.numel() for p in m_none.decoder.domain_parameters('LEVIR')):,} domain params/domain (BN only)")
+    print(f"[OK] Decoder adapter 'guided' (bottleneck only): {sum(p.numel() for p in m_single_btn.decoder.domain_parameters('LEVIR')):,} domain params/domain")
+    print(f"[OK] Decoder adapter 'simple' (up4 only):        {sum(p.numel() for p in m_single_up4.decoder.domain_parameters('LEVIR')):,} domain params/domain")
 
     print("\n" + "=" * 80)
     print("TEST 6: Parameter Count Comparison Table")
     print("=" * 80)
     configs = [
-        ("Full Guided (all layers: 1..4)", ["layer1", "layer2", "layer3", "layer4"], "guided", "simple"),
-        ("Last Layer Guided (layer4 only)", ["layer4"], "guided", "simple"),
-        ("Full Simple (all layers: 1..4)", ["layer1", "layer2", "layer3", "layer4"], "simple", "simple"),
-        ("Last Layer Simple (layer4 only)", ["layer4"], "simple", "simple"),
-        ("Last Layer Guided + Decoder None", ["layer4"], "guided", "none"),
+        ("Full Guided (all layers: 1..4)", ["layer1", "layer2", "layer3", "layer4"], "guided", "simple", None),
+        ("Last Layer Guided (layer4 only, dec all)", ["layer4"], "guided", "simple", None),
+        ("Last Layer Guided (layer4 + dec bottleneck & up4)", ["layer4"], "guided", "simple", ["bottleneck", "up4"]),
+        ("Last Layer Guided (layer4 + dec bottleneck only)", ["layer4"], "guided", "simple", ["bottleneck"]),
+        ("Last Layer Simple (layer4 only, dec all)", ["layer4"], "simple", "simple", None),
+        ("Last Layer Simple (layer4 + dec bottleneck & up4)", ["layer4"], "simple", "simple", ["bottleneck", "up4"]),
+        ("Last Layer Guided + Decoder None", ["layer4"], "guided", "none", None),
     ]
 
-    header = f"{'Configuration':<35} | {'Backbone Ad/Dom':<16} | {'Decoder Dom/Dom':<16} | {'Trainable':<12} | {'Total Params':<12}"
+    header = f"{'Configuration':<45} | {'Backbone Ad/Dom':<16} | {'Decoder Dom/Dom':<16} | {'Trainable':<12} | {'Total Params':<12}"
     print(header)
     print("-" * len(header))
-    for name, st, at, dat in configs:
-        m = build_change_detection_model(domains, adapter_stages=st, adapter_type=at, decoder_adapter_type=dat)
+    for name, st, at, dat, dec_st in configs:
+        m = build_change_detection_model(domains, adapter_stages=st, adapter_type=at, decoder_adapter_type=dat, decoder_adapter_stages=dec_st)
         bb_dom = sum(p.numel() for p in m.backbone.domain_parameters("LEVIR"))
         dec_dom = sum(p.numel() for p in m.decoder.domain_parameters("LEVIR"))
         trainable = sum(p.numel() for p in m.parameters() if p.requires_grad)
         total = sum(p.numel() for p in m.parameters())
-        print(f"{name:<35} | {bb_dom:<16,d} | {dec_dom:<16,d} | {trainable:<12,d} | {total:<12,d}")
+        print(f"{name:<45} | {bb_dom:<16,d} | {dec_dom:<16,d} | {trainable:<12,d} | {total:<12,d}")
 
     print("\n" + "=" * 80)
     print("ALL TESTS PASSED SUCCESSFULLY!")

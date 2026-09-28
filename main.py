@@ -116,6 +116,11 @@ def build_parser(defaults=None):
                         "encoder's |f1-f2| change map at that scale; up-stage 4 runs at full "
                         "resolution where no change map exists, so it keeps residual adapters. "
                         "'none' disables decoder adapters.")
+    p.add_argument("--decoder-adapter-stages", type=str, nargs="+",
+                   default=defaults.get("decoder_adapter_stages", None),
+                   choices=["bottleneck", "up1", "up2", "up3", "up4"],
+                   help="Stages in U-Net decoder to place adapters (bottleneck, up1, up2, up3, up4). "
+                        "If omitted, all stages have adapters (when decoder_adapter_type != 'none').")
     p.add_argument("--guided-granularity", type=str,
                    default=defaults.get("guided_granularity", "stage"),
                    choices=["stage", "block"],
@@ -338,6 +343,7 @@ def main():
         guided_reduction=args.guided_reduction,
         router_top_k=(args.router_top_k or None),
         decoder_adapter_type=args.decoder_adapter_type,
+        decoder_adapter_stages=args.decoder_adapter_stages,
         use_deep_supervision=args.use_deep_supervision,
     )
     print_architecture(
@@ -347,6 +353,7 @@ def main():
         num_experts=args.num_experts,
         router_top_k=(args.router_top_k or None),
         decoder_adapter_type=args.decoder_adapter_type,
+        decoder_adapter_stages=args.decoder_adapter_stages,
         adapter_stages=args.adapter_stages,
     )
 
