@@ -193,8 +193,8 @@ class AuxDecoder(nn.Module):
     blur of a small map.  Deliberately has no skip connections and thin
     channels: it is meant to be a cheap exit, not a second decoder.
 
-    Shared transposed convs + per-domain BatchNorm, matching DomainConvBlock's
-    split, but without the residual adapters.
+    Shared transposed convs + per-domain BatchNorm + per-domain ResidualAdapter,
+    matching DomainConvBlock's split.
     """
 
     def __init__(
@@ -202,25 +202,34 @@ class AuxDecoder(nn.Module):
         in_ch: int,
         domain_list: Iterable[str],
         widths: Tuple[int, ...] = (128, 64, 32, 16, 16),
+        adapter_reduction: int = 16,
     ):
         super().__init__()
+        domains = list(domain_list)
         self.ups = nn.ModuleList()
         self.norms = nn.ModuleList()
+        self.adapters = nn.ModuleList()
         ch = in_ch
         for w in widths:
             self.ups.append(
                 nn.ConvTranspose2d(ch, w, kernel_size=2, stride=2, bias=False)
             )
             self.norms.append(
-                nn.ModuleDict({d: nn.BatchNorm2d(w) for d in domain_list})
+                nn.ModuleDict({d: nn.BatchNorm2d(w) for d in domains})
+            )
+            self.adapters.append(
+                nn.ModuleDict({
+                    d: ResidualAdapter(w, reduction=adapter_reduction)
+                    for d in domains
+                })
             )
             ch = w
         self.act = nn.ReLU(inplace=True)
         self.classifier = nn.Conv2d(ch, 1, kernel_size=1)
 
     def forward(self, x: torch.Tensor, domain: str) -> torch.Tensor:
-        for up, norm in zip(self.ups, self.norms):
-            x = self.act(norm[domain](up(x)))
+        for up, norm, adapter in zip(self.ups, self.norms, self.adapters):
+            x = adapter[domain](self.act(norm[domain](up(x))))
         return self.classifier(x)
 
 
