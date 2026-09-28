@@ -80,6 +80,28 @@ def _fmt(v, M=False):
     return f"{v:.4f}"
 
 
+BASELINES = [
+    ("Individual models (plain, one per dataset)", 0.8569, 0.9353, 0.8961),
+    ("Multi-domain, simple adapters", 0.8739, 0.9365, 0.9052),
+]
+
+
+def print_comparison_table(rows):
+    header = f"{'Config':<44}\t{'LEVIR':<8}\t{'WHU':<8}\t{'mean':<8}"
+    print("\n" + "=" * 72)
+    print(header)
+    print("-" * 72)
+    for name, levir, whu, mean in BASELINES:
+        print(f"{name:<44}\t{levir:<8.4f}\t{whu:<8.4f}\t{mean:<8.4f}")
+    for r in rows:
+        lf1 = r["LEVIR_F1"]
+        wf1 = r["WHU_F1"]
+        avg = (lf1 + wf1) / 2 if (lf1 is not None and wf1 is not None) else None
+        name = r["log"].replace(".log", "")
+        print(f"{name:<44}\t{_fmt(lf1):<8}\t{_fmt(wf1):<8}\t{_fmt(avg):<8}")
+    print("=" * 72 + "\n")
+
+
 def print_table(rows):
     header = (
         f"{'Experiment':<38} | {'LEVIR F1':>8} | {'LEVIR IoU':>9} | "
@@ -120,6 +142,7 @@ def main():
 
     logs = sys.argv[1:]
     rows = [parse_log(p) for p in logs]
+    print_comparison_table(rows)
     print_table(rows)
     write_csv(rows)
 
