@@ -97,7 +97,7 @@ def build_parser(defaults=None):
     p.add_argument("--use-attention", action="store_true",
                    help="Add CBAM attention block on the fused l4 features.")
     p.add_argument("--adapter-stages", type=str, nargs="+",
-                   default=defaults.get("adapter_stages", ["layer1", "layer2", "layer3", "layer4"]),
+                   default=defaults.get("adapter_stages", ["layer4"]),
                    choices=["layer1", "layer2", "layer3", "layer4"],
                    help="Stages in ResNet backbone to place adapters.")
     p.add_argument("--adapter-type", type=str, default=defaults.get("adapter_type", "guided"),
@@ -111,10 +111,11 @@ def build_parser(defaults=None):
                         "auxiliary loss, and nothing to distil from.")
     p.add_argument("--decoder-adapter-type", type=str,
                    default=defaults.get("decoder_adapter_type", "simple"),
-                   choices=["simple", "guided"],
+                   choices=["simple", "guided", "none"],
                    help="Decoder adapter. 'guided' conditions each decoder stage on the "
                         "encoder's |f1-f2| change map at that scale; up-stage 4 runs at full "
-                        "resolution where no change map exists, so it keeps residual adapters.")
+                        "resolution where no change map exists, so it keeps residual adapters. "
+                        "'none' disables decoder adapters.")
     p.add_argument("--guided-granularity", type=str,
                    default=defaults.get("guided_granularity", "stage"),
                    choices=["stage", "block"],
@@ -346,6 +347,7 @@ def main():
         num_experts=args.num_experts,
         router_top_k=(args.router_top_k or None),
         decoder_adapter_type=args.decoder_adapter_type,
+        adapter_stages=args.adapter_stages,
     )
 
     count_parameters(model)

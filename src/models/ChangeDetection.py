@@ -90,6 +90,7 @@ class DomainConvBlock(nn.Module):
     ):
         super().__init__()
         self.guided = adapter_type == "guided" and context_channels > 0
+        self.has_adapter = adapter_type not in {"none", None, "off", False}
         self.conv = nn.Conv2d(
             in_ch, out_ch, kernel_size=kernel_size, padding=padding, bias=False
         )
@@ -106,16 +107,20 @@ class DomainConvBlock(nn.Module):
                 )
                 for d in domain_list
             })
-        else:
+        elif self.has_adapter:
             self.adapters = nn.ModuleDict({
                 d: ResidualAdapter(out_ch, reduction=adapter_reduction, dropout=adapter_dropout)
                 for d in domain_list
             })
+        else:
+            self.adapters = None
 
     def forward(
         self, x: torch.Tensor, domain: str, context: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x = self.act(self.norm[domain](self.conv(x)))
+        if self.adapters is None:
+            return x, None
         if self.guided and context is not None:
             x, info = self.adapters[domain](x, context)
             return x, info["routing_weights"]
@@ -277,7 +282,8 @@ class UNetDecoder(nn.Module):
                         adapter_reduction=adapter_reduction, adapter_dropout=adapter_dropout,
                         context_channels=STAGE_CHANNELS["l1"], **guided_kw),
             UNetUpStage(64, 0, 32, domain_list, upsample_stride=4,
-                        adapter_reduction=adapter_reduction, adapter_dropout=adapter_dropout),
+                        adapter_reduction=adapter_reduction, adapter_dropout=adapter_dropout,
+                        adapter_type="none" if adapter_type == "none" else "simple"),
         ])
 
         self.classifier = nn.Conv2d(32, 1, kernel_size=1)

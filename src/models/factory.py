@@ -19,7 +19,7 @@ def build_change_detection_model(
     domain_bn_in_adapter: bool = False,
     unfreeze_layer4: bool = False,
     use_attention: bool = False,
-    adapter_stages: Iterable[str] = ("layer1", "layer2", "layer3", "layer4"),
+    adapter_stages: Iterable[str] = ("layer4",),
     adapter_type: str = "guided",
     guided_granularity: str = "stage",
     num_experts: int = 4,
@@ -70,23 +70,38 @@ def print_architecture(
     num_experts: int = 4,
     router_top_k: Optional[int] = 2,
     decoder_adapter_type: str = "simple",
+    adapter_stages: Iterable[str] = ("layer4",),
 ) -> None:
     label = "Uni-domain" if mode == "uni" else "Multi-domain"
-    if adapter_type == "guided":
-        where = "every ResNet stage" if guided_granularity == "stage" else "every bottleneck block"
+    stages = list(adapter_stages)
+    if stages == ["layer4"]:
+        stage_desc = "last stage only (layer4)"
+    elif len(stages) == 4 and set(stages) == {"layer1", "layer2", "layer3", "layer4"}:
+        stage_desc = "every ResNet stage" if guided_granularity == "stage" else "every bottleneck block"
+    elif not stages:
+        stage_desc = "no backbone stages (backbone fully frozen without adapters)"
+    else:
+        stage_desc = f"stages: {', '.join(stages)}"
+
+    if not stages:
+        encoder = "frozen ImageNet ResNet50 (no domain adapters in backbone)"
+    elif adapter_type == "guided":
         routing = f"top-{router_top_k}" if router_top_k else "dense"
         encoder = (
             "frozen ImageNet ResNet50 + per-domain change-guided adapters "
-            f"({num_experts} experts, {routing} routing) after {where}"
+            f"({num_experts} experts, {routing} routing) after {stage_desc}"
         )
     else:
-        encoder = "frozen ImageNet ResNet50 + per-domain residual adapters after every bottleneck block"
+        where = "every bottleneck block" if (guided_granularity == "block" and len(stages) > 1) else "stage output"
+        encoder = f"frozen ImageNet ResNet50 + per-domain residual adapters after {stage_desc}"
     print(f"{label} change detection:")
     print(f"  Encoder: {encoder}")
     if decoder_adapter_type == "guided":
         decoder = ("shared trainable U-Net (shared convs + per-domain BatchNorm + per-domain "
                    "change-guided adapters conditioned on |f1-f2| at each scale; up-stage 4 "
                    "keeps residual adapters)")
+    elif decoder_adapter_type == "none":
+        decoder = "shared trainable U-Net (shared convs + per-domain BatchNorm, no decoder adapters)"
     else:
         decoder = "shared trainable U-Net (shared convs + per-domain BatchNorm + per-domain residual adapters)"
     print(f"  Decoder: {decoder}")
