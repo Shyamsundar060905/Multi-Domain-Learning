@@ -170,6 +170,34 @@ def _segmentation_metrics(logits: torch.Tensor, target: torch.Tensor):
     return acc.mean(), dice.mean(), iou.mean()
 
 
+def _confusion(logits: torch.Tensor, target: torch.Tensor):
+    """Pixel counts (tp, fp, fn, tn) for one batch, at threshold 0.5.
+
+    Accumulated over a whole split these give the *aggregate* precision,
+    recall, F1 and IoU that the LEVIR-CD and WHU-CD literature reports.
+    """
+    pred = (torch.sigmoid(logits) > 0.5).float()
+    target = target.float()
+    tp = (pred * target).sum()
+    fp = (pred * (1.0 - target)).sum()
+    fn = ((1.0 - pred) * target).sum()
+    tn = ((1.0 - pred) * (1.0 - target)).sum()
+    return tp.item(), fp.item(), fn.item(), tn.item()
+
+
+def _aggregate_scores(tp: float, fp: float, fn: float, tn: float) -> Dict[str, float]:
+    eps = 1e-9
+    precision = tp / max(tp + fp, eps)
+    recall = tp / max(tp + fn, eps)
+    return {
+        "precision": precision,
+        "recall": recall,
+        "f1": 2.0 * tp / max(2.0 * tp + fp + fn, eps),
+        "iou": tp / max(tp + fp + fn, eps),
+        "acc": (tp + tn) / max(tp + tn + fp + fn, eps),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Trainer
 # ---------------------------------------------------------------------------
@@ -688,6 +716,7 @@ class MultiDomainTrainer:
         aux_acc = aux_dice = aux_iou = 0.0
         has_aux = False
         n = 0
+        agg = {"main": [0.0, 0.0, 0.0, 0.0], "aux": [0.0, 0.0, 0.0, 0.0]}
         desc = f"{domain} {split_label}"
         if epoch is not None and total_epochs is not None:
             desc = f"{domain} {split_label} (ep {epoch}/{total_epochs})"
@@ -715,6 +744,8 @@ class MultiDomainTrainer:
                 total_acc += acc.item()
                 total_dice += dice.item()
                 total_iou += iou.item()
+                for i, v in enumerate(_confusion(logits, mask)):
+                    agg["main"][i] += v
 
                 if aux_logits is not None:
                     has_aux = True
@@ -722,6 +753,8 @@ class MultiDomainTrainer:
                     aux_acc += a_acc.item()
                     aux_dice += a_dice.item()
                     aux_iou += a_iou.item()
+                    for i, v in enumerate(_confusion(aux_logits, mask)):
+                        agg["aux"][i] += v
                 n += 1
 
         if was_training:
@@ -731,6 +764,7 @@ class MultiDomainTrainer:
         avg_acc = 100.0 * total_acc / n
         avg_dice = total_dice / n
         avg_iou = total_iou / n
+        indent = "  " if epoch is not None else ""
         if epoch is not None:
             print(
                 f"  [{domain} {split_label}] main: dice={avg_dice:.4f}  "
@@ -742,16 +776,29 @@ class MultiDomainTrainer:
                 f"dice={avg_dice:.4f}  iou={avg_iou:.4f}"
             )
 
+        main_agg = _aggregate_scores(*agg["main"])
+        print(
+            f"{indent}[{domain} {split_label}] main aggregate: "
+            f"F1={main_agg['f1']:.4f}  IoU={main_agg['iou']:.4f}  "
+            f"P={main_agg['precision']:.4f}  R={main_agg['recall']:.4f}"
+        )
+
         if has_aux:
             a_acc = 100.0 * aux_acc / n
             a_dice = aux_dice / n
             a_iou = aux_iou / n
             gap = avg_dice - a_dice
-            indent = "  " if epoch is not None else ""
             print(
                 f"{indent}[{domain} {split_label}] aux : dice={a_dice:.4f}  "
                 f"iou={a_iou:.4f}  acc={a_acc:.2f}%  (gap {gap:+.4f})"
             )
+            aux_agg = _aggregate_scores(*agg["aux"])
+            print(
+                f"{indent}[{domain} {split_label}] aux  aggregate: "
+                f"F1={aux_agg['f1']:.4f}  IoU={aux_agg['iou']:.4f}  "
+                f"P={aux_agg['precision']:.4f}  R={aux_agg['recall']:.4f}"
+            )
+
 
         # Checkpoint selection tracks the MAIN head -- that is the deployed
         # prediction; the aux head is reported for the early-exit comparison.
