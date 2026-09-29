@@ -1,4 +1,5 @@
-"""U-Net CD: frozen ResNet encoder + adapters, shared decoder with domain BatchNorm + residual adapters."""
+"""U-Net CD: frozen encoder (ResNet-50 or VGG-16) + per-domain adapters,
+shared decoder with domain BatchNorm + per-domain residual adapters."""
 
 from __future__ import annotations
 
@@ -9,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.models.adapter_resnet import STAGE_CHANNELS, ResidualAdapter
+from src.models.adapter_resnet import STAGE_CHANNELS as _RESNET_STAGE_CHANNELS, ResidualAdapter
 
 
 def build_bitemporal_fusion(f1: torch.Tensor, f2: torch.Tensor, fusion_type: str = "abs") -> torch.Tensor:
@@ -180,7 +181,16 @@ class AuxDecoder(nn.Module):
 
 
 class UNetDecoder(nn.Module):
-    """Shared trainable U-Net decoder; BatchNorm + residual adapters are per-domain."""
+    """Shared trainable U-Net decoder; BatchNorm + residual adapters are per-domain.
+
+    Parameters
+    ----------
+    stage_channels:
+        Dict mapping ``{"l1", "l2", "l3", "l4"}`` to the number of channels
+        produced by the backbone at each scale.  Defaults to ResNet-50 values
+        when not provided.  Pass ``VGGWithAdapters.STAGE_CHANNELS`` (or
+        equivalently ``vgg_adapter.STAGE_CHANNELS``) when using VGG-16.
+    """
 
     def __init__(
         self,
@@ -190,14 +200,16 @@ class UNetDecoder(nn.Module):
         use_attention: bool = False,
         adapter_reduction: int = 16,
         adapter_dropout: float = 0.1,
+        stage_channels: Optional[Dict[str, int]] = None,
     ):
         super().__init__()
         self.domain_list = list(domain_list)
         self.fusion_type = fusion_type
         self.use_attention = use_attention
 
+        sc = stage_channels if stage_channels is not None else _RESNET_STAGE_CHANNELS
         mult = 4 if fusion_type == "abs_prod" else 3
-        fused_channels = {k: mult * STAGE_CHANNELS[k] for k in ("l1", "l2", "l3", "l4")}
+        fused_channels = {k: mult * sc[k] for k in ("l1", "l2", "l3", "l4")}
 
         if use_attention:
             self.attention = CBAM(fused_channels["l4"])
@@ -267,7 +279,14 @@ class UNetDecoder(nn.Module):
 
 
 class ChangeDetectionModel(nn.Module):
-    """Bi-temporal U-Net CD: adapter encoder + shared decoder (domain BN + adapters)."""
+    """Bi-temporal U-Net CD: adapter encoder + shared decoder (domain BN + adapters).
+
+    Works with any backbone that exposes:
+      - ``extract_multiscale(img, domain) -> {"l1", "l2", "l3", "l4"}``
+      - ``domain_parameters(domain) -> List[Parameter]``
+      - ``domain_list: List[str]``
+      - ``STAGE_CHANNELS: Dict[str, int]``  (optional; falls back to ResNet-50)
+    """
 
     def __init__(
         self,
@@ -294,6 +313,11 @@ class ChangeDetectionModel(nn.Module):
             )
         self.domain_list: List[str] = list(domain_list)
 
+        # Read stage_channels from the backbone class (VGG vs ResNet differ here)
+        backbone_sc: Optional[Dict[str, int]] = getattr(
+            type(backbone), "STAGE_CHANNELS", None
+        ) or getattr(backbone, "STAGE_CHANNELS", None)
+
         self.decoder = UNetDecoder(
             self.domain_list,
             prior=prior,
@@ -301,6 +325,7 @@ class ChangeDetectionModel(nn.Module):
             use_attention=use_attention,
             adapter_reduction=decoder_adapter_reduction,
             adapter_dropout=decoder_adapter_dropout,
+            stage_channels=backbone_sc,
         )
 
         # Fixed (structural) set of shared-parameter ids, decided once at

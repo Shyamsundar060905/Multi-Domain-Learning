@@ -100,6 +100,14 @@ def build_parser(defaults=None):
                    default=defaults.get("adapter_stages", ["layer1", "layer2", "layer3", "layer4"]),
                    choices=["layer1", "layer2", "layer3", "layer4"],
                    help="Stages in ResNet backbone to place adapters.")
+    p.add_argument("--backbone", type=str,
+                   default=defaults.get("backbone", "resnet50"),
+                   choices=["resnet50", "vgg16"],
+                   help="Encoder backbone: 'resnet50' (default) or 'vgg16'.")
+    p.add_argument("--vgg-adapter-stages", type=str, nargs="+",
+                   default=defaults.get("vgg_adapter_stages", ["l1", "l2", "l3", "l4"]),
+                   choices=["l1", "l2", "l3", "l4"],
+                   help="VGG pyramid levels to insert adapters at (only used when --backbone=vgg16).")
     p.add_argument("--use-tta", action="store_true",
                    help="Enable Test-Time Augmentation (hflip/vflip averaging) during eval.")
     p.add_argument("--ckpt-dir", type=str, default=defaults.get("ckpt_dir", "checkpoints"),
@@ -282,8 +290,10 @@ def main():
         unfreeze_layer4=args.unfreeze_layer4,
         use_attention=args.use_attention,
         adapter_stages=args.adapter_stages,
+        backbone=args.backbone,
+        vgg_adapter_stages=args.vgg_adapter_stages,
     )
-    print_architecture(mode=mode)
+    print_architecture(mode=mode, backbone=args.backbone)
 
     count_parameters(model)
 
