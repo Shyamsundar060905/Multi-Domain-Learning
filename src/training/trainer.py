@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 import math
-from itertools import cycle
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Union
 
@@ -68,8 +67,23 @@ def change_detection_loss(
 # Schedule helpers
 # ---------------------------------------------------------------------------
 
+def _endless(loader):
+    """Yield batches forever, re-entering the loader whenever it is exhausted.
+
+    ``itertools.cycle`` must not be used here.  It caches every batch and then
+    replays the cached copies, so a domain that wraps inside an epoch would see
+    the same samples in the same order with the same flips and rotations each
+    time -- augmentation silently switched off for the repeated passes -- and
+    the whole epoch's batches would be pinned in memory.  Re-entering the
+    DataLoader reshuffles and re-augments, and caches nothing.
+    """
+    while True:
+        for batch in loader:
+            yield batch
+
+
 def _round_robin(loaders: Dict, steps: int, order: List[str]):
-    iters = {d: cycle(loaders[d]) for d in order}
+    iters = {d: _endless(loaders[d]) for d in order}
     for i in range(steps):
         d = order[i % len(order)]
         yield d, next(iters[d])
@@ -77,7 +91,7 @@ def _round_robin(loaders: Dict, steps: int, order: List[str]):
 
 def _sequential(loaders: Dict, batches_per_domain: int, order: List[str]):
     for d in order:
-        it = cycle(loaders[d])
+        it = _endless(loaders[d])
         for _ in range(batches_per_domain):
             yield d, next(it)
 
@@ -89,7 +103,7 @@ def _sequential(loaders: Dict, batches_per_domain: int, order: List[str]):
 class _LossAccum:
     """Running means of each loss term over an epoch (or a domain block)."""
 
-    KEYS = ("total", "main", "aux", "distill", "ewc", "dice", "aux_dice")
+    KEYS = ("total", "main", "aux", "distill", "ewc", "route", "dice", "aux_dice")
 
     def __init__(self):
         self.sums = {k: 0.0 for k in self.KEYS}
@@ -117,6 +131,9 @@ class _LossAccum:
         if e > 0.0:
             # Raw Fisher-weighted penalty and the lambda/2 it is scaled by.
             parts.append(f"ewc={self.mean('ewc'):.3e}x{e / 2:g}")
+        r = trainer.routing_balance_weight
+        if r > 0.0 and self.sums["route"] > 0.0:
+            parts.append(f"route={self.mean('route'):.4f}x{r:g}")
         parts[-1] += ")"
         parts.append(f"dice={self.mean('dice'):.4f}")
         if self.sums["aux_dice"] > 0.0:
@@ -174,7 +191,10 @@ def _confusion(logits: torch.Tensor, target: torch.Tensor):
     """Pixel counts (tp, fp, fn, tn) for one batch, at threshold 0.5.
 
     Accumulated over a whole split these give the *aggregate* precision,
-    recall, F1 and IoU that the LEVIR-CD and WHU-CD literature reports.
+    recall, F1 and IoU that the LEVIR-CD and WHU-CD literature reports.  That
+    differs from averaging a per-image Dice: an empty tile scores 1.0 or ~0
+    under the per-image metric and dominates the mean, whereas here it simply
+    contributes no positives.
     """
     pred = (torch.sigmoid(logits) > 0.5).float()
     target = target.float()
@@ -225,11 +245,13 @@ class MultiDomainTrainer:
         distill_alpha: float = 0.0,
         ewc_lambda: float = 0.0,
         ewc_fisher_batches: int = 50,
+        routing_balance_weight: float = 0.0,
         schedule: str = "per_domain_full_epoch",
         domain_order: Iterable[str] | None = None,
         scheduler_step_size: int = 15,
         scheduler_gamma: float = 0.1,
         use_tta: bool = False,
+        select_metric: str = "dice",
         ckpt_dir: str | None = "checkpoints",
         ckpt_name: str = "best.pt",
     ):
@@ -242,6 +264,9 @@ class MultiDomainTrainer:
         self.domain_list = list(domain_list)
         self.device = device
         self.use_tta = use_tta
+        if select_metric not in {"dice", "f1"}:
+            raise ValueError(f"select_metric must be 'dice' or 'f1', got {select_metric!r}")
+        self.select_metric = select_metric
 
         # Best-checkpoint tracking, keyed on the mean eval Dice across domains.
         self.ckpt_dir = Path(ckpt_dir) if ckpt_dir else None
@@ -267,6 +292,7 @@ class MultiDomainTrainer:
         # snapshot per domain, refreshed by _ewc_consolidate.
         self.ewc_lambda = ewc_lambda
         self.ewc_fisher_batches = ewc_fisher_batches
+        self.routing_balance_weight = routing_balance_weight
         self._ewc: Dict[str, Dict[str, list]] = {}
         self._ewc_shared: list = []
 
@@ -319,6 +345,15 @@ class MultiDomainTrainer:
                   f"({self.ewc_fisher_batches} Fisher batches/domain, shared params only)")
         else:
             print(f"EWC lambda:            {self.ewc_lambda}  (off)")
+        if getattr(getattr(self.model, "backbone", None), "adapter_type", "simple") == "guided":
+            print(f"Routing balance weight: {self.routing_balance_weight}"
+                  f"{'  (off)' if self.routing_balance_weight <= 0 else ''}")
+        sel_label = (
+            self._selection_label(self._selection_domains(self.eval_loaders))
+            if self.eval_loaders else "none"
+        )
+        metric_label = "aggregate F1" if self.select_metric == "f1" else "per-image Dice"
+        print(f"Checkpoint selection:  {sel_label}  ({metric_label})")
         print(f"Domain order:          {self.domain_order}")
         print(f"Schedule:              {self.schedule}")
         self._log_trainable()
@@ -354,23 +389,44 @@ class MultiDomainTrainer:
     def ckpt_path(self) -> Path | None:
         return None if self.ckpt_dir is None else self.ckpt_dir / self.ckpt_name
 
+    def _selection_domains(self, domains: Iterable[str]) -> List[str]:
+        """Domains allowed to choose the best checkpoint.
+
+        Only domains evaluated on a validation split vote.  A domain whose eval
+        loader is its test set (currently WHU) would otherwise leak test data
+        into model selection -- and its epoch-to-epoch swings would decide which
+        checkpoint is kept.  Falls back to every domain when none has a
+        validation split (e.g. a WHU-only run), so something is still saved.
+        """
+        held_out = [d for d in domains if self.eval_domain_splits.get(d, "test") != "test"]
+        return held_out or list(domains)
+
+    def _selection_label(self, domains: Iterable[str]) -> str:
+        return " + ".join(f"{d} {self.eval_domain_splits.get(d, 'test')}" for d in domains)
+
     def _save_best(self, epoch: int, results: Dict[str, float]) -> bool:
-        """Save the model when mean eval Dice improves. Returns True if saved."""
+        """Save the model when the selection Dice improves. Returns True if saved.
+
+        The selection score uses only validation-split domains (see
+        _selection_domains); every domain's score is still stored.
+        """
         path = self.ckpt_path
         if path is None or not results:
             return False
 
-        avg = sum(results.values()) / len(results)
-        if avg <= self.best_dice:
+        sel = self._selection_domains(results)
+        score = sum(results[d] for d in sel) / len(sel)
+        if score <= self.best_dice:
             return False
 
         prev = self.best_dice
-        self.best_dice, self.best_epoch = avg, epoch
+        self.best_dice, self.best_epoch = score, epoch
 
         payload = {
             "model": self.model.state_dict(),
             "epoch": epoch,
-            "avg_eval_dice": avg,
+            "selection_dice": score,
+            "selection_domains": sel,
             "per_domain_dice": dict(results),
             "domain_list": list(self.domain_list),
         }
@@ -381,7 +437,7 @@ class MultiDomainTrainer:
         tmp.replace(path)
 
         delta = "" if prev < 0 else f" (was {prev:.4f})"
-        print(f"  * new best avg Dice {avg:.4f}{delta} -- saved {path}")
+        print(f"  * new best {self._selection_label(sel)} Dice {score:.4f}{delta} -- saved {path}")
         return True
 
     def _load_best(self) -> bool:
@@ -392,10 +448,12 @@ class MultiDomainTrainer:
         ckpt = torch.load(path, map_location=self.device)
         self.model.load_state_dict(ckpt["model"])
         self.best_epoch = ckpt.get("epoch", self.best_epoch)
-        self.best_dice = ckpt.get("avg_eval_dice", self.best_dice)
+        self.best_dice = ckpt.get("selection_dice", ckpt.get("avg_eval_dice", self.best_dice))
+        sel = ckpt.get("selection_domains")
+        label = self._selection_label(sel) if sel else "avg eval"
         print(
             f"Restored best checkpoint from epoch {self.best_epoch} "
-            f"(avg eval Dice {self.best_dice:.4f})"
+            f"({label} Dice {self.best_dice:.4f})"
         )
         return True
 
@@ -502,6 +560,8 @@ class MultiDomainTrainer:
             out["dst"] = f"{stats['distill']:.4f}"
         if self.ewc_lambda > 0.0:
             out["ewc"] = f"{stats['ewc']:.2e}"
+        if self.routing_balance_weight > 0.0 and stats.get("route", 0.0) > 0.0:
+            out["route"] = f"{stats['route']:.4f}"
         out["dice"] = f"{stats['dice']:.4f}"
         out["msum"] = int(stats["msum"])
         return out
@@ -566,6 +626,18 @@ class MultiDomainTrainer:
                 loss = loss + 0.5 * self.ewc_lambda * pen
                 ewc_val = float(pen.detach())
 
+        # Load balancing for the change-guided adapters' top-k routing: without
+        # it experts tend to collapse onto one.  Computed by the backbone during
+        # this forward pass, averaged over every guided adapter that ran.
+        route_val = 0.0
+        route = getattr(self.model, "routing_balance", None)
+        if route is None:
+            route = getattr(getattr(self.model, "backbone", None), "routing_balance", None)
+        if route is not None:
+            route_val = float(route.detach())
+            if self.routing_balance_weight > 0.0:
+                loss = loss + self.routing_balance_weight * route
+
         loss.backward()
         trainable = domain_parameters(self.model, domain) + shared_parameters(self.model)
         torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
@@ -588,6 +660,7 @@ class MultiDomainTrainer:
             "aux": aux_val,
             "distill": distill_val,
             "ewc": ewc_val,
+            "route": route_val,
             "dice": dice.item(),
             "aux_dice": aux_dice,
             "msum": mask.sum().item(),
@@ -716,6 +789,7 @@ class MultiDomainTrainer:
         aux_acc = aux_dice = aux_iou = 0.0
         has_aux = False
         n = 0
+        # Running pixel counts for the aggregate (dataset-level) scores.
         agg = {"main": [0.0, 0.0, 0.0, 0.0], "aux": [0.0, 0.0, 0.0, 0.0]}
         desc = f"{domain} {split_label}"
         if epoch is not None and total_epochs is not None:
@@ -764,7 +838,6 @@ class MultiDomainTrainer:
         avg_acc = 100.0 * total_acc / n
         avg_dice = total_dice / n
         avg_iou = total_iou / n
-        indent = "  " if epoch is not None else ""
         if epoch is not None:
             print(
                 f"  [{domain} {split_label}] main: dice={avg_dice:.4f}  "
@@ -777,6 +850,7 @@ class MultiDomainTrainer:
             )
 
         main_agg = _aggregate_scores(*agg["main"])
+        indent = "  " if epoch is not None else ""
         print(
             f"{indent}[{domain} {split_label}] main aggregate: "
             f"F1={main_agg['f1']:.4f}  IoU={main_agg['iou']:.4f}  "
@@ -799,10 +873,9 @@ class MultiDomainTrainer:
                 f"P={aux_agg['precision']:.4f}  R={aux_agg['recall']:.4f}"
             )
 
-
         # Checkpoint selection tracks the MAIN head -- that is the deployed
         # prediction; the aux head is reported for the early-exit comparison.
-        return avg_dice
+        return main_agg["f1"] if self.select_metric == "f1" else avg_dice
 
     def evaluate_all(
         self,

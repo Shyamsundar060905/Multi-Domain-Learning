@@ -108,6 +108,11 @@ def build_parser(defaults=None):
                    default=defaults.get("vgg_adapter_stages", ["l1", "l2", "l3", "l4"]),
                    choices=["l1", "l2", "l3", "l4"],
                    help="VGG pyramid levels to insert adapters at (only used when --backbone=vgg16).")
+    p.add_argument("--select-metric", type=str, default=defaults.get("select_metric", "dice"),
+                   choices=["dice", "f1"],
+                   help="Which validation score picks the best checkpoint: 'dice' = the "
+                        "per-image mean Dice used so far, 'f1' = aggregate F1 over the whole "
+                        "split (what the CD literature reports, and far less noisy).")
     p.add_argument("--use-tta", action="store_true",
                    help="Enable Test-Time Augmentation (hflip/vflip averaging) during eval.")
     p.add_argument("--ckpt-dir", type=str, default=defaults.get("ckpt_dir", "checkpoints"),
@@ -149,6 +154,10 @@ def _make_loaders(args):
                 root_dir=args.whu_dir, split="train", transform=train_transform,
                 positive_only=args.positive_only, image_size=args.image_size,
             )
+            whu_val = WHUDataset(
+                root_dir=args.whu_dir, split="val", transform=test_transform,
+                image_size=args.image_size,
+            )
             whu_test = WHUDataset(
                 root_dir=args.whu_dir, split="test", transform=test_transform,
                 image_size=args.image_size,
@@ -156,13 +165,21 @@ def _make_loaders(args):
             train_loaders["WHU"] = DataLoader(
                 whu_train, batch_size=args.batch_size, shuffle=True,
                 num_workers=args.num_workers, pin_memory=True, drop_last=True,
+                persistent_workers=args.num_workers > 0,
+            )
+            eval_loaders["WHU"] = DataLoader(
+                whu_val, batch_size=args.batch_size, shuffle=False,
+                num_workers=args.num_workers,
             )
             test_loaders["WHU"] = DataLoader(
                 whu_test, batch_size=args.batch_size, shuffle=False,
                 num_workers=args.num_workers,
             )
-            eval_loaders["WHU"] = test_loaders["WHU"]
-            print(f"WHU loaded: {len(whu_train)} train / {len(whu_test)} test (eval each epoch)")
+            print(
+                f"WHU loaded: {len(whu_train)} train | "
+                f"{len(whu_val)} val (eval each epoch) | "
+                f"{len(whu_test)} test (final only)"
+            )
         except Exception as e:
             print(f"[Warning] WHU loading failed: {e}")
 
@@ -195,6 +212,7 @@ def _make_loaders(args):
             train_loaders["LEVIR"] = DataLoader(
                 levir_train, batch_size=args.batch_size, shuffle=True,
                 num_workers=args.num_workers, pin_memory=True, drop_last=True,
+                persistent_workers=args.num_workers > 0,
             )
             eval_loaders["LEVIR"] = DataLoader(
                 levir_val, batch_size=args.batch_size, shuffle=False,
@@ -313,15 +331,19 @@ def main():
             pos_weight_arg[d] = float(v)
     else:
         # Sensible defaults tuned for WHU (~13% pos) vs LEVIR (~3% pos).
-        defaults_pw = {"WHU": 7.0, "LEVIR": 45.0}
-        pos_weight_arg = {d: defaults_pw.get(d, args.pos_weight) for d in domain_list}
+        # No per-domain values given: use the single --pos-weight for every
+        # domain and say so.  Hidden per-domain constants here would silently
+        # change the objective when a config key is missing.
+        pos_weight_arg = {d: args.pos_weight for d in domain_list}
+        print(f"[warn] pos_weight_per_domain not set; using --pos-weight "
+              f"{args.pos_weight} for all domains.")
 
     trainer = MultiDomainTrainer(
         model=model,
         train_loaders=train_loaders,
         eval_loaders=eval_loaders,
         test_loaders=test_loaders,
-        eval_domain_splits={"LEVIR": "val", "WHU": "test"},
+        eval_domain_splits={"LEVIR": "val", "WHU": "val"},
         test_domain_splits={"LEVIR": "test", "WHU": "test"},
         domain_list=domain_list,
         device=device,
@@ -335,11 +357,13 @@ def main():
         distill_alpha=args.distill_alpha,
         ewc_lambda=args.ewc_lambda,
         ewc_fisher_batches=args.ewc_fisher_batches,
+        routing_balance_weight=0.0,  # no guided adapters on this branch
         schedule=args.schedule,
         domain_order=domain_order,
         scheduler_step_size=args.scheduler_step_size,
         scheduler_gamma=args.scheduler_gamma,
         use_tta=args.use_tta,
+        select_metric=args.select_metric,
         ckpt_dir=args.ckpt_dir,
         ckpt_name=args.ckpt_name,
     )
