@@ -79,6 +79,7 @@ class ResNetWithAdapters(nn.Module):
         guided_reduction: int = 16,
         router_top_k: Optional[int] = 2,
         router_temperature: float = 1.0,
+        simple_granularity: str = "block",
     ):
         super().__init__()
         if adapter_type not in {"simple", "guided"}:
@@ -86,6 +87,10 @@ class ResNetWithAdapters(nn.Module):
         if guided_granularity not in {"stage", "block"}:
             raise ValueError(
                 f"guided_granularity must be 'stage' or 'block', got {guided_granularity!r}"
+            )
+        if simple_granularity not in {"stage", "block"}:
+            raise ValueError(
+                f"simple_granularity must be 'stage' or 'block', got {simple_granularity!r}"
             )
 
         self.stem = nn.Sequential(base.conv1, base.bn1, base.relu, base.maxpool)
@@ -101,9 +106,13 @@ class ResNetWithAdapters(nn.Module):
         self.adapter_stages = list(adapter_stages)
         self.adapter_type = adapter_type
         self.guided_granularity = guided_granularity
-        # Simple adapters always sit after every block; guided adapters follow
-        # guided_granularity.
-        self.adapter_per_block = adapter_type == "simple" or guided_granularity == "block"
+        self.simple_granularity = simple_granularity
+        # 'block': an adapter after every bottleneck block of the stage.
+        # 'stage': one adapter at the stage output (after its last block).
+        # Each adapter type has its own setting.  Simple defaults to 'block',
+        # which is how every simple-adapter run so far was built.
+        granularity = simple_granularity if adapter_type == "simple" else guided_granularity
+        self.adapter_per_block = granularity == "block"
         # Load-balancing loss over guided routing, refreshed on every forward.
         self.routing_balance: Optional[torch.Tensor] = None
 

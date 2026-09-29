@@ -121,6 +121,23 @@ def build_parser(defaults=None):
                    choices=["bottleneck", "up1", "up2", "up3", "up4"],
                    help="Stages in U-Net decoder to place adapters (bottleneck, up1, up2, up3, up4). "
                         "If omitted, all stages have adapters (when decoder_adapter_type != 'none').")
+    p.add_argument("--simple-granularity", type=str,
+                   default=defaults.get("simple_granularity", "block"),
+                   choices=["block", "stage"],
+                   help="Simple encoder adapters only: 'block' = one after every bottleneck "
+                        "block of each adapted stage (how every simple run so far was built); "
+                        "'stage' = one per stage, at the stage output.")
+    p.add_argument("--decoder-adapter-granularity", type=str,
+                   default=defaults.get("decoder_adapter_granularity", "block"),
+                   choices=["block", "stage"],
+                   help="'block' = an adapter in both conv blocks of each adapted up-stage; "
+                        "'stage' = one per up-stage, on its last conv block. The bottleneck "
+                        "is a single block either way.")
+    p.add_argument("--aux-adapters", dest="aux_adapters", action="store_true",
+                   help="Per-domain residual adapters inside the auxiliary head (default).")
+    p.add_argument("--no-aux-adapters", dest="aux_adapters", action="store_false",
+                   help="Auxiliary head without adapters: shared convs + per-domain "
+                        "BatchNorm only, as in every run before aux adapters existed.")
     p.add_argument("--guided-granularity", type=str,
                    default=defaults.get("guided_granularity", "stage"),
                    choices=["stage", "block"],
@@ -166,6 +183,9 @@ def build_parser(defaults=None):
         p.set_defaults(use_attention=True)
     if defaults.get("use_tta"):
         p.set_defaults(use_tta=True)
+    # Paired --aux-adapters / --no-aux-adapters share one dest; set the default
+    # once here so the config value (or True) applies regardless of flag order.
+    p.set_defaults(aux_adapters=defaults.get("aux_adapters", True))
     return p
 
 
@@ -345,6 +365,9 @@ def main():
         decoder_adapter_type=args.decoder_adapter_type,
         decoder_adapter_stages=args.decoder_adapter_stages,
         use_deep_supervision=args.use_deep_supervision,
+        simple_granularity=args.simple_granularity,
+        decoder_adapter_granularity=args.decoder_adapter_granularity,
+        aux_adapters=args.aux_adapters,
     )
     print_architecture(
         mode=mode,
@@ -355,6 +378,10 @@ def main():
         decoder_adapter_type=args.decoder_adapter_type,
         decoder_adapter_stages=args.decoder_adapter_stages,
         adapter_stages=args.adapter_stages,
+        simple_granularity=args.simple_granularity,
+        decoder_adapter_granularity=args.decoder_adapter_granularity,
+        aux_adapters=args.aux_adapters,
+        use_deep_supervision=args.use_deep_supervision,
     )
 
     count_parameters(model)
