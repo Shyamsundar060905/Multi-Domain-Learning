@@ -1,6 +1,6 @@
 {
   "domains": ["LEVIR", "WHU"],
-  "epochs": 20,
+  "epochs": 40,
   "lr": 0.0002,
   "weight_decay": 0.0001,
   "batch_size": 4,
@@ -20,6 +20,8 @@
   "pos_weight_per_domain": ["WHU=3.0", "LEVIR=10.0"],
   "backbone": "segnet",
   "segnet_adapter_stages": ["l1", "l2", "l3", "l4"],
+  "select_metric": "f1",
+  "ckpt_dir": "checkpoints/segnet",
   "whu_dir": "./Data/WHU",
   "levir_dir": "./Data/LEVIR CD"
 }
