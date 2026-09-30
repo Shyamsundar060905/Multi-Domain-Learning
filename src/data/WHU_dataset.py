@@ -42,7 +42,21 @@ class WHUDataset(Dataset):
         self.B_dir = os.path.join(self.root, "B")
         self.label_dir = os.path.join(self.root, "OUT")
 
+        for name, path in (("A", self.A_dir), ("B", self.B_dir), ("OUT", self.label_dir)):
+            if not os.path.isdir(path):
+                raise FileNotFoundError(f"WHU [{split}]: expected directory not found: {path}")
+
         all_names = sorted(os.listdir(self.A_dir))
+        missing = [
+            n for n in all_names
+            if not (os.path.isfile(os.path.join(self.B_dir, n))
+                    and os.path.isfile(os.path.join(self.label_dir, n)))
+        ]
+        if missing:
+            raise FileNotFoundError(
+                f"WHU [{split}]: {len(missing)} sample(s) missing a B or OUT counterpart. "
+                f"Examples: {missing[:8]}"
+            )
 
         if positive_only and split == "train":
             self.img_names = self._filter_positives(all_names, min_change_pixels, image_size)
