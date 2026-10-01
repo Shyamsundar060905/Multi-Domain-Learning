@@ -100,8 +100,11 @@ class UNetWithAdapters(nn.Module):
     Exposes ``{l1, l2, l3, l4}`` feature maps for U-Net skip connections at
     H/4, H/8, H/16 and H/32 respectively (for a 512x512 input).
 
-    Initializes with ImageNet pretrained weights (transferred from VGG-16 BN
-    convolutions which share identical DoubleConv topology) when ``pretrained=True``.
+    With ``pretrained=True`` the convs are initialized from ImageNet VGG-16-BN.
+    Stages 1-2 match VGG-16-BN exactly.  VGG-16-BN stages 3-5 have three convs
+    and a U-Net block has two, so the third conv of those stages (VGG indices
+    20, 30, 40) is not used: from stage 3 on, the features are NOT those of
+    the pretrained network.  Using all VGG-16-BN layers is the SegNet encoder.
 
     Parameters
     ----------
@@ -181,47 +184,75 @@ class UNetWithAdapters(nn.Module):
         if not self.unfreeze_backbone:
             self._freeze_backbone()
 
+    # (U-Net stage, conv/bn suffix, VGG16_BN conv index, VGG16_BN BatchNorm index).
+    # VGG-16-BN stages 3-5 have a THIRD conv (indices 20, 30, 40) that a
+    # two-conv U-Net block has no slot for, so those layers are not used.
+    _VGG16_BN_MAP = (
+        ("stage1", "1", 0, 1), ("stage1", "2", 3, 4),
+        ("stage2", "1", 7, 8), ("stage2", "2", 10, 11),
+        ("stage3", "1", 14, 15), ("stage3", "2", 17, 18),
+        ("stage4", "1", 24, 25), ("stage4", "2", 27, 28),
+        ("stage5", "1", 34, 35), ("stage5", "2", 37, 38),
+    )
+
     def _load_pretrained_weights(self) -> None:
-        """Initialize U-Net DoubleConv weights from ImageNet VGG16_BN layers."""
+        """Initialize the DoubleConv blocks from ImageNet VGG-16-BN.
+
+        Any failure raises.  The encoder is frozen, so silently falling back to
+        random weights would train the whole model on random features.
+        """
         try:
             vgg = vgg16_bn(weights=VGG16_BN_Weights.IMAGENET1K_V1)
-            f = list(vgg.features)
-            # VGG16_BN indices:
-            # Stage 1: conv1(0), bn1(1), conv2(3), bn2(4)
-            self._copy_conv_bn(f[0], f[1], self.stage1.conv1, self.stage1.bn1)
-            self._copy_conv_bn(f[3], f[4], self.stage1.conv2, self.stage1.bn2)
-
-            # Stage 2: conv1(7), bn1(8), conv2(10), bn2(11)
-            self._copy_conv_bn(f[7], f[8], self.stage2.conv1, self.stage2.bn1)
-            self._copy_conv_bn(f[10], f[11], self.stage2.conv2, self.stage2.bn2)
-
-            # Stage 3: conv1(14), bn1(15), conv2(17), bn2(18)
-            self._copy_conv_bn(f[14], f[15], self.stage3.conv1, self.stage3.bn1)
-            self._copy_conv_bn(f[17], f[18], self.stage3.conv2, self.stage3.bn2)
-
-            # Stage 4: conv1(24), bn1(25), conv2(27), bn2(28)
-            self._copy_conv_bn(f[24], f[25], self.stage4.conv1, self.stage4.bn1)
-            self._copy_conv_bn(f[27], f[28], self.stage4.conv2, self.stage4.bn2)
-
-            # Stage 5: conv1(34), bn1(35), conv2(37), bn2(38)
-            self._copy_conv_bn(f[34], f[35], self.stage5.conv1, self.stage5.bn1)
-            self._copy_conv_bn(f[37], f[38], self.stage5.conv2, self.stage5.bn2)
-            print("Loaded ImageNet pretrained weights into U-Net encoder.")
         except Exception as exc:
-            print(f"[Warning] Could not load ImageNet weights into U-Net encoder: {exc}")
-            print("Proceeding with Kaiming normal initialization.")
+            raise RuntimeError(
+                "Could not load ImageNet VGG-16-BN weights for the U-Net encoder. "
+                "The encoder is frozen, so training on random weights would be "
+                "meaningless; fix the download/cache and rerun."
+            ) from exc
+        f = list(vgg.features)
+        for stage, k, conv_i, bn_i in self._VGG16_BN_MAP:
+            block = getattr(self, stage)
+            self._copy_conv_bn(f[conv_i], f[bn_i],
+                               getattr(block, f"conv{k}"), getattr(block, f"bn{k}"))
+        print("Loaded ImageNet pretrained weights into U-Net encoder "
+              "(VGG-16-BN convs 0,3,7,10,14,17,24,27,34,37 with biases folded into "
+              "BatchNorm; VGG convs 20,30,40 have no U-Net counterpart and are unused).")
 
     @staticmethod
+    @torch.no_grad()
     def _copy_conv_bn(src_conv, src_bn, dst_conv, dst_bn) -> None:
-        if src_conv.weight.shape == dst_conv.weight.shape:
-            dst_conv.weight.data.copy_(src_conv.weight.data)
-            if src_conv.bias is not None and dst_conv.bias is not None:
-                dst_conv.bias.data.copy_(src_conv.bias.data)
-        if src_bn.weight.shape == dst_bn.weight.shape:
-            dst_bn.weight.data.copy_(src_bn.weight.data)
-            dst_bn.bias.data.copy_(src_bn.bias.data)
-            dst_bn.running_mean.data.copy_(src_bn.running_mean.data)
-            dst_bn.running_var.data.copy_(src_bn.running_var.data)
+        """Copy a VGG ``conv(+bias) -> BN`` pair into a U-Net ``conv -> BN`` pair.
+
+        VGG-16-BN convs carry a bias; the U-Net convs are bias-free.  The bias is
+        folded into the BatchNorm running mean, which is exact for an eval-mode
+        (frozen) BatchNorm:  BN(Wx + b; mean) == BN(Wx; mean - b).  In train
+        mode a per-channel constant is removed by the batch mean anyway, so the
+        fold is harmless with --unfreeze-backbone too.
+        """
+        if not (isinstance(src_conv, nn.Conv2d) and isinstance(src_bn, nn.BatchNorm2d)):
+            raise TypeError(
+                f"expected Conv2d + BatchNorm2d, got "
+                f"{type(src_conv).__name__} + {type(src_bn).__name__}"
+            )
+        if src_conv.weight.shape != dst_conv.weight.shape:
+            raise ValueError(
+                f"conv shape mismatch: VGG {tuple(src_conv.weight.shape)} "
+                f"vs U-Net {tuple(dst_conv.weight.shape)}"
+            )
+        if src_bn.num_features != dst_bn.num_features or src_bn.eps != dst_bn.eps:
+            raise ValueError("BatchNorm mismatch (num_features or eps)")
+
+        bias = (src_conv.bias if src_conv.bias is not None
+                else torch.zeros_like(src_bn.running_mean))
+        dst_conv.weight.copy_(src_conv.weight)
+        if dst_conv.bias is not None:
+            dst_conv.bias.copy_(bias)
+            dst_bn.running_mean.copy_(src_bn.running_mean)
+        else:
+            dst_bn.running_mean.copy_(src_bn.running_mean - bias)
+        dst_bn.running_var.copy_(src_bn.running_var)
+        dst_bn.weight.copy_(src_bn.weight)
+        dst_bn.bias.copy_(src_bn.bias)
 
     # ------------------------------------------------------------------
     # Freezing helpers
