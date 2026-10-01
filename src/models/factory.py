@@ -26,6 +26,7 @@ from torchvision.models import (
 from src.models.ChangeDetection import ChangeDetectionModel
 from src.models.adapter_resnet import ResNetWithAdapters
 from src.models.segnet_adapter import SegNetWithAdapters
+from src.models.unet_adapter import UNetWithAdapters
 from src.models.vgg_adapter import VGGWithAdapters
 
 
@@ -40,14 +41,16 @@ def build_change_detection_model(
     fusion_type: str = "abs",
     use_attention: bool = False,
     # --- backbone selection ---
-    backbone: Literal["resnet50", "vgg16", "segnet"] = "segnet",
-    # --- ResNet-only options (ignored for VGG/SegNet) ---
+    backbone: Literal["resnet50", "vgg16", "segnet", "unet"] = "unet",
+    # --- ResNet-only options ---
     domain_bn_in_adapter: bool = False,
     unfreeze_layer4: bool = False,
     adapter_stages: Iterable[str] = ("layer1", "layer2", "layer3", "layer4"),
-    # --- VGG / SegNet options (ignored for ResNet) ---
+    # --- VGG / SegNet / U-Net options ---
     vgg_adapter_stages: Iterable[str] = ("l1", "l2", "l3", "l4"),
     segnet_adapter_stages: Iterable[str] = ("l1", "l2", "l3", "l4"),
+    unet_adapter_stages: Iterable[str] = ("l1", "l2", "l3", "l4"),
+    unfreeze_backbone: bool = False,
     # --- shared adapter hyper-params ---
     adapter_reduction: int = 16,
     adapter_dropout: float = 0.1,
@@ -59,13 +62,13 @@ def build_change_detection_model(
     domain_list:
         Names of domains to train on jointly (e.g. ``["LEVIR", "WHU"]``).
     backbone:
-        ``"segnet"``, ``"vgg16"``, or ``"resnet50"``.
+        ``"unet"``, ``"segnet"``, ``"vgg16"``, or ``"resnet50"``.
     adapter_stages:
-        For ResNet-50: which stages get per-domain adapters
-        (``"layer1"``–``"layer4"``).
-    vgg_adapter_stages / segnet_adapter_stages:
-        For VGG-16 / SegNet: which pyramid levels get per-domain adapters
-        (``"l1"``–``"l4"``).
+        For ResNet-50: which stages get per-domain adapters (``"layer1"``–``"layer4"``).
+    vgg_adapter_stages / segnet_adapter_stages / unet_adapter_stages:
+        Which pyramid levels get per-domain adapters (``"l1"``–``"l4"``).
+    unfreeze_backbone:
+        For U-Net: if True, base DoubleConv blocks are trained as shared parameters.
     adapter_reduction:
         Bottleneck reduction factor shared by both encoder and decoder adapters.
     adapter_dropout:
@@ -75,7 +78,16 @@ def build_change_detection_model(
     if not domains:
         raise ValueError("domain_list must contain at least one domain name.")
 
-    if backbone == "segnet":
+    if backbone == "unet":
+        enc = UNetWithAdapters(
+            domains,
+            pretrained=True,
+            unfreeze_backbone=unfreeze_backbone,
+            adapter_dropout=adapter_dropout,
+            adapter_reduction=adapter_reduction,
+            adapter_stages=list(unet_adapter_stages),
+        )
+    elif backbone == "segnet":
         base = vgg16_bn(weights=VGG16_BN_Weights.IMAGENET1K_V1)
         enc = SegNetWithAdapters(
             base,
@@ -106,7 +118,7 @@ def build_change_detection_model(
         )
     else:
         raise ValueError(
-            f"Unknown backbone '{backbone}'. Choose 'segnet', 'vgg16', or 'resnet50'."
+            f"Unknown backbone '{backbone}'. Choose 'unet', 'segnet', 'vgg16', or 'resnet50'."
         )
 
     model = ChangeDetectionModel(
@@ -129,13 +141,14 @@ def build_change_detection_model(
 
 def print_architecture(
     mode: str = "multi",
-    backbone: str = "segnet",
+    backbone: str = "unet",
 ) -> None:
     label = "Uni-domain" if mode == "uni" else "Multi-domain"
     enc_desc = {
         "resnet50": "frozen ImageNet ResNet-50 + per-domain residual adapters (layer1-layer4)",
         "vgg16":    "frozen ImageNet VGG-16   + per-domain residual adapters (l1-l4)",
         "segnet":   "frozen ImageNet SegNet (VGG-16 + BN) + per-domain residual adapters (l1-l4)",
+        "unet":     "canonical U-Net encoder (DoubleConv pyramid) + per-domain residual adapters (l1-l4)",
     }.get(backbone, backbone)
     print(f"{label} change detection:")
     print(f"  Encoder: {enc_desc}")

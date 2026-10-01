@@ -336,6 +336,14 @@ class ChangeDetectionModel(nn.Module):
         shared_ids = {id(p) for p in self.decoder.shared_parameters()}
         if getattr(self.backbone, "unfreeze_layer4", False):
             shared_ids |= {id(p) for p in self.backbone.layer4.parameters()}
+        if getattr(self.backbone, "unfreeze_backbone", False):
+            for stage in (getattr(self.backbone, "stage1", None),
+                          getattr(self.backbone, "stage2", None),
+                          getattr(self.backbone, "stage3", None),
+                          getattr(self.backbone, "stage4", None),
+                          getattr(self.backbone, "stage5", None)):
+                if stage is not None:
+                    shared_ids |= {id(p) for p in stage.parameters()}
         self._shared_param_ids = shared_ids
 
     def _fuse_pyramid(

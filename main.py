@@ -101,9 +101,9 @@ def build_parser(defaults=None):
                    choices=["layer1", "layer2", "layer3", "layer4"],
                    help="Stages in ResNet backbone to place adapters.")
     p.add_argument("--backbone", type=str,
-                   default=defaults.get("backbone", "segnet"),
-                   choices=["resnet50", "vgg16", "segnet"],
-                   help="Encoder backbone: 'segnet' (default), 'vgg16', or 'resnet50'.")
+                   default=defaults.get("backbone", "unet"),
+                   choices=["resnet50", "vgg16", "segnet", "unet"],
+                   help="Encoder backbone: 'unet' (default), 'segnet', 'vgg16', or 'resnet50'.")
     p.add_argument("--vgg-adapter-stages", type=str, nargs="+",
                    default=defaults.get("vgg_adapter_stages", ["l1", "l2", "l3", "l4"]),
                    choices=["l1", "l2", "l3", "l4"],
@@ -112,6 +112,12 @@ def build_parser(defaults=None):
                    default=defaults.get("segnet_adapter_stages", ["l1", "l2", "l3", "l4"]),
                    choices=["l1", "l2", "l3", "l4"],
                    help="SegNet pyramid levels to insert adapters at (only used when --backbone=segnet).")
+    p.add_argument("--unet-adapter-stages", type=str, nargs="+",
+                   default=defaults.get("unet_adapter_stages", ["l1", "l2", "l3", "l4"]),
+                   choices=["l1", "l2", "l3", "l4"],
+                   help="U-Net pyramid levels to insert adapters at (only used when --backbone=unet).")
+    p.add_argument("--unfreeze-backbone", action="store_true",
+                   help="Unfreeze base U-Net encoder convolutions (trains as shared parameters across domains).")
     p.add_argument("--select-metric", type=str, default=defaults.get("select_metric", "dice"),
                    choices=["dice", "f1"],
                    help="Which validation score picks the best checkpoint: 'dice' = the "
@@ -315,6 +321,8 @@ def main():
         backbone=args.backbone,
         vgg_adapter_stages=args.vgg_adapter_stages,
         segnet_adapter_stages=args.segnet_adapter_stages,
+        unet_adapter_stages=args.unet_adapter_stages,
+        unfreeze_backbone=args.unfreeze_backbone,
     )
     print_architecture(mode=mode, backbone=args.backbone)
 
