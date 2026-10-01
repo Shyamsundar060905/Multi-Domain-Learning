@@ -1,6 +1,12 @@
-"""U-Net-style encoder: frozen ImageNet SegNet (VGG-16 with BatchNorm) pyramid + per-domain adapters.
+"""Frozen ImageNet VGG-16-BN encoder (all 13 convs) + per-domain adapters.
 
-SegNet feature-map hierarchy (13 conv layers with BatchNorm + ReLU + MaxPool):
+This is the SegNet encoder.  It is shared by two backbones in factory.py:
+  - ``--backbone unet``:   + U-Net decoder (skip connections at every level)
+  - ``--backbone segnet``: + SegNet decoder (max-unpooling with this encoder's
+                             pooling indices, no skip connections)
+so the U-Net vs SegNet comparison differs only in the decoder.
+
+VGG-16-BN feature-map hierarchy (13 conv layers with BatchNorm + ReLU + MaxPool):
   Stage 1:  64 ch  @ H/2  (conv1_1 -> bn -> relu -> conv1_2 -> bn -> relu -> maxpool)
   Stage 2: 128 ch  @ H/4  (conv2_1 -> bn -> relu -> conv2_2 -> bn -> relu -> maxpool)
   Stage 3: 256 ch  @ H/8  (conv3_1 -> bn -> relu -> conv3_2 -> bn -> relu -> conv3_3 -> bn -> relu -> maxpool)
@@ -25,6 +31,7 @@ from typing import Dict, Iterable, List, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +262,43 @@ class SegNetWithAdapters(nn.Module):
         l4 = self._apply_adapter(x, domain, "l4")
 
         return {"l1": l1, "l2": l2, "l3": l3, "l4": l4}
+
+    @staticmethod
+    def _stage_with_indices(stage: nn.Sequential, x: torch.Tensor):
+        """Run one stage, also returning its max-pool indices and pre-pool size.
+
+        Uses the stage's own layers; only the final MaxPool2d is called
+        functionally with ``return_indices=True`` (same output, plus indices).
+        """
+        layers = list(stage.children())
+        pool = layers[-1]
+        if not isinstance(pool, nn.MaxPool2d):
+            raise TypeError(f"stage must end with MaxPool2d, got {type(pool).__name__}")
+        for layer in layers[:-1]:
+            x = layer(x)
+        size = x.shape[-2:]
+        x, idx = F.max_pool2d(
+            x, pool.kernel_size, pool.stride, pool.padding, pool.dilation,
+            ceil_mode=pool.ceil_mode, return_indices=True,
+        )
+        return x, idx, size
+
+    def extract_with_indices(self, x: torch.Tensor, domain: str):
+        """Deepest feature + every stage's max-pool indices, for a SegNet decoder.
+
+        Runs exactly the layers and adapters of ``extract_multiscale``.
+        Returns ``(l4, indices, sizes)``: ``indices[k]`` / ``sizes[k]`` belong to
+        stage ``k+1`` (``sizes`` = spatial size just before that stage's pool).
+        """
+        indices, sizes = [], []
+        for name in ("stage1", "stage2", "stage3", "stage4", "stage5"):
+            x, idx, size = self._stage_with_indices(getattr(self, name), x)
+            indices.append(idx)
+            sizes.append(size)
+            level = self._stage_to_level.get(name)
+            if level is not None:
+                x = self._apply_adapter(x, domain, level)
+        return x, indices, sizes
 
     def forward(
         self, x: torch.Tensor, domain: str

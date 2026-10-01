@@ -21,7 +21,7 @@
   "backbone": "unet",
   "unet_adapter_stages": ["l1", "l2", "l3", "l4"],
   "select_metric": "f1",
-  "ckpt_dir": "checkpoints/unet",
+  "ckpt_dir": "checkpoints/unet_vgg16bn",
   "whu_dir": "./Data/WHU",
   "levir_dir": "./Data/LEVIR CD"
 }

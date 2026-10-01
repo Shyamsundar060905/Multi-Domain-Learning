@@ -102,8 +102,11 @@ def build_parser(defaults=None):
                    help="Stages in ResNet backbone to place adapters.")
     p.add_argument("--backbone", type=str,
                    default=defaults.get("backbone", "unet"),
-                   choices=["resnet50", "vgg16", "segnet", "unet"],
-                   help="Encoder backbone: 'unet' (default), 'segnet', 'vgg16', or 'resnet50'.")
+                   choices=["resnet50", "vgg16", "segnet", "unet", "unet_2conv"],
+                   help="'unet' (default) = VGG-16-BN encoder + U-Net decoder; 'segnet' = the "
+                        "same encoder + SegNet decoder (unpooling with pooling indices, no "
+                        "skips); 'unet_2conv' = 2-conv U-Net encoder from VGG-16-BN; "
+                        "'vgg16'; 'resnet50'.")
     p.add_argument("--vgg-adapter-stages", type=str, nargs="+",
                    default=defaults.get("vgg_adapter_stages", ["l1", "l2", "l3", "l4"]),
                    choices=["l1", "l2", "l3", "l4"],
@@ -115,9 +118,11 @@ def build_parser(defaults=None):
     p.add_argument("--unet-adapter-stages", type=str, nargs="+",
                    default=defaults.get("unet_adapter_stages", ["l1", "l2", "l3", "l4"]),
                    choices=["l1", "l2", "l3", "l4"],
-                   help="U-Net pyramid levels to insert adapters at (only used when --backbone=unet).")
+                   help="Pyramid levels to insert adapters at (used with --backbone unet "
+                        "and unet_2conv).")
     p.add_argument("--unfreeze-backbone", action="store_true",
-                   help="Unfreeze base U-Net encoder convolutions (trains as shared parameters across domains).")
+                   help="--backbone unet_2conv only: train the encoder convs as shared "
+                        "parameters across domains.")
     p.add_argument("--select-metric", type=str, default=defaults.get("select_metric", "dice"),
                    choices=["dice", "f1"],
                    help="Which validation score picks the best checkpoint: 'dice' = the "

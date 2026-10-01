@@ -18,10 +18,10 @@
   "bce_weight": 0.3,
   "focal_gamma": 2.0,
   "pos_weight_per_domain": ["WHU=3.0", "LEVIR=10.0"],
-  "backbone": "segnet",
-  "segnet_adapter_stages": ["l1", "l2", "l3", "l4"],
+  "backbone": "unet_2conv",
+  "unet_adapter_stages": ["l1", "l2", "l3", "l4"],
   "select_metric": "f1",
-  "ckpt_dir": "checkpoints/segnet_unpool",
+  "ckpt_dir": "checkpoints/unet_2conv",
   "whu_dir": "./Data/WHU",
   "levir_dir": "./Data/LEVIR CD"
 }

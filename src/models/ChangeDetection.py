@@ -278,6 +278,125 @@ class UNetDecoder(nn.Module):
         return [p for p in self.parameters() if id(p) not in domain_param_ids]
 
 
+class SegNetDecoder(nn.Module):
+    """SegNet decoder (Badrinarayanan et al., TPAMI 2017), adapted to two dates.
+
+    Mirrors the VGG-16-BN encoder: five stages, deepest first, each starting
+    with max-unpooling at the positions recorded by the matching encoder pool,
+    followed by convs whose widths mirror VGG-16-BN (3, 3, 3, 2, 1 blocks; a
+    final 3x3 conv is the classifier).  No skip connections: the encoder
+    passes only pooling indices, which is what distinguishes SegNet from U-Net.
+
+    Bi-temporal adaptation:
+      - the two dates are fused once, at the deepest level, with the same
+        fusion as the U-Net decoder (concat[f1, f2, |f1-f2|]) and a 1x1 conv;
+      - each date has its own pooling indices, so every unpooling step is the
+        average of unpooling with date-1 and date-2 indices (neither date is
+        privileged).
+
+    Convs are shared; BatchNorm and residual adapters are per-domain
+    (DomainConvBlock), as in UNetDecoder.  The auxiliary head branches off the
+    first decoder stage (512 ch at H/16), the same position as UNetDecoder's.
+    """
+
+    # Block widths per decoder stage, deepest first.  The stage input width must
+    # equal the matching encoder pool's channels (512, 512, 256, 128, 64) so the
+    # unpooling indices line up; this mirror guarantees it.
+    _STAGES = (
+        (512, 512, 512),    # unpool encoder pool5: H/32 -> H/16
+        (512, 512, 256),    # unpool encoder pool4: H/16 -> H/8
+        (256, 256, 128),    # unpool encoder pool3: H/8  -> H/4
+        (128, 64),          # unpool encoder pool2: H/4  -> H/2
+        (64,),              # unpool encoder pool1: H/2  -> H   (+ classifier)
+    )
+
+    def __init__(
+        self,
+        domain_list: Iterable[str],
+        prior: float = 0.02,
+        fusion_type: str = "abs",
+        use_attention: bool = False,
+        adapter_reduction: int = 16,
+        adapter_dropout: float = 0.1,
+        in_channels: int = 512,
+    ):
+        super().__init__()
+        self.domain_list = list(domain_list)
+        self.fusion_type = fusion_type
+        self.use_attention = use_attention
+
+        mult = 4 if fusion_type == "abs_prod" else 3
+        fused_channels = mult * in_channels
+        self.attention = CBAM(fused_channels) if use_attention else nn.Identity()
+
+        blk = dict(adapter_reduction=adapter_reduction, adapter_dropout=adapter_dropout)
+        self.bottleneck = DomainConvBlock(
+            fused_channels, 512, domain_list, kernel_size=1, padding=0, **blk
+        )
+        self.stages = nn.ModuleList()
+        ch = 512
+        for widths in self._STAGES:
+            blocks = nn.ModuleList()
+            for w in widths:
+                blocks.append(DomainConvBlock(ch, w, domain_list, **blk))
+                ch = w
+            self.stages.append(blocks)
+
+        self.classifier = nn.Conv2d(ch, 1, kernel_size=3, padding=1)
+        self.aux_decoder = AuxDecoder(self._STAGES[0][-1], domain_list, widths=(128, 64, 32, 16))
+
+        prior_bias = math.log(prior / (1.0 - prior))
+        for head in (self.classifier, self.aux_decoder.classifier):
+            nn.init.normal_(head.weight, std=0.01)
+            nn.init.constant_(head.bias, prior_bias)
+
+    @staticmethod
+    def _unpool(x: torch.Tensor, idx_t1: torch.Tensor, idx_t2: torch.Tensor,
+                size: torch.Size) -> torch.Tensor:
+        if x.shape != idx_t1.shape or x.shape != idx_t2.shape:
+            raise ValueError(
+                f"decoder feature {tuple(x.shape)} does not match pooling indices "
+                f"{tuple(idx_t1.shape)}; use an input size divisible by 32"
+            )
+        # VGG-16-BN pools are all kernel 2, stride 2.
+        up1 = F.max_unpool2d(x, idx_t1, kernel_size=2, stride=2, output_size=size)
+        up2 = F.max_unpool2d(x, idx_t2, kernel_size=2, stride=2, output_size=size)
+        return 0.5 * (up1 + up2)
+
+    def forward(
+        self,
+        fused: torch.Tensor,
+        indices_t1: List[torch.Tensor],
+        indices_t2: List[torch.Tensor],
+        sizes: List[torch.Size],
+        domain: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not (len(indices_t1) == len(indices_t2) == len(sizes) == len(self.stages)):
+            raise ValueError("need pooling indices and sizes for all 5 encoder stages")
+        x = self.bottleneck(self.attention(fused), domain)
+        aux = None
+        for i, blocks in enumerate(self.stages):
+            k = len(self.stages) - 1 - i          # encoder stage to undo: 5,4,3,2,1
+            x = self._unpool(x, indices_t1[k], indices_t2[k], sizes[k])
+            for block in blocks:
+                x = block(x, domain)
+            if i == 0:
+                aux = self.aux_decoder(x, domain)
+        return self.classifier(x), aux
+
+    def domain_parameters(self, domain: str) -> list:
+        """Per-domain BatchNorm + adapters: every ModuleDict keyed by domain."""
+        params: list = []
+        for module in self.modules():
+            if isinstance(module, nn.ModuleDict) and domain in module:
+                params += list(module[domain].parameters())
+        return params
+
+    def shared_parameters(self) -> list:
+        domain_param_ids = {id(p) for d in self.domain_list for p in self.domain_parameters(d)}
+        return [p for p in self.parameters() if id(p) not in domain_param_ids]
+
+
 class ChangeDetectionModel(nn.Module):
     """Bi-temporal U-Net CD: adapter encoder + shared decoder (domain BN + adapters).
 
@@ -298,12 +417,16 @@ class ChangeDetectionModel(nn.Module):
         use_attention: bool = False,
         decoder_adapter_reduction: int = 16,
         decoder_adapter_dropout: float = 0.1,
+        decoder: str = "unet",
     ):
         super().__init__()
+        if decoder not in ("unet", "segnet"):
+            raise ValueError(f"decoder must be 'unet' or 'segnet', got {decoder!r}")
         self.backbone = backbone
         self.use_deep_supervision = use_deep_supervision
         self.fusion_type = fusion_type
         self.use_attention = use_attention
+        self.decoder_type = decoder
 
         if domain_list is None:
             domain_list = getattr(backbone, "domain_list", None)
@@ -318,15 +441,31 @@ class ChangeDetectionModel(nn.Module):
             type(backbone), "STAGE_CHANNELS", None
         ) or getattr(backbone, "STAGE_CHANNELS", None)
 
-        self.decoder = UNetDecoder(
-            self.domain_list,
-            prior=prior,
-            fusion_type=fusion_type,
-            use_attention=use_attention,
-            adapter_reduction=decoder_adapter_reduction,
-            adapter_dropout=decoder_adapter_dropout,
-            stage_channels=backbone_sc,
-        )
+        if decoder == "segnet":
+            if not hasattr(backbone, "extract_with_indices"):
+                raise ValueError(
+                    "The SegNet decoder needs max-pool indices from the encoder; "
+                    "only the VGG-16-BN encoder (SegNetWithAdapters) provides them."
+                )
+            self.decoder = SegNetDecoder(
+                self.domain_list,
+                prior=prior,
+                fusion_type=fusion_type,
+                use_attention=use_attention,
+                adapter_reduction=decoder_adapter_reduction,
+                adapter_dropout=decoder_adapter_dropout,
+                in_channels=backbone_sc["l4"],
+            )
+        else:
+            self.decoder = UNetDecoder(
+                self.domain_list,
+                prior=prior,
+                fusion_type=fusion_type,
+                use_attention=use_attention,
+                adapter_reduction=decoder_adapter_reduction,
+                adapter_dropout=decoder_adapter_dropout,
+                stage_channels=backbone_sc,
+            )
 
         # Fixed (structural) set of shared-parameter ids, decided once at
         # construction time. ``freeze_domain`` toggles ``requires_grad`` on
@@ -357,11 +496,18 @@ class ChangeDetectionModel(nn.Module):
     def forward(
         self, img1: torch.Tensor, img2: torch.Tensor, domain: str
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        pyramid1 = self.backbone.extract_multiscale(img1, domain)
-        pyramid2 = self.backbone.extract_multiscale(img2, domain)
-        fused = self._fuse_pyramid(pyramid1, pyramid2)
-
-        logits, aux = self.decoder(fused, domain)
+        if self.decoder_type == "segnet":
+            # SegNet: fuse the two dates at the deepest level only; the decoder
+            # upsamples with each date's pooling indices (no skip features).
+            f1, idx1, sizes = self.backbone.extract_with_indices(img1, domain)
+            f2, idx2, _ = self.backbone.extract_with_indices(img2, domain)
+            fused_l4 = build_bitemporal_fusion(f1, f2, fusion_type=self.fusion_type)
+            logits, aux = self.decoder(fused_l4, idx1, idx2, sizes, domain)
+        else:
+            pyramid1 = self.backbone.extract_multiscale(img1, domain)
+            pyramid2 = self.backbone.extract_multiscale(img2, domain)
+            fused = self._fuse_pyramid(pyramid1, pyramid2)
+            logits, aux = self.decoder(fused, domain)
 
         # ``aux`` is returned in eval mode too, so the auxiliary head can be
         # scored as a standalone predictor alongside the main head.  It is
