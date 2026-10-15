@@ -73,7 +73,9 @@ def build_change_detection_model(
     vgg_adapter_stages / segnet_adapter_stages / unet_adapter_stages:
         Which pyramid levels get per-domain adapters (``"l1"``–``"l4"``).
     unfreeze_backbone:
-        ``unet_2conv`` only: train the DoubleConv blocks as shared parameters.
+        VGG-based encoders (vgg16, unet, segnet, unet_2conv): train every
+        encoder weight as a parameter shared by all domains instead of freezing
+        it.  Per-domain adapters are unchanged.
     adapter_reduction:
         Bottleneck reduction factor shared by both encoder and decoder adapters.
     adapter_dropout:
@@ -83,8 +85,11 @@ def build_change_detection_model(
     if not domains:
         raise ValueError("domain_list must contain at least one domain name.")
 
-    if unfreeze_backbone and backbone != "unet_2conv":
-        raise ValueError("--unfreeze-backbone is only supported with --backbone unet_2conv")
+    if unfreeze_backbone and backbone == "resnet50":
+        raise ValueError(
+            "--unfreeze-backbone is for the VGG-based encoders (vgg16, unet, segnet, "
+            "unet_2conv); for resnet50 use --unfreeze-layer4"
+        )
 
     decoder = "unet"
     if backbone in ("unet", "segnet"):
@@ -99,6 +104,7 @@ def build_change_detection_model(
             adapter_reduction=adapter_reduction,
             adapter_stages=list(unet_adapter_stages if backbone == "unet"
                                 else segnet_adapter_stages),
+            unfreeze_backbone=unfreeze_backbone,
         )
         decoder = backbone
     elif backbone == "unet_2conv":
@@ -118,6 +124,7 @@ def build_change_detection_model(
             adapter_dropout=adapter_dropout,
             adapter_reduction=adapter_reduction,
             adapter_stages=list(vgg_adapter_stages),
+            unfreeze_backbone=unfreeze_backbone,
         )
     elif backbone == "resnet50":
         base = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
@@ -158,6 +165,7 @@ def build_change_detection_model(
 def print_architecture(
     mode: str = "multi",
     backbone: str = "unet",
+    unfreeze_backbone: bool = False,
 ) -> None:
     label = "Uni-domain" if mode == "uni" else "Multi-domain"
     vgg_bn = "frozen ImageNet VGG-16-BN (all 13 convs) + per-domain residual adapters (l1-l4)"
@@ -169,6 +177,13 @@ def print_architecture(
         "unet_2conv": "2-conv U-Net encoder from VGG-16-BN (convs 20/30/40 unused) "
                       "+ per-domain residual adapters (l1-l4)",
     }.get(backbone, backbone)
+    if unfreeze_backbone:
+        bn_note = {
+            "vgg16": "VGG-16 has no BatchNorm",
+            "unet_2conv": "BatchNorm statistics updated during training",
+        }.get(backbone, "BatchNorm statistics kept at ImageNet values")
+        enc_desc = (enc_desc.replace("frozen ", "", 1)
+                    + f"  [ENCODER TRAINABLE: all weights shared across domains; {bn_note}]")
     shared = "shared convs + per-domain BatchNorm + per-domain residual adapters"
     print(f"{label} change detection:")
     print(f"  Encoder: {enc_desc}")

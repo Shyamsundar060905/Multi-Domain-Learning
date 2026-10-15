@@ -364,11 +364,15 @@ class MultiDomainTrainer:
         backbone = getattr(self.model, "backbone", None)
         if backbone is None:
             return
+        # A trainable encoder (--unfreeze-backbone) keeps its BatchNorm statistics
+        # fixed but trains the scale/shift, so leave requires_grad alone there.
+        freeze_affine = not getattr(backbone, "unfreeze_backbone", False)
         for name, m in backbone.named_modules():
             if isinstance(m, nn.BatchNorm2d) and "adapter" not in name and "domain_bn" not in name:
                 m.eval()
-                for p in m.parameters():
-                    p.requires_grad = False
+                if freeze_affine:
+                    for p in m.parameters():
+                        p.requires_grad = False
 
     def _log_trainable(self) -> None:
         total = sum(p.numel() for p in self.model.parameters())

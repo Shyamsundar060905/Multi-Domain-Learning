@@ -121,8 +121,10 @@ def build_parser(defaults=None):
                    help="Pyramid levels to insert adapters at (used with --backbone unet "
                         "and unet_2conv).")
     p.add_argument("--unfreeze-backbone", action="store_true",
-                   help="--backbone unet_2conv only: train the encoder convs as shared "
-                        "parameters across domains.")
+                   default=defaults.get("unfreeze_backbone", False),
+                   help="VGG-based encoders (vgg16, unet, segnet, unet_2conv): train every "
+                        "encoder weight, shared across domains, instead of freezing it. "
+                        "Use a separate --ckpt-dir so frozen-encoder checkpoints are kept.")
     p.add_argument("--select-metric", type=str, default=defaults.get("select_metric", "dice"),
                    choices=["dice", "f1"],
                    help="Which validation score picks the best checkpoint: 'dice' = the "
@@ -329,7 +331,8 @@ def main():
         unet_adapter_stages=args.unet_adapter_stages,
         unfreeze_backbone=args.unfreeze_backbone,
     )
-    print_architecture(mode=mode, backbone=args.backbone)
+    print_architecture(mode=mode, backbone=args.backbone,
+                       unfreeze_backbone=args.unfreeze_backbone)
 
     count_parameters(model)
 

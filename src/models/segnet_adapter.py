@@ -138,6 +138,7 @@ class SegNetWithAdapters(nn.Module):
         adapter_dropout: float = 0.1,
         adapter_reduction: int = 16,
         adapter_stages: Iterable[str] = ("l1", "l2", "l3", "l4"),
+        unfreeze_backbone: bool = False,
     ):
         super().__init__()
 
@@ -175,8 +176,21 @@ class SegNetWithAdapters(nn.Module):
             for d in self.domain_list
         })
 
-        # --- Freeze backbone --------------------------------------------------
-        self._freeze_backbone()
+        # --- Freeze backbone (default), or leave every VGG-16-BN weight trainable
+        # When trainable, ChangeDetectionModel puts stage1..stage5 in the set of
+        # parameters shared by all domains.  The BatchNorm scale/shift train too,
+        # but BatchNorm statistics stay at their ImageNet values (``train()``
+        # keeps them in eval mode either way): batches of 4 alternating between
+        # domains would give noisy, domain-mixed running statistics.
+        self.unfreeze_backbone = unfreeze_backbone
+        if unfreeze_backbone:
+            for name, module in self.named_children():
+                if name != "domain_adapters":
+                    for m in module.modules():
+                        if isinstance(m, nn.BatchNorm2d):
+                            m.eval()
+        else:
+            self._freeze_backbone()
 
     # ------------------------------------------------------------------
     # Freezing helpers

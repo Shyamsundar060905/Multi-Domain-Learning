@@ -141,6 +141,7 @@ class VGGWithAdapters(nn.Module):
         adapter_dropout: float = 0.1,
         adapter_reduction: int = 16,
         adapter_stages: Iterable[str] = ("l1", "l2", "l3", "l4"),
+        unfreeze_backbone: bool = False,
     ):
         super().__init__()
 
@@ -178,8 +179,12 @@ class VGGWithAdapters(nn.Module):
             for d in self.domain_list
         })
 
-        # --- Freeze backbone --------------------------------------------------
-        self._freeze_backbone()
+        # --- Freeze backbone (default), or leave every VGG weight trainable ----
+        # When trainable, ChangeDetectionModel puts stage1..stage5 in the set of
+        # parameters shared by all domains (one optimiser, both datasets).
+        self.unfreeze_backbone = unfreeze_backbone
+        if not unfreeze_backbone:
+            self._freeze_backbone()
 
     # ------------------------------------------------------------------
     # Freezing helpers
