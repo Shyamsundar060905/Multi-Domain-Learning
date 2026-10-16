@@ -405,6 +405,12 @@ class ChangeDetectionModel(nn.Module):
         shared_ids = {id(p) for p in self.decoder.shared_parameters()}
         if getattr(self.backbone, "unfreeze_layer4", False):
             shared_ids |= {id(p) for p in self.backbone.layer4.parameters()}
+        if getattr(self.backbone, "unfreeze_backbone", False):
+            # Whole encoder trainable: every non-adapter encoder weight is shared.
+            shared_ids |= {
+                id(p) for n, p in self.backbone.named_parameters()
+                if not n.startswith(("domain_adapters", "domain_bns"))
+            }
         self._shared_param_ids = shared_ids
 
     def _fuse_pyramid(

@@ -27,6 +27,7 @@ def build_change_detection_model(
     router_top_k: Optional[int] = 2,
     decoder_adapter_type: str = "simple",
     use_deep_supervision: bool = True,
+    unfreeze_backbone: bool = False,
 ) -> ChangeDetectionModel:
     """ResNet50 encoder + per-domain adapters (simple or change-guided) + shared U-Net decoder."""
     domains: List[str] = list(domain_list)
@@ -45,6 +46,7 @@ def build_change_detection_model(
         num_experts=num_experts,
         guided_reduction=guided_reduction,
         router_top_k=router_top_k,
+        unfreeze_backbone=unfreeze_backbone,
     )
     model = ChangeDetectionModel(
         backbone,
@@ -70,6 +72,7 @@ def print_architecture(
     num_experts: int = 4,
     router_top_k: Optional[int] = 2,
     decoder_adapter_type: str = "simple",
+    unfreeze_backbone: bool = False,
 ) -> None:
     label = "Uni-domain" if mode == "uni" else "Multi-domain"
     if adapter_type == "guided":
@@ -81,6 +84,10 @@ def print_architecture(
         )
     else:
         encoder = "frozen ImageNet ResNet50 + per-domain residual adapters after every bottleneck block"
+    if unfreeze_backbone:
+        encoder = (encoder.replace("frozen ", "", 1)
+                   + "  [ENCODER TRAINABLE: all weights shared across domains; "
+                     "BatchNorm statistics kept at ImageNet values]")
     print(f"{label} change detection:")
     print(f"  Encoder: {encoder}")
     if decoder_adapter_type == "guided":

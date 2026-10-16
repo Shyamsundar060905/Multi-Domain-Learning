@@ -92,6 +92,11 @@ def build_parser(defaults=None):
                    help="Add domain-specific BN in the adapter path.")
     p.add_argument("--unfreeze-layer4", action="store_true",
                    help="Unfreeze Layer4 in the ResNet backbone.")
+    p.add_argument("--unfreeze-backbone", action="store_true",
+                   default=defaults.get("unfreeze_backbone", False),
+                   help="Train the whole ResNet50 encoder (stem + layer1-4), shared across "
+                        "domains, instead of freezing it. BatchNorm statistics stay at their "
+                        "ImageNet values. Use a separate --ckpt-dir.")
     p.add_argument("--use-color-jitter", action="store_true",
                    help="Apply independent color jitter augmentation to images.")
     p.add_argument("--use-attention", action="store_true",
@@ -338,6 +343,7 @@ def main():
         router_top_k=(args.router_top_k or None),
         decoder_adapter_type=args.decoder_adapter_type,
         use_deep_supervision=args.use_deep_supervision,
+        unfreeze_backbone=args.unfreeze_backbone,
     )
     print_architecture(
         mode=mode,
@@ -346,6 +352,7 @@ def main():
         num_experts=args.num_experts,
         router_top_k=(args.router_top_k or None),
         decoder_adapter_type=args.decoder_adapter_type,
+        unfreeze_backbone=args.unfreeze_backbone,
     )
 
     count_parameters(model)

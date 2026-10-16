@@ -79,6 +79,7 @@ class ResNetWithAdapters(nn.Module):
         guided_reduction: int = 16,
         router_top_k: Optional[int] = 2,
         router_temperature: float = 1.0,
+        unfreeze_backbone: bool = False,
     ):
         super().__init__()
         if adapter_type not in {"simple", "guided"}:
@@ -98,6 +99,10 @@ class ResNetWithAdapters(nn.Module):
         self.domain_list = list(domain_list)
         self.domain_bn_in_adapter = domain_bn_in_adapter
         self.unfreeze_layer4 = unfreeze_layer4
+        # Whole encoder (stem + layer1..4) trainable, shared across domains.
+        # BatchNorm statistics stay at their ImageNet values (train() keeps them
+        # in eval mode); BatchNorm scale/shift train with the convs.
+        self.unfreeze_backbone = unfreeze_backbone
         self.adapter_stages = list(adapter_stages)
         self.adapter_type = adapter_type
         self.guided_granularity = guided_granularity
@@ -152,7 +157,7 @@ class ResNetWithAdapters(nn.Module):
         for name, module in self.named_children():
             if name in ("domain_adapters", "domain_bns"):
                 continue
-            if self.unfreeze_layer4 and name == "layer4":
+            if self.unfreeze_backbone or (self.unfreeze_layer4 and name == "layer4"):
                 for p in module.parameters():
                     p.requires_grad = True
                 for m in module.modules():
