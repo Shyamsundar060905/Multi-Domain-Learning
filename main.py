@@ -125,6 +125,14 @@ def build_parser(defaults=None):
                    help="VGG-based encoders (vgg16, unet, segnet, unet_2conv): train every "
                         "encoder weight, shared across domains, instead of freezing it. "
                         "Use a separate --ckpt-dir so frozen-encoder checkpoints are kept.")
+    p.add_argument("--use-recon", dest="use_recon", action="store_true",
+                   default=defaults.get("use_recon", False),
+                   help="Enable bottleneck reconstruction decoder to reconstruct T1' and T2'.")
+    p.add_argument("--no-recon", dest="use_recon", action="store_false",
+                   help="Disable bottleneck reconstruction decoder.")
+    p.add_argument("--recon-weight", type=float,
+                   default=defaults.get("recon_weight", 0.5),
+                   help="Weight on the bottleneck reconstruction MSE loss.")
     p.add_argument("--select-metric", type=str, default=defaults.get("select_metric", "dice"),
                    choices=["dice", "f1"],
                    help="Which validation score picks the best checkpoint: 'dice' = the "
@@ -330,9 +338,11 @@ def main():
         segnet_adapter_stages=args.segnet_adapter_stages,
         unet_adapter_stages=args.unet_adapter_stages,
         unfreeze_backbone=args.unfreeze_backbone,
+        use_recon=args.use_recon,
     )
     print_architecture(mode=mode, backbone=args.backbone,
-                       unfreeze_backbone=args.unfreeze_backbone)
+                       unfreeze_backbone=args.unfreeze_backbone,
+                       use_recon=args.use_recon)
 
     count_parameters(model)
 
@@ -387,6 +397,8 @@ def main():
         select_metric=args.select_metric,
         ckpt_dir=args.ckpt_dir,
         ckpt_name=args.ckpt_name,
+        use_recon=args.use_recon,
+        recon_weight=args.recon_weight,
     )
 
     print("Starting training...")

@@ -28,6 +28,13 @@ from src.utils.helpers import domain_parameters, freeze_domain, shared_parameter
 PosWeightLike = Union[float, Mapping[str, float]]
 
 
+def _unnormalize(tensor: torch.Tensor) -> torch.Tensor:
+    """Invert ImageNet normalization to recover [0, 1] RGB images for PSNR."""
+    mean = tensor.new_tensor([0.485, 0.456, 0.406]).view(1, -1, 1, 1)
+    std = tensor.new_tensor([0.229, 0.224, 0.225]).view(1, -1, 1, 1)
+    return (tensor * std + mean).clamp(0.0, 1.0)
+
+
 # ---------------------------------------------------------------------------
 # Losses
 # ---------------------------------------------------------------------------
@@ -103,7 +110,7 @@ def _sequential(loaders: Dict, batches_per_domain: int, order: List[str]):
 class _LossAccum:
     """Running means of each loss term over an epoch (or a domain block)."""
 
-    KEYS = ("total", "main", "aux", "distill", "ewc", "route", "dice", "aux_dice")
+    KEYS = ("total", "main", "aux", "distill", "ewc", "route", "dice", "aux_dice", "recon", "psnr")
 
     def __init__(self):
         self.sums = {k: 0.0 for k in self.KEYS}
@@ -134,10 +141,14 @@ class _LossAccum:
         r = trainer.routing_balance_weight
         if r > 0.0 and self.sums["route"] > 0.0:
             parts.append(f"route={self.mean('route'):.4f}x{r:g}")
+        if getattr(trainer, "use_recon", False):
+            parts.append(f"rec={self.mean('recon'):.4f}x{trainer.recon_weight:g}")
         parts[-1] += ")"
         parts.append(f"dice={self.mean('dice'):.4f}")
         if self.sums["aux_dice"] > 0.0:
             parts.append(f"aux_dice={self.mean('aux_dice'):.4f}")
+        if getattr(trainer, "use_recon", False) and self.sums["psnr"] > 0.0:
+            parts.append(f"psnr={self.mean('psnr'):.2f}dB")
         return "  ".join(parts)
 
 
@@ -254,8 +265,12 @@ class MultiDomainTrainer:
         select_metric: str = "dice",
         ckpt_dir: str | None = "checkpoints",
         ckpt_name: str = "best.pt",
+        use_recon: bool = False,
+        recon_weight: float = 0.5,
     ):
         self.model = model
+        self.use_recon = use_recon
+        self.recon_weight = recon_weight
         self.train_loaders = train_loaders
         self.eval_loaders = eval_loaders if eval_loaders is not None else test_loaders
         self.test_loaders = test_loaders
@@ -338,6 +353,8 @@ class MultiDomainTrainer:
 
         print(f"Per-domain pos_weight: {self.pos_weight}")
         print(f"Deep supervision weight: {self.deep_supervision_weight}")
+        if self.use_recon:
+            print(f"Reconstruction loss:   ON (weight={self.recon_weight}, MSE + PSNR tracking)")
         print(f"Distill alpha:         {self.distill_alpha}"
               f"{'  (off)' if self.distill_alpha <= 0 else ''}")
         if self.ewc_lambda > 0:
@@ -566,6 +583,9 @@ class MultiDomainTrainer:
             out["ewc"] = f"{stats['ewc']:.2e}"
         if self.routing_balance_weight > 0.0 and stats.get("route", 0.0) > 0.0:
             out["route"] = f"{stats['route']:.4f}"
+        if getattr(self, "use_recon", False) and "recon" in stats:
+            out["rec"] = f"{stats['recon']:.4f}"
+            out["psnr"] = f"{stats['psnr']:.1f}dB"
         out["dice"] = f"{stats['dice']:.4f}"
         out["msum"] = int(stats["msum"])
         return out
@@ -589,7 +609,12 @@ class MultiDomainTrainer:
         if self.decoder_optimizer is not None:
             self.decoder_optimizer.zero_grad(set_to_none=True)
 
-        logits, aux_logits = self.model(img1, img2, domain)
+        if self.use_recon:
+            logits, aux_logits, recons = self.model(img1, img2, domain, return_recon=True)
+        else:
+            logits, aux_logits = self.model(img1, img2, domain, return_recon=False)
+            recons = None
+
         main_loss = change_detection_loss(
             logits, mask,
             pos_weight=self.pos_weight[domain],
@@ -598,6 +623,25 @@ class MultiDomainTrainer:
             bce_weight=self.bce_weight,
         )
         loss = main_loss
+
+        recon_loss_val = 0.0
+        psnr_val = 0.0
+        if self.use_recon and recons is not None:
+            r1, r2 = recons
+            mse_t1 = F.mse_loss(r1, img1)
+            mse_t2 = F.mse_loss(r2, img2)
+            recon_loss = 0.5 * (mse_t1 + mse_t2)
+            loss = loss + self.recon_weight * recon_loss
+            recon_loss_val = float(recon_loss.item())
+
+            with torch.no_grad():
+                u_img1 = _unnormalize(img1)
+                u_r1   = _unnormalize(r1)
+                u_img2 = _unnormalize(img2)
+                u_r2   = _unnormalize(r2)
+                raw_mse = 0.5 * (F.mse_loss(u_r1, u_img1) + F.mse_loss(u_r2, u_img2)).item()
+                psnr_val = 10.0 * math.log10(1.0 / max(raw_mse, 1e-10))
+
         aux_val = 0.0
         if aux_logits is not None:
             aux_loss = change_detection_loss(
@@ -665,6 +709,8 @@ class MultiDomainTrainer:
             "distill": distill_val,
             "ewc": ewc_val,
             "route": route_val,
+            "recon": recon_loss_val,
+            "psnr": psnr_val,
             "dice": dice.item(),
             "aux_dice": aux_dice,
             "msum": mask.sum().item(),
@@ -792,6 +838,9 @@ class MultiDomainTrainer:
         total_acc = total_dice = total_iou = 0.0
         aux_acc = aux_dice = aux_iou = 0.0
         has_aux = False
+        total_recon_mse = 0.0
+        total_psnr = 0.0
+        recon_count = 0
         n = 0
         # Running pixel counts for the aggregate (dataset-level) scores.
         agg = {"main": [0.0, 0.0, 0.0, 0.0], "aux": [0.0, 0.0, 0.0, 0.0]}
@@ -813,7 +862,20 @@ class MultiDomainTrainer:
                     mask = mask.unsqueeze(0).unsqueeze(0)
                 mask = (mask > 0.5).float()
 
-                if self.use_tta:
+                if self.use_recon:
+                    logits, aux_logits, recons = self.model(img1, img2, domain, return_recon=True)
+                    if recons is not None:
+                        r1, r2 = recons
+                        u_img1 = _unnormalize(img1)
+                        u_r1   = _unnormalize(r1)
+                        u_img2 = _unnormalize(img2)
+                        u_r2   = _unnormalize(r2)
+                        raw_mse = 0.5 * (F.mse_loss(u_r1, u_img1) + F.mse_loss(u_r2, u_img2)).item()
+                        psnr = 10.0 * math.log10(1.0 / max(raw_mse, 1e-10))
+                        total_recon_mse += raw_mse
+                        total_psnr += psnr
+                        recon_count += 1
+                elif self.use_tta:
                     logits, aux_logits = _tta_logits(self.model, img1, img2, domain)
                 else:
                     logits, aux_logits = self.model(img1, img2, domain)
@@ -875,6 +937,14 @@ class MultiDomainTrainer:
                 f"{indent}[{domain} {split_label}] aux  aggregate: "
                 f"F1={aux_agg['f1']:.4f}  IoU={aux_agg['iou']:.4f}  "
                 f"P={aux_agg['precision']:.4f}  R={aux_agg['recall']:.4f}"
+            )
+
+        if self.use_recon and recon_count > 0:
+            avg_rec_mse = total_recon_mse / recon_count
+            avg_psnr = total_psnr / recon_count
+            print(
+                f"{indent}[{domain} {split_label}] recon: MSE={avg_rec_mse:.5f}  "
+                f"PSNR={avg_psnr:.2f} dB"
             )
 
         # Checkpoint selection tracks the MAIN head -- that is the deployed

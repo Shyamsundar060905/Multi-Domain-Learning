@@ -59,6 +59,8 @@ def build_change_detection_model(
     # --- shared adapter hyper-params ---
     adapter_reduction: int = 16,
     adapter_dropout: float = 0.1,
+    # --- bottleneck reconstruction decoder ---
+    use_recon: bool = False,
 ) -> ChangeDetectionModel:
     """Build a bi-temporal change-detection model with the requested backbone.
 
@@ -152,6 +154,7 @@ def build_change_detection_model(
         decoder_adapter_reduction=adapter_reduction,
         decoder_adapter_dropout=adapter_dropout,
         decoder=decoder,
+        use_recon=use_recon,
     )
     if device is not None:
         model = model.to(device)
@@ -166,6 +169,7 @@ def print_architecture(
     mode: str = "multi",
     backbone: str = "unet",
     unfreeze_backbone: bool = False,
+    use_recon: bool = False,
 ) -> None:
     label = "Uni-domain" if mode == "uni" else "Multi-domain"
     vgg_bn = "frozen ImageNet VGG-16-BN (all 13 convs) + per-domain residual adapters (l1-l4)"
@@ -195,3 +199,5 @@ def print_architecture(
     else:
         print(f"  Decoder: U-Net ({shared}); skip connections at every level")
         print("  Fusion:  concat(f1, f2, |f1-f2|) at each scale  |  deep sup on 1st up-stage")
+    if use_recon:
+        print("  Recon:   bottleneck decoder reconstructing T1' & T2' (MSE loss + PSNR eval)")
