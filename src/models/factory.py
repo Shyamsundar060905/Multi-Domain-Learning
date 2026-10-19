@@ -87,10 +87,11 @@ def build_change_detection_model(
     if not domains:
         raise ValueError("domain_list must contain at least one domain name.")
 
-    if unfreeze_backbone and backbone == "resnet50":
+    if unfreeze_backbone and backbone in ("resnet50", "fcn"):
         raise ValueError(
             "--unfreeze-backbone is for the VGG-based encoders (vgg16, unet, segnet, "
-            "unet_2conv); for resnet50 use --unfreeze-layer4"
+            f"unet_2conv); it is not supported for {backbone} on this branch"
+            + (" (use --unfreeze-layer4)" if backbone == "resnet50" else "")
         )
 
     decoder = "unet"

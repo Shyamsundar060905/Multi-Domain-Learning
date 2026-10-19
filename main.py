@@ -101,6 +101,7 @@ def build_parser(defaults=None):
                    choices=["layer1", "layer2", "layer3", "layer4"],
                    help="Stages in ResNet backbone to place adapters.")
     p.add_argument("--backbone", type=str,
+                   default=defaults.get("backbone", "unet"),
                    choices=["resnet50", "vgg16", "segnet", "unet", "unet_2conv", "fcn"],
                    help="'unet' (default) = VGG-16-BN encoder + U-Net decoder; 'segnet' = the "
                         "same encoder + SegNet decoder (unpooling with pooling indices, no "
