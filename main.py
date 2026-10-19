@@ -101,12 +101,11 @@ def build_parser(defaults=None):
                    choices=["layer1", "layer2", "layer3", "layer4"],
                    help="Stages in ResNet backbone to place adapters.")
     p.add_argument("--backbone", type=str,
-                   default=defaults.get("backbone", "unet"),
-                   choices=["resnet50", "vgg16", "segnet", "unet", "unet_2conv"],
+                   choices=["resnet50", "vgg16", "segnet", "unet", "unet_2conv", "fcn"],
                    help="'unet' (default) = VGG-16-BN encoder + U-Net decoder; 'segnet' = the "
                         "same encoder + SegNet decoder (unpooling with pooling indices, no "
                         "skips); 'unet_2conv' = 2-conv U-Net encoder from VGG-16-BN; "
-                        "'vgg16'; 'resnet50'.")
+                        "'vgg16'; 'resnet50'; 'fcn' = dilated ResNet-50.")
     p.add_argument("--vgg-adapter-stages", type=str, nargs="+",
                    default=defaults.get("vgg_adapter_stages", ["l1", "l2", "l3", "l4"]),
                    choices=["l1", "l2", "l3", "l4"],
@@ -120,6 +119,10 @@ def build_parser(defaults=None):
                    choices=["l1", "l2", "l3", "l4"],
                    help="Pyramid levels to insert adapters at (used with --backbone unet "
                         "and unet_2conv).")
+    p.add_argument("--fcn-adapter-stages", type=str, nargs="+",
+                   default=defaults.get("fcn_adapter_stages", ["l1", "l2", "l3", "l4"]),
+                   choices=["l1", "l2", "l3", "l4"],
+                   help="FCN pyramid levels to insert adapters at (only used when --backbone=fcn).")
     p.add_argument("--unfreeze-backbone", action="store_true",
                    default=defaults.get("unfreeze_backbone", False),
                    help="VGG-based encoders (vgg16, unet, segnet, unet_2conv): train every "
@@ -329,6 +332,7 @@ def main():
         vgg_adapter_stages=args.vgg_adapter_stages,
         segnet_adapter_stages=args.segnet_adapter_stages,
         unet_adapter_stages=args.unet_adapter_stages,
+        fcn_adapter_stages=args.fcn_adapter_stages,
         unfreeze_backbone=args.unfreeze_backbone,
     )
     print_architecture(mode=mode, backbone=args.backbone,

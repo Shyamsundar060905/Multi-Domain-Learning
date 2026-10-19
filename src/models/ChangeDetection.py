@@ -190,6 +190,11 @@ class UNetDecoder(nn.Module):
         produced by the backbone at each scale.  Defaults to ResNet-50 values
         when not provided.  Pass ``VGGWithAdapters.STAGE_CHANNELS`` (or
         equivalently ``vgg_adapter.STAGE_CHANNELS``) when using VGG-16.
+    upsample_strides:
+        4-tuple of ints ``(s0, s1, s2, s3)`` for the four up-stages:
+        ``(l4->l3, l3->l2, l2->l1, l1->full)``.  Default ``(2, 2, 2, 4)``
+        for standard backbones.  Use ``(1, 2, 2, 4)`` for FCN, where l3 and
+        l4 are both at H/16 so the first up-stage performs no spatial change.
     """
 
     def __init__(
@@ -201,6 +206,7 @@ class UNetDecoder(nn.Module):
         adapter_reduction: int = 16,
         adapter_dropout: float = 0.1,
         stage_channels: Optional[Dict[str, int]] = None,
+        upsample_strides: Tuple[int, int, int, int] = (2, 2, 2, 4),
     ):
         super().__init__()
         self.domain_list = list(domain_list)
@@ -222,13 +228,13 @@ class UNetDecoder(nn.Module):
         )
 
         self.up_stages = nn.ModuleList([
-            UNetUpStage(512, fused_channels["l3"], 256, domain_list, upsample_stride=2,
+            UNetUpStage(512, fused_channels["l3"], 256, domain_list, upsample_stride=upsample_strides[0],
                         adapter_reduction=adapter_reduction, adapter_dropout=adapter_dropout),
-            UNetUpStage(256, fused_channels["l2"], 128, domain_list, upsample_stride=2,
+            UNetUpStage(256, fused_channels["l2"], 128, domain_list, upsample_stride=upsample_strides[1],
                         adapter_reduction=adapter_reduction, adapter_dropout=adapter_dropout),
-            UNetUpStage(128, fused_channels["l1"], 64, domain_list, upsample_stride=2,
+            UNetUpStage(128, fused_channels["l1"], 64, domain_list, upsample_stride=upsample_strides[2],
                         adapter_reduction=adapter_reduction, adapter_dropout=adapter_dropout),
-            UNetUpStage(64, 0, 32, domain_list, upsample_stride=4,
+            UNetUpStage(64, 0, 32, domain_list, upsample_stride=upsample_strides[3],
                         adapter_reduction=adapter_reduction, adapter_dropout=adapter_dropout),
         ])
 
@@ -441,6 +447,19 @@ class ChangeDetectionModel(nn.Module):
             type(backbone), "STAGE_CHANNELS", None
         ) or getattr(backbone, "STAGE_CHANNELS", None)
 
+        # Read upsample_strides from the backbone class (FCN differs from others)
+        backbone_us = getattr(
+            type(backbone), "UPSAMPLE_STRIDES", None
+        ) or getattr(backbone, "UPSAMPLE_STRIDES", None)
+        if backbone_us is not None:
+            _us = backbone_us
+            upsample_strides = (
+                _us.get("up0", 2), _us.get("up1", 2),
+                _us.get("up2", 2), _us.get("up3", 4),
+            )
+        else:
+            upsample_strides = (2, 2, 2, 4)
+
         if decoder == "segnet":
             if not hasattr(backbone, "extract_with_indices"):
                 raise ValueError(
@@ -465,6 +484,7 @@ class ChangeDetectionModel(nn.Module):
                 adapter_reduction=decoder_adapter_reduction,
                 adapter_dropout=decoder_adapter_dropout,
                 stage_channels=backbone_sc,
+                upsample_strides=upsample_strides,
             )
 
         # Fixed (structural) set of shared-parameter ids, decided once at

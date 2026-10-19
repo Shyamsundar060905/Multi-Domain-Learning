@@ -7,11 +7,11 @@ Architectures selected via the ``backbone`` argument:
                       encoder's pooling indices, no skip connections)
   - ``"unet_2conv"``  two-conv-per-stage U-Net encoder initialised from
                       VGG-16-BN (convs 20/30/40 unused) + U-Net decoder
+  - ``"fcn"``         frozen ImageNet ResNet-50 with dilated layer4 + U-Net decoder
   - ``"vgg16"``       frozen ImageNet VGG-16 (no BN) + U-Net decoder
   - ``"resnet50"``    frozen ImageNet ResNet-50 + U-Net decoder
 Every encoder carries per-domain adapters; every decoder has shared convs with
-per-domain BatchNorm and adapters.  ``unet`` and ``segnet`` share the encoder,
-so they differ only in the decoder.
+per-domain BatchNorm and adapters.
 """
 
 from __future__ import annotations
@@ -30,6 +30,7 @@ from torchvision.models import (
 
 from src.models.ChangeDetection import ChangeDetectionModel
 from src.models.adapter_resnet import ResNetWithAdapters
+from src.models.fcn_adapter import FCNWithAdapters
 from src.models.segnet_adapter import SegNetWithAdapters
 from src.models.unet_adapter import UNetWithAdapters
 from src.models.vgg_adapter import VGGWithAdapters
@@ -46,15 +47,16 @@ def build_change_detection_model(
     fusion_type: str = "abs",
     use_attention: bool = False,
     # --- backbone selection ---
-    backbone: Literal["resnet50", "vgg16", "segnet", "unet", "unet_2conv"] = "unet",
+    backbone: Literal["resnet50", "vgg16", "segnet", "unet", "unet_2conv", "fcn"] = "unet",
     # --- ResNet-only options ---
     domain_bn_in_adapter: bool = False,
     unfreeze_layer4: bool = False,
     adapter_stages: Iterable[str] = ("layer1", "layer2", "layer3", "layer4"),
-    # --- VGG / SegNet / U-Net options ---
+    # --- VGG / SegNet / U-Net / FCN options ---
     vgg_adapter_stages: Iterable[str] = ("l1", "l2", "l3", "l4"),
     segnet_adapter_stages: Iterable[str] = ("l1", "l2", "l3", "l4"),
     unet_adapter_stages: Iterable[str] = ("l1", "l2", "l3", "l4"),
+    fcn_adapter_stages: Iterable[str] = ("l1", "l2", "l3", "l4"),
     unfreeze_backbone: bool = False,
     # --- shared adapter hyper-params ---
     adapter_reduction: int = 16,
@@ -67,10 +69,10 @@ def build_change_detection_model(
     domain_list:
         Names of domains to train on jointly (e.g. ``["LEVIR", "WHU"]``).
     backbone:
-        ``"unet"``, ``"segnet"``, ``"vgg16"``, or ``"resnet50"``.
+        ``"unet"``, ``"segnet"``, ``"vgg16"``, ``"resnet50"``, or ``"fcn"``.
     adapter_stages:
         For ResNet-50: which stages get per-domain adapters (``"layer1"``–``"layer4"``).
-    vgg_adapter_stages / segnet_adapter_stages / unet_adapter_stages:
+    vgg_adapter_stages / segnet_adapter_stages / unet_adapter_stages / fcn_adapter_stages:
         Which pyramid levels get per-domain adapters (``"l1"``–``"l4"``).
     unfreeze_backbone:
         VGG-based encoders (vgg16, unet, segnet, unet_2conv): train every
@@ -137,10 +139,22 @@ def build_change_detection_model(
             adapter_reduction=adapter_reduction,
             adapter_dropout=adapter_dropout,
         )
+    elif backbone == "fcn":
+        base = resnet50(
+            weights=ResNet50_Weights.IMAGENET1K_V1,
+            replace_stride_with_dilation=[False, False, True],
+        )
+        enc = FCNWithAdapters(
+            base,
+            domains,
+            adapter_stages=list(fcn_adapter_stages),
+            adapter_reduction=adapter_reduction,
+            adapter_dropout=adapter_dropout,
+        )
     else:
         raise ValueError(
             f"Unknown backbone '{backbone}'. Choose 'unet', 'segnet', 'unet_2conv', "
-            "'vgg16', or 'resnet50'."
+            "'vgg16', 'resnet50', or 'fcn'."
         )
 
     model = ChangeDetectionModel(
@@ -176,6 +190,7 @@ def print_architecture(
         "unet":       vgg_bn,
         "unet_2conv": "2-conv U-Net encoder from VGG-16-BN (convs 20/30/40 unused) "
                       "+ per-domain residual adapters (l1-l4)",
+        "fcn":        "frozen ImageNet ResNet-50 with dilated layer4 (FCN-style) + per-domain residual adapters (l1-l4)",
     }.get(backbone, backbone)
     if unfreeze_backbone:
         bn_note = {
