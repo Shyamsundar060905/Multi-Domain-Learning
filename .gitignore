@@ -1,13 +1,15 @@
-Dataset/
-data/
-!src/data/
+# Dataset folders at the repo root only (anchored with "/"): without the
+# anchor, "data/" and "Data/" also match src/data/ -- case-insensitively on
+# Windows -- and new loader files there get silently left out of commits.
+/Dataset/
+/data/
 *.csv
 *.log
 *.pth
 *.pt
 __pycache__/
 .ipynb_checkpoints/
-Data/
+/Data/
 __pycache__/
 *.pt
 *.pth
