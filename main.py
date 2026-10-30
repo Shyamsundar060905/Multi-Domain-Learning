@@ -5,6 +5,7 @@ import torch
 from torch.utils.data import DataLoader, RandomSampler
 
 from src.data.LEVIR_dataset import LEVIRDataset, list_image_names, verify_levir_splits
+from src.data.SYSU_dataset import SYSUDataset
 from src.data.WHU_dataset import WHUDataset
 from src.data.transforms import get_test_transform, get_train_transform
 from src.models.factory import build_change_detection_model, print_architecture
@@ -79,11 +80,17 @@ def build_parser(defaults=None):
                         "or rotated (round_robin mode).")
     p.add_argument("--domains", type=str, nargs="+",
                    default=defaults.get("domains"),
-                   choices=["WHU", "LEVIR"],
-                   help="Datasets to train on (default: both). "
+                   choices=["WHU", "LEVIR", "SYSU"],
+                   help="Datasets to train on (default: WHU and LEVIR). "
                         "Use one name for uni-domain baselines, e.g. --domains WHU.")
     p.add_argument("--whu-dir", type=str, default=defaults.get("whu_dir", "./Data/WHU"))
     p.add_argument("--levir-dir", type=str, default=defaults.get("levir_dir", "./Data/LEVIR CD"))
+    p.add_argument("--sysu-dir", type=str, default=defaults.get("sysu_dir", "./Data/SYSU-CD"))
+    p.add_argument("--max-train-samples-per-domain", type=int,
+                   default=defaults.get("max_train_samples_per_domain"),
+                   help="Cap on training samples a domain contributes per epoch; a larger "
+                        "domain is randomly subsampled with a fresh draw every epoch. "
+                        "Default: no cap (each domain uses its full training set).")
     p.add_argument("--device", type=str, default=defaults.get("device", "cuda" if torch.cuda.is_available() else "cpu"),
                    help="Device to run on, e.g. cuda, cuda:0, cuda:7, or cpu.")
     p.add_argument("--fusion-type", type=str, default=defaults.get("fusion_type", "abs"),
@@ -255,6 +262,66 @@ def _make_loaders(args):
         except Exception as e:
             print(f"[Warning] LEVIR loading failed: {e}")
 
+    if "SYSU" in requested:
+        try:
+            sysu_train = SYSUDataset(
+                root_dir=args.sysu_dir, split="train", transform=train_transform,
+                positive_only=args.positive_only, image_size=args.image_size,
+            )
+            sysu_val = SYSUDataset(
+                root_dir=args.sysu_dir, split="val", transform=test_transform,
+                image_size=args.image_size,
+            )
+            sysu_test = SYSUDataset(
+                root_dir=args.sysu_dir, split="test", transform=test_transform,
+                image_size=args.image_size,
+            )
+            train_loaders["SYSU"] = DataLoader(
+                sysu_train, batch_size=args.batch_size, shuffle=True,
+                num_workers=args.num_workers, pin_memory=True, drop_last=True,
+                persistent_workers=args.num_workers > 0,
+            )
+            eval_loaders["SYSU"] = DataLoader(
+                sysu_val, batch_size=args.batch_size, shuffle=False,
+                num_workers=args.num_workers,
+            )
+            test_loaders["SYSU"] = DataLoader(
+                sysu_test, batch_size=args.batch_size, shuffle=False,
+                num_workers=args.num_workers,
+            )
+            print(
+                f"SYSU loaded: {len(sysu_train)} train | "
+                f"{len(sysu_val)} val (eval each epoch) | "
+                f"{len(sysu_test)} test (final only)"
+            )
+        except Exception as e:
+            print(f"[Warning] SYSU loading failed: {e}")
+
+    missing = [d for d in requested if d not in train_loaders]
+    if missing:
+        # A requested dataset that failed to load must stop the run: otherwise
+        # it silently trains and reports on fewer domains than asked for.
+        raise SystemExit(f"Requested domain(s) failed to load: {missing} (see warnings above)")
+
+    cap = args.max_train_samples_per_domain
+    if cap is not None:
+        if args.balance_domain_samples and len(train_loaders) > 1:
+            raise SystemExit("--max-train-samples-per-domain and domain balancing both "
+                             "resample the training sets; use one or the other.")
+        for d, ld in list(train_loaders.items()):
+            n = len(ld.dataset)
+            if n <= cap:
+                continue
+            # Without replacement, re-drawn every epoch: over a run the whole
+            # training set is still seen, but each epoch has at most ``cap``.
+            train_loaders[d] = DataLoader(
+                ld.dataset, batch_size=args.batch_size,
+                sampler=RandomSampler(ld.dataset, replacement=False, num_samples=cap),
+                num_workers=args.num_workers, pin_memory=True, drop_last=True,
+                persistent_workers=args.num_workers > 0,
+            )
+            print(f"[cap] {d}: {n} train samples -> {cap} per epoch (fresh random draw each epoch)")
+
     if args.balance_domain_samples and len(train_loaders) > 1:
         train_loaders = _balance_domain_samples(train_loaders, args)
 
@@ -349,6 +416,12 @@ def main():
     domain_order = [d for d in args.domain_order if d in train_loaders]
     if not domain_order:
         domain_order = domain_list
+    # A loaded domain left out of domain_order would never be trained in the
+    # round-robin / sequential schedules (but would still be evaluated).
+    unordered = [d for d in domain_list if d not in domain_order]
+    if unordered:
+        domain_order = domain_order + unordered
+        print(f"[note] {unordered} not in --domain-order; appended -> {domain_order}")
 
     if args.pos_weight_per_domain:
         pos_weight_arg = {d: args.pos_weight for d in domain_list}
@@ -360,6 +433,14 @@ def main():
                 print(f"[warn] --pos-weight-per-domain entry {kv!r} references unknown domain; ignored.")
                 continue
             pos_weight_arg[d] = float(v)
+        given = {kv.split("=", 1)[0] for kv in args.pos_weight_per_domain}
+        unset = [d for d in domain_list if d not in given]
+        if unset:
+            raise SystemExit(
+                f"--pos-weight-per-domain has no value for {unset}. Add e.g. "
+                f"'{unset[0]}=<value>' (config key pos_weight_per_domain) rather than "
+                f"silently using --pos-weight {args.pos_weight}."
+            )
     else:
         # Sensible defaults tuned for WHU (~13% pos) vs LEVIR (~3% pos).
         # No per-domain values given: use the single --pos-weight for every
@@ -374,8 +455,10 @@ def main():
         train_loaders=train_loaders,
         eval_loaders=eval_loaders,
         test_loaders=test_loaders,
-        eval_domain_splits={"LEVIR": "val", "WHU": "val"},
-        test_domain_splits={"LEVIR": "test", "WHU": "test"},
+        # Every dataset is validated on its own val split (and only val splits
+        # choose the best checkpoint); test splits are used once, at the end.
+        eval_domain_splits={d: "val" for d in eval_loaders},
+        test_domain_splits={d: "test" for d in test_loaders},
         domain_list=domain_list,
         device=device,
         lr=args.lr,
