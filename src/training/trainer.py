@@ -110,7 +110,8 @@ def _sequential(loaders: Dict, batches_per_domain: int, order: List[str]):
 class _LossAccum:
     """Running means of each loss term over an epoch (or a domain block)."""
 
-    KEYS = ("total", "main", "aux", "distill", "ewc", "route", "dice", "aux_dice", "recon", "psnr")
+    KEYS = ("total", "main", "aux", "distill", "ewc", "route", "dice", "aux_dice", "recon", "psnr",
+            "rchg")
 
     def __init__(self):
         self.sums = {k: 0.0 for k in self.KEYS}
@@ -143,6 +144,9 @@ class _LossAccum:
             parts.append(f"route={self.mean('route'):.4f}x{r:g}")
         if getattr(trainer, "use_recon", False):
             parts.append(f"rec={self.mean('recon'):.4f}x{trainer.recon_weight:g}")
+        rcw = getattr(trainer, "recon_change_weight", 0.0)
+        if rcw > 0.0:
+            parts.append(f"rchg={self.mean('rchg'):.4f}x{rcw:g}")
         parts[-1] += ")"
         parts.append(f"dice={self.mean('dice'):.4f}")
         if self.sums["aux_dice"] > 0.0:
@@ -267,10 +271,12 @@ class MultiDomainTrainer:
         ckpt_name: str = "best.pt",
         use_recon: bool = False,
         recon_weight: float = 0.5,
+        recon_change_weight: float = 0.0,
     ):
         self.model = model
         self.use_recon = use_recon
         self.recon_weight = recon_weight
+        self.recon_change_weight = recon_change_weight
         self.train_loaders = train_loaders
         self.eval_loaders = eval_loaders if eval_loaders is not None else test_loaders
         self.test_loaders = test_loaders
@@ -355,6 +361,9 @@ class MultiDomainTrainer:
         print(f"Deep supervision weight: {self.deep_supervision_weight}")
         if self.use_recon:
             print(f"Reconstruction loss:   ON (weight={self.recon_weight}, MSE + PSNR tracking)")
+        if getattr(self.model, "recon_change", False):
+            print(f"Recon-change loss:     ON (weight={self.recon_change_weight}, "
+                  f"focal BCE + Dice vs the change mask)")
         print(f"Distill alpha:         {self.distill_alpha}"
               f"{'  (off)' if self.distill_alpha <= 0 else ''}")
         if self.ewc_lambda > 0:
@@ -586,6 +595,8 @@ class MultiDomainTrainer:
         if getattr(self, "use_recon", False) and "recon" in stats:
             out["rec"] = f"{stats['recon']:.4f}"
             out["psnr"] = f"{stats['psnr']:.1f}dB"
+        if self.recon_change_weight > 0.0:
+            out["rchg"] = f"{stats.get('rchg', 0.0):.4f}"
         out["dice"] = f"{stats['dice']:.4f}"
         out["msum"] = int(stats["msum"])
         return out
@@ -641,6 +652,21 @@ class MultiDomainTrainer:
                 u_r2   = _unnormalize(r2)
                 raw_mse = 0.5 * (F.mse_loss(u_r1, u_img1) + F.mse_loss(u_r2, u_img2)).item()
                 psnr_val = 10.0 * math.log10(1.0 / max(raw_mse, 1e-10))
+
+        # Reconstruction-change branch: its change logits (full resolution) are
+        # supervised by the same focal BCE + Dice as the main head.
+        rchg_val = 0.0
+        rc_logits = getattr(self.model, "recon_change_logits", None)
+        if rc_logits is not None and self.recon_change_weight > 0.0:
+            rc_loss = change_detection_loss(
+                rc_logits, mask,
+                pos_weight=self.pos_weight[domain],
+                gamma=self.focal_gamma,
+                dice_weight=self.dice_weight,
+                bce_weight=self.bce_weight,
+            )
+            loss = loss + self.recon_change_weight * rc_loss
+            rchg_val = float(rc_loss.detach())
 
         aux_val = 0.0
         if aux_logits is not None:
@@ -711,6 +737,7 @@ class MultiDomainTrainer:
             "route": route_val,
             "recon": recon_loss_val,
             "psnr": psnr_val,
+            "rchg": rchg_val,
             "dice": dice.item(),
             "aux_dice": aux_dice,
             "msum": mask.sum().item(),
@@ -843,7 +870,9 @@ class MultiDomainTrainer:
         recon_count = 0
         n = 0
         # Running pixel counts for the aggregate (dataset-level) scores.
-        agg = {"main": [0.0, 0.0, 0.0, 0.0], "aux": [0.0, 0.0, 0.0, 0.0]}
+        agg = {"main": [0.0, 0.0, 0.0, 0.0], "aux": [0.0, 0.0, 0.0, 0.0],
+               "rchg": [0.0, 0.0, 0.0, 0.0]}
+        has_rchg = False
         desc = f"{domain} {split_label}"
         if epoch is not None and total_epochs is not None:
             desc = f"{domain} {split_label} (ep {epoch}/{total_epochs})"
@@ -895,6 +924,12 @@ class MultiDomainTrainer:
                     aux_iou += a_iou.item()
                     for i, v in enumerate(_confusion(aux_logits, mask)):
                         agg["aux"][i] += v
+
+                rc_logits = getattr(self.model, "recon_change_logits", None)
+                if rc_logits is not None:
+                    has_rchg = True
+                    for i, v in enumerate(_confusion(rc_logits, mask)):
+                        agg["rchg"][i] += v
                 n += 1
 
         if was_training:
@@ -937,6 +972,14 @@ class MultiDomainTrainer:
                 f"{indent}[{domain} {split_label}] aux  aggregate: "
                 f"F1={aux_agg['f1']:.4f}  IoU={aux_agg['iou']:.4f}  "
                 f"P={aux_agg['precision']:.4f}  R={aux_agg['recall']:.4f}"
+            )
+
+        if has_rchg:
+            rc_agg = _aggregate_scores(*agg["rchg"])
+            print(
+                f"{indent}[{domain} {split_label}] rchg aggregate: "
+                f"F1={rc_agg['f1']:.4f}  IoU={rc_agg['iou']:.4f}  "
+                f"P={rc_agg['precision']:.4f}  R={rc_agg['recall']:.4f}"
             )
 
         if self.use_recon and recon_count > 0:

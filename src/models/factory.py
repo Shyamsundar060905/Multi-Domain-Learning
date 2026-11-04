@@ -61,6 +61,7 @@ def build_change_detection_model(
     adapter_dropout: float = 0.1,
     # --- bottleneck reconstruction decoder ---
     use_recon: bool = False,
+    recon_change: bool = False,
 ) -> ChangeDetectionModel:
     """Build a bi-temporal change-detection model with the requested backbone.
 
@@ -91,6 +92,12 @@ def build_change_detection_model(
         raise ValueError(
             "--unfreeze-backbone is for the VGG-based encoders (vgg16, unet, segnet, "
             "unet_2conv); for resnet50 use --unfreeze-layer4"
+        )
+
+    if recon_change and (backbone != "unet" or not use_recon):
+        raise ValueError(
+            "recon_change is implemented for --backbone unet with reconstruction on "
+            f"(--use-recon); got backbone={backbone!r}, use_recon={use_recon}"
         )
 
     decoder = "unet"
@@ -155,6 +162,7 @@ def build_change_detection_model(
         decoder_adapter_dropout=adapter_dropout,
         decoder=decoder,
         use_recon=use_recon,
+        recon_change=recon_change,
     )
     if device is not None:
         model = model.to(device)
@@ -170,6 +178,7 @@ def print_architecture(
     backbone: str = "unet",
     unfreeze_backbone: bool = False,
     use_recon: bool = False,
+    recon_change: bool = False,
 ) -> None:
     label = "Uni-domain" if mode == "uni" else "Multi-domain"
     vgg_bn = "frozen ImageNet VGG-16-BN (all 13 convs) + per-domain residual adapters (l1-l4)"
@@ -199,5 +208,10 @@ def print_architecture(
     else:
         print(f"  Decoder: U-Net ({shared}); skip connections at every level")
         print("  Fusion:  concat(f1, f2, |f1-f2|) at each scale  |  deep sup on 1st up-stage")
-    if use_recon:
+    if use_recon and recon_change:
+        print("  Recon:   shared decoder run per date (T1' from date-1 l4, T2' from date-2 l4; "
+              "MSE loss + PSNR eval)")
+        print("  Recon-change: |stage-1 date 1 - stage-1 date 2| (256 ch, H/16) -> change head "
+              "(supervised) + concatenated into U-Net before up-stage 2")
+    elif use_recon:
         print("  Recon:   bottleneck decoder reconstructing T1' & T2' (MSE loss + PSNR eval)")

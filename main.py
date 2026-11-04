@@ -140,6 +140,16 @@ def build_parser(defaults=None):
     p.add_argument("--recon-weight", type=float,
                    default=defaults.get("recon_weight", 0.5),
                    help="Weight on the bottleneck reconstruction MSE loss.")
+    p.add_argument("--recon-change", dest="recon_change", action="store_true",
+                   default=defaults.get("recon_change", False),
+                   help="Reconstruction-change branch (needs --use-recon, --backbone unet): "
+                        "the reconstruction decoder runs per date; the difference of its "
+                        "stage-1 features gets its own change loss and is concatenated "
+                        "into the U-Net before up-stage 2.")
+    p.add_argument("--recon-change-weight", type=float,
+                   default=defaults.get("recon_change_weight", 0.5),
+                   help="Weight on the reconstruction-branch change loss "
+                        "(same focal BCE + Dice as the main head).")
     p.add_argument("--select-metric", type=str, default=defaults.get("select_metric", "dice"),
                    choices=["dice", "f1"],
                    help="Which validation score picks the best checkpoint: 'dice' = the "
@@ -406,10 +416,12 @@ def main():
         unet_adapter_stages=args.unet_adapter_stages,
         unfreeze_backbone=args.unfreeze_backbone,
         use_recon=args.use_recon,
+        recon_change=args.recon_change,
     )
     print_architecture(mode=mode, backbone=args.backbone,
                        unfreeze_backbone=args.unfreeze_backbone,
-                       use_recon=args.use_recon)
+                       use_recon=args.use_recon,
+                       recon_change=args.recon_change)
 
     count_parameters(model)
 
@@ -482,6 +494,7 @@ def main():
         ckpt_name=args.ckpt_name,
         use_recon=args.use_recon,
         recon_weight=args.recon_weight,
+        recon_change_weight=(args.recon_change_weight if args.recon_change else 0.0),
     )
 
     print("Starting training...")
