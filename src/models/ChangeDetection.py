@@ -218,6 +218,24 @@ class ReconstructionDecoder(nn.Module):
             x = self.act(norm[domain](up(x)))
         return self.head_t1(x), self.head_t2(x)
 
+    def stream(self, x: torch.Tensor, domain: str, date: str) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Decode ONE date's own features into that date's image.
+
+        Used by the reconstruction-change branch: the SAME upsampling weights
+        decode date 1 and date 2, so the difference of their stage-1 features
+        reflects the two images rather than two differently-trained decoders.
+        Returns ``(image, stage1_features)``; ``date`` picks the output head.
+        """
+        if date not in ("t1", "t2"):
+            raise ValueError(f"date must be 't1' or 't2', got {date!r}")
+        stage1 = None
+        for i, (up, norm) in enumerate(zip(self.ups, self.norms)):
+            x = self.act(norm[domain](up(x)))
+            if i == 0:
+                stage1 = x
+        head = self.head_t1 if date == "t1" else self.head_t2
+        return head(x), stage1
+
 
 class UNetDecoder(nn.Module):
     """Shared trainable U-Net decoder; BatchNorm + residual adapters are per-domain.
@@ -232,6 +250,12 @@ class UNetDecoder(nn.Module):
     use_recon:
         If True, instantiates a bottleneck reconstruction decoder to reconstruct
         T1' and T2' from the fused bottleneck representation.
+    recon_change:
+        Requires ``use_recon``.  The reconstruction decoder instead decodes EACH
+        date from its own deepest encoder features (shared weights, run twice).
+        The difference of the two streams' stage-1 features (256 ch at H/16)
+        feeds (a) a change head, supervised against the mask, and (b) the U-Net
+        path: it is concatenated with up-stage 1's output before up-stage 2.
     """
 
     def __init__(
@@ -244,12 +268,18 @@ class UNetDecoder(nn.Module):
         adapter_dropout: float = 0.1,
         stage_channels: Optional[Dict[str, int]] = None,
         use_recon: bool = False,
+        recon_change: bool = False,
     ):
         super().__init__()
+        if recon_change and not use_recon:
+            raise ValueError("recon_change needs use_recon (it is built on the reconstruction decoder)")
         self.domain_list = list(domain_list)
         self.fusion_type = fusion_type
         self.use_attention = use_attention
         self.use_recon = use_recon
+        self.recon_change = recon_change
+        # Change logits from the reconstruction branch, refreshed every forward.
+        self.recon_change_logits: Optional[torch.Tensor] = None
 
         sc = stage_channels if stage_channels is not None else _RESNET_STAGE_CHANNELS
         mult = 4 if fusion_type == "abs_prod" else 3
@@ -265,16 +295,22 @@ class UNetDecoder(nn.Module):
             adapter_reduction=adapter_reduction, adapter_dropout=adapter_dropout,
         )
 
-        # Bottleneck reconstruction decoder: reconstructs T1' and T2'
+        # Bottleneck reconstruction decoder: reconstructs T1' and T2'.
+        # With recon_change it decodes each date's own l4 features instead of
+        # the fused bottleneck, so its input width is the encoder's l4 width.
+        recon_widths = (256, 128, 64, 32, 16)
         if use_recon:
-            self.recon_decoder = ReconstructionDecoder(512, domain_list, widths=(256, 128, 64, 32, 16))
+            recon_in = sc["l4"] if recon_change else 512
+            self.recon_decoder = ReconstructionDecoder(recon_in, domain_list, widths=recon_widths)
         else:
             self.recon_decoder = None
+        # Up-stage 2 also receives the reconstruction-branch change features.
+        up2_in = 256 + (recon_widths[0] if recon_change else 0)
 
         self.up_stages = nn.ModuleList([
             UNetUpStage(512, fused_channels["l3"], 256, domain_list, upsample_stride=2,
                         adapter_reduction=adapter_reduction, adapter_dropout=adapter_dropout),
-            UNetUpStage(256, fused_channels["l2"], 128, domain_list, upsample_stride=2,
+            UNetUpStage(up2_in, fused_channels["l2"], 128, domain_list, upsample_stride=2,
                         adapter_reduction=adapter_reduction, adapter_dropout=adapter_dropout),
             UNetUpStage(128, fused_channels["l1"], 64, domain_list, upsample_stride=2,
                         adapter_reduction=adapter_reduction, adapter_dropout=adapter_dropout),
@@ -288,25 +324,55 @@ class UNetDecoder(nn.Module):
         # steps take H/16 -> H, so the aux logits match the main head exactly
         # and no bilinear upsampling is needed.
         self.aux_decoder = AuxDecoder(256, domain_list, widths=(128, 64, 32, 16))
+        # Change head on the reconstruction branch's stage-1 difference features
+        # (256 ch at H/16), lifted to full resolution the same way as the aux head.
+        self.recon_change_head = (
+            AuxDecoder(recon_widths[0], domain_list, widths=(128, 64, 32, 16))
+            if recon_change else None
+        )
 
         prior_bias = math.log(prior / (1.0 - prior))
-        for head in (self.classifier, self.aux_decoder.classifier):
+        heads = [self.classifier, self.aux_decoder.classifier]
+        if self.recon_change_head is not None:
+            heads.append(self.recon_change_head.classifier)
+        for head in heads:
             nn.init.normal_(head.weight, std=0.01)
             nn.init.constant_(head.bias, prior_bias)
 
     def forward(
-        self, fused_skips: Dict[str, torch.Tensor], domain: str, return_recon: bool = False
+        self,
+        fused_skips: Dict[str, torch.Tensor],
+        domain: str,
+        return_recon: bool = False,
+        recon_inputs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         fused_l4 = self.attention(fused_skips["l4"])
         x = self.bottleneck(fused_l4, domain)
 
         recons = None
-        if self.use_recon and self.recon_decoder is not None:
+        rc_feat = None
+        self.recon_change_logits = None
+        if self.recon_change:
+            if recon_inputs is None:
+                raise ValueError("recon_change needs each date's deepest encoder features (recon_inputs)")
+            r1, s1 = self.recon_decoder.stream(recon_inputs[0], domain, "t1")
+            r2, s2 = self.recon_decoder.stream(recon_inputs[1], domain, "t2")
+            recons = (r1, r2)
+            rc_feat = torch.abs(s1 - s2)
+            self.recon_change_logits = self.recon_change_head(rc_feat, domain)
+        elif self.use_recon and self.recon_decoder is not None:
             recons = self.recon_decoder(x, domain)
 
         x = self.up_stages[0](x, domain, fused_skips["l3"])
         aux = self.aux_decoder(x, domain)
 
+        if rc_feat is not None:
+            if rc_feat.shape[-2:] != x.shape[-2:]:
+                raise ValueError(
+                    f"reconstruction stage-1 features {tuple(rc_feat.shape[-2:])} do not match "
+                    f"U-Net up-stage 1 output {tuple(x.shape[-2:])}"
+                )
+            x = torch.cat([x, rc_feat], dim=1)
         x = self.up_stages[1](x, domain, fused_skips["l2"])
         x = self.up_stages[2](x, domain, fused_skips["l1"])
         x = self.up_stages[3](x, domain)
@@ -475,16 +541,23 @@ class ChangeDetectionModel(nn.Module):
         decoder_adapter_dropout: float = 0.1,
         decoder: str = "unet",
         use_recon: bool = False,
+        recon_change: bool = False,
     ):
         super().__init__()
         if decoder not in ("unet", "segnet"):
             raise ValueError(f"decoder must be 'unet' or 'segnet', got {decoder!r}")
+        if recon_change and decoder != "unet":
+            raise ValueError("recon_change is implemented for the U-Net decoder only")
         self.backbone = backbone
         self.use_deep_supervision = use_deep_supervision
         self.fusion_type = fusion_type
         self.use_attention = use_attention
         self.decoder_type = decoder
         self.use_recon = use_recon
+        self.recon_change = recon_change
+        # Full-resolution change logits from the reconstruction branch (or None),
+        # refreshed on every forward; read by the trainer for its loss and scores.
+        self.recon_change_logits: Optional[torch.Tensor] = None
 
         if domain_list is None:
             domain_list = getattr(backbone, "domain_list", None)
@@ -524,6 +597,7 @@ class ChangeDetectionModel(nn.Module):
                 adapter_dropout=decoder_adapter_dropout,
                 stage_channels=backbone_sc,
                 use_recon=use_recon,
+                recon_change=recon_change,
             )
 
         # Fixed (structural) set of shared-parameter ids, decided once at
@@ -563,12 +637,18 @@ class ChangeDetectionModel(nn.Module):
             fused_l4 = build_bitemporal_fusion(f1, f2, fusion_type=self.fusion_type)
             logits, aux = self.decoder(fused_l4, idx1, idx2, sizes, domain)
             recons = None
+            self.recon_change_logits = None
         else:
             pyramid1 = self.backbone.extract_multiscale(img1, domain)
             pyramid2 = self.backbone.extract_multiscale(img2, domain)
             fused = self._fuse_pyramid(pyramid1, pyramid2)
+            # Each date's own deepest (adapted) encoder features, for the
+            # per-date reconstruction streams of the recon-change branch.
+            recon_inputs = (pyramid1["l4"], pyramid2["l4"]) if self.recon_change else None
             if return_recon:
-                logits, aux, recons = self.decoder(fused, domain, return_recon=True)
+                logits, aux, recons = self.decoder(
+                    fused, domain, return_recon=True, recon_inputs=recon_inputs
+                )
                 if recons is not None:
                     r1, r2 = recons
                     if r1.shape[-2:] != img1.shape[-2:]:
@@ -576,8 +656,16 @@ class ChangeDetectionModel(nn.Module):
                         r2 = F.interpolate(r2, size=img2.shape[-2:], mode="bilinear", align_corners=False)
                     recons = (r1, r2)
             else:
-                logits, aux = self.decoder(fused, domain, return_recon=False)
+                logits, aux = self.decoder(
+                    fused, domain, return_recon=False, recon_inputs=recon_inputs
+                )
                 recons = None
+            rc = self.decoder.recon_change_logits if self.recon_change else None
+            if rc is not None and rc.shape[-2:] != img1.shape[-2:]:
+                # The change head already emits full resolution; this only fires
+                # if the input size is not divisible by 32.
+                rc = F.interpolate(rc, size=img1.shape[-2:], mode="bilinear", align_corners=False)
+            self.recon_change_logits = rc
 
         # ``aux`` is returned in eval mode too, so the auxiliary head can be
         # scored as a standalone predictor alongside the main head.  It is
