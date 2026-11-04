@@ -1,4 +1,5 @@
-"""U-Net CD: frozen ResNet encoder + adapters, shared decoder with domain BatchNorm + residual adapters."""
+"""U-Net CD: frozen encoder (ResNet-50 or VGG-16) + per-domain adapters,
+shared decoder with domain BatchNorm + per-domain residual adapters."""
 
 from __future__ import annotations
 
@@ -9,8 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.models.adapter_resnet import STAGE_CHANNELS, ResidualAdapter
-from src.models.guided_adapter import ContextGuidedAdapter, routing_balance_loss
+from src.models.adapter_resnet import STAGE_CHANNELS as _RESNET_STAGE_CHANNELS, ResidualAdapter
 
 
 def build_bitemporal_fusion(f1: torch.Tensor, f2: torch.Tensor, fusion_type: str = "abs") -> torch.Tensor:
@@ -65,13 +65,7 @@ class CBAM(nn.Module):
 
 
 class DomainConvBlock(nn.Module):
-    """Shared conv + per-domain BatchNorm + ReLU + per-domain adapter.
-
-    The adapter is a plain ResidualAdapter by default.  With
-    ``adapter_type="guided"`` and a ``context_channels`` count it becomes a
-    ContextGuidedAdapter, conditioned on the encoder's change map for this
-    scale, which ``forward`` then expects as ``context``.
-    """
+    """Shared conv + per-domain BatchNorm + ReLU + per-domain residual adapter."""
 
     def __init__(
         self,
@@ -82,14 +76,8 @@ class DomainConvBlock(nn.Module):
         padding: int = 1,
         adapter_reduction: int = 16,
         adapter_dropout: float = 0.1,
-        adapter_type: str = "simple",
-        context_channels: int = 0,
-        num_experts: int = 4,
-        router_top_k: Optional[int] = 2,
-        router_temperature: float = 1.0,
     ):
         super().__init__()
-        self.guided = adapter_type == "guided" and context_channels > 0
         self.conv = nn.Conv2d(
             in_ch, out_ch, kernel_size=kernel_size, padding=padding, bias=False
         )
@@ -97,29 +85,14 @@ class DomainConvBlock(nn.Module):
             d: nn.BatchNorm2d(out_ch) for d in domain_list
         })
         self.act = nn.ReLU(inplace=True)
-        if self.guided:
-            self.adapters = nn.ModuleDict({
-                d: ContextGuidedAdapter(
-                    out_ch, context_channels, num_experts=num_experts,
-                    reduction=adapter_reduction, temperature=router_temperature,
-                    top_k=router_top_k,
-                )
-                for d in domain_list
-            })
-        else:
-            self.adapters = nn.ModuleDict({
-                d: ResidualAdapter(out_ch, reduction=adapter_reduction, dropout=adapter_dropout)
-                for d in domain_list
-            })
+        self.adapters = nn.ModuleDict({
+            d: ResidualAdapter(out_ch, reduction=adapter_reduction, dropout=adapter_dropout)
+            for d in domain_list
+        })
 
-    def forward(
-        self, x: torch.Tensor, domain: str, context: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, x: torch.Tensor, domain: str) -> torch.Tensor:
         x = self.act(self.norm[domain](self.conv(x)))
-        if self.guided and context is not None:
-            x, info = self.adapters[domain](x, context)
-            return x, info["routing_weights"]
-        return self.adapters[domain](x), None
+        return self.adapters[domain](x)
 
 
 class UNetUpStage(nn.Module):
@@ -134,35 +107,26 @@ class UNetUpStage(nn.Module):
         upsample_stride: int = 2,
         adapter_reduction: int = 16,
         adapter_dropout: float = 0.1,
-        adapter_type: str = "simple",
-        context_channels: int = 0,
-        num_experts: int = 4,
-        router_top_k: Optional[int] = 2,
-        router_temperature: float = 1.0,
     ):
         super().__init__()
         self.upconv = nn.ConvTranspose2d(
             in_ch, in_ch, kernel_size=upsample_stride, stride=upsample_stride
         )
         merge_in = in_ch + skip_ch if skip_ch > 0 else in_ch
-        block_kw = dict(
-            adapter_reduction=adapter_reduction, adapter_dropout=adapter_dropout,
-            adapter_type=adapter_type, context_channels=context_channels,
-            num_experts=num_experts, router_top_k=router_top_k,
-            router_temperature=router_temperature,
-        )
         self.merge_conv = nn.Sequential(
-            DomainConvBlock(merge_in, out_ch, domain_list, **block_kw),
-            DomainConvBlock(out_ch, out_ch, domain_list, **block_kw),
+            DomainConvBlock(
+                merge_in, out_ch, domain_list,
+                adapter_reduction=adapter_reduction, adapter_dropout=adapter_dropout,
+            ),
+            DomainConvBlock(
+                out_ch, out_ch, domain_list,
+                adapter_reduction=adapter_reduction, adapter_dropout=adapter_dropout,
+            ),
         )
 
     def forward(
-        self,
-        x: torch.Tensor,
-        domain: str,
-        skip: Optional[torch.Tensor] = None,
-        context: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        self, x: torch.Tensor, domain: str, skip: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         x = self.upconv(x)
         if skip is not None:
             if x.shape[-2:] != skip.shape[-2:]:
@@ -171,12 +135,9 @@ class UNetUpStage(nn.Module):
                     "Use an input size divisible by 32."
                 )
             x = torch.cat([x, skip], dim=1)
-        routing: List[torch.Tensor] = []
         for block in self.merge_conv:
-            x, r = block(x, domain, context)
-            if r is not None:
-                routing.append(r)
-        return x, routing
+            x = block(x, domain)
+        return x
 
 
 class AuxDecoder(nn.Module):
@@ -219,8 +180,59 @@ class AuxDecoder(nn.Module):
         return self.classifier(x)
 
 
+class ReconstructionDecoder(nn.Module):
+    """Bottleneck reconstruction decoder that reconstructs T1' and T2'.
+
+    Branching off from the bottleneck feature representation, this decoder
+    progressively upsamples (5 stages of stride-2 transposed convolutions)
+    and predicts reconstructed RGB images T1' and T2'.
+    Shared transposed convs + per-domain BatchNorm, mirroring DomainConvBlock.
+    """
+
+    def __init__(
+        self,
+        in_ch: int,
+        domain_list: Iterable[str],
+        widths: Tuple[int, ...] = (256, 128, 64, 32, 16),
+        out_channels: int = 3,
+    ):
+        super().__init__()
+        self.ups = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        ch = in_ch
+        for w in widths:
+            self.ups.append(
+                nn.ConvTranspose2d(ch, w, kernel_size=2, stride=2, bias=False)
+            )
+            self.norms.append(
+                nn.ModuleDict({d: nn.BatchNorm2d(w) for d in domain_list})
+            )
+            ch = w
+        self.act = nn.ReLU(inplace=True)
+        # Separate output heads for T1' and T2'
+        self.head_t1 = nn.Conv2d(ch, out_channels, kernel_size=3, padding=1)
+        self.head_t2 = nn.Conv2d(ch, out_channels, kernel_size=3, padding=1)
+
+    def forward(self, x: torch.Tensor, domain: str) -> Tuple[torch.Tensor, torch.Tensor]:
+        for up, norm in zip(self.ups, self.norms):
+            x = self.act(norm[domain](up(x)))
+        return self.head_t1(x), self.head_t2(x)
+
+
 class UNetDecoder(nn.Module):
-    """Shared trainable U-Net decoder; BatchNorm + residual adapters are per-domain."""
+    """Shared trainable U-Net decoder; BatchNorm + residual adapters are per-domain.
+
+    Parameters
+    ----------
+    stage_channels:
+        Dict mapping ``{"l1", "l2", "l3", "l4"}`` to the number of channels
+        produced by the backbone at each scale.  Defaults to ResNet-50 values
+        when not provided.  Pass ``VGGWithAdapters.STAGE_CHANNELS`` (or
+        equivalently ``vgg_adapter.STAGE_CHANNELS``) when using VGG-16.
+    use_recon:
+        If True, instantiates a bottleneck reconstruction decoder to reconstruct
+        T1' and T2' from the fused bottleneck representation.
+    """
 
     def __init__(
         self,
@@ -230,52 +242,42 @@ class UNetDecoder(nn.Module):
         use_attention: bool = False,
         adapter_reduction: int = 16,
         adapter_dropout: float = 0.1,
-        adapter_type: str = "simple",
-        num_experts: int = 4,
-        router_top_k: Optional[int] = 2,
-        router_temperature: float = 1.0,
-        use_deep_supervision: bool = True,
+        stage_channels: Optional[Dict[str, int]] = None,
+        use_recon: bool = False,
     ):
         super().__init__()
         self.domain_list = list(domain_list)
         self.fusion_type = fusion_type
         self.use_attention = use_attention
-        self.adapter_type = adapter_type
-        # Load-balancing loss over this decoder's guided routing, per forward.
-        self.routing_balance: Optional[torch.Tensor] = None
+        self.use_recon = use_recon
 
+        sc = stage_channels if stage_channels is not None else _RESNET_STAGE_CHANNELS
         mult = 4 if fusion_type == "abs_prod" else 3
-        fused_channels = {k: mult * STAGE_CHANNELS[k] for k in ("l1", "l2", "l3", "l4")}
+        fused_channels = {k: mult * sc[k] for k in ("l1", "l2", "l3", "l4")}
 
         if use_attention:
             self.attention = CBAM(fused_channels["l4"])
         else:
             self.attention = nn.Identity()
 
-        # Each decoder stage is conditioned on the change map of the pyramid
-        # level it works at: |f1 - f2| has STAGE_CHANNELS[level] channels and
-        # already matches that stage's spatial size.  Up-stage 4 runs at full
-        # resolution, where no change map exists, so it keeps simple adapters.
-        guided_kw = dict(
-            adapter_type=adapter_type, num_experts=num_experts,
-            router_top_k=router_top_k, router_temperature=router_temperature,
-        )
         self.bottleneck = DomainConvBlock(
             fused_channels["l4"], 512, domain_list, kernel_size=1, padding=0,
             adapter_reduction=adapter_reduction, adapter_dropout=adapter_dropout,
-            context_channels=STAGE_CHANNELS["l4"], **guided_kw,
         )
+
+        # Bottleneck reconstruction decoder: reconstructs T1' and T2'
+        if use_recon:
+            self.recon_decoder = ReconstructionDecoder(512, domain_list, widths=(256, 128, 64, 32, 16))
+        else:
+            self.recon_decoder = None
 
         self.up_stages = nn.ModuleList([
             UNetUpStage(512, fused_channels["l3"], 256, domain_list, upsample_stride=2,
-                        adapter_reduction=adapter_reduction, adapter_dropout=adapter_dropout,
-                        context_channels=STAGE_CHANNELS["l3"], **guided_kw),
+                        adapter_reduction=adapter_reduction, adapter_dropout=adapter_dropout),
             UNetUpStage(256, fused_channels["l2"], 128, domain_list, upsample_stride=2,
-                        adapter_reduction=adapter_reduction, adapter_dropout=adapter_dropout,
-                        context_channels=STAGE_CHANNELS["l2"], **guided_kw),
+                        adapter_reduction=adapter_reduction, adapter_dropout=adapter_dropout),
             UNetUpStage(128, fused_channels["l1"], 64, domain_list, upsample_stride=2,
-                        adapter_reduction=adapter_reduction, adapter_dropout=adapter_dropout,
-                        context_channels=STAGE_CHANNELS["l1"], **guided_kw),
+                        adapter_reduction=adapter_reduction, adapter_dropout=adapter_dropout),
             UNetUpStage(64, 0, 32, domain_list, upsample_stride=4,
                         adapter_reduction=adapter_reduction, adapter_dropout=adapter_dropout),
         ])
@@ -285,50 +287,33 @@ class UNetDecoder(nn.Module):
         # cheap transposed-conv stack back to full resolution.  Four stride-2
         # steps take H/16 -> H, so the aux logits match the main head exactly
         # and no bilinear upsampling is needed.
-        # Built only when deep supervision is on, so switching it off removes
-        # the branch entirely rather than computing and discarding it.
-        self.aux_decoder = (
-            AuxDecoder(256, domain_list, widths=(128, 64, 32, 16))
-            if use_deep_supervision else None
-        )
+        self.aux_decoder = AuxDecoder(256, domain_list, widths=(128, 64, 32, 16))
 
         prior_bias = math.log(prior / (1.0 - prior))
-        heads = [self.classifier]
-        if self.aux_decoder is not None:
-            heads.append(self.aux_decoder.classifier)
-        for head in heads:
+        for head in (self.classifier, self.aux_decoder.classifier):
             nn.init.normal_(head.weight, std=0.01)
             nn.init.constant_(head.bias, prior_bias)
 
     def forward(
-        self, fused_skips: Dict[str, torch.Tensor], domain: str
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        def change_map(level: str) -> torch.Tensor:
-            """The |f1 - f2| block of a fused skip (channels 2C..3C)."""
-            c = STAGE_CHANNELS[level]
-            return fused_skips[level][:, 2 * c:3 * c]
-
-        routing: List[torch.Tensor] = []
+        self, fused_skips: Dict[str, torch.Tensor], domain: str, return_recon: bool = False
+    ) -> Tuple[torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         fused_l4 = self.attention(fused_skips["l4"])
-        x, r = self.bottleneck(fused_l4, domain, change_map("l4"))
-        if r is not None:
-            routing.append(r)
+        x = self.bottleneck(fused_l4, domain)
 
-        x, r = self.up_stages[0](x, domain, fused_skips["l3"], change_map("l3"))
-        routing.extend(r)
-        aux = self.aux_decoder(x, domain) if self.aux_decoder is not None else None
+        recons = None
+        if self.use_recon and self.recon_decoder is not None:
+            recons = self.recon_decoder(x, domain)
 
-        x, r = self.up_stages[1](x, domain, fused_skips["l2"], change_map("l2"))
-        routing.extend(r)
-        x, r = self.up_stages[2](x, domain, fused_skips["l1"], change_map("l1"))
-        routing.extend(r)
-        x, _ = self.up_stages[3](x, domain)
+        x = self.up_stages[0](x, domain, fused_skips["l3"])
+        aux = self.aux_decoder(x, domain)
 
-        self.routing_balance = (
-            torch.stack([routing_balance_loss(w) for w in routing]).mean()
-            if routing else None
-        )
+        x = self.up_stages[1](x, domain, fused_skips["l2"])
+        x = self.up_stages[2](x, domain, fused_skips["l1"])
+        x = self.up_stages[3](x, domain)
+
         logits = self.classifier(x)
+        if return_recon:
+            return logits, aux, recons
         return logits, aux
 
     def domain_parameters(self, domain: str) -> list:
@@ -349,8 +334,134 @@ class UNetDecoder(nn.Module):
         return [p for p in self.parameters() if id(p) not in domain_param_ids]
 
 
+class SegNetDecoder(nn.Module):
+    """SegNet decoder (Badrinarayanan et al., TPAMI 2017), adapted to two dates.
+
+    Mirrors the VGG-16-BN encoder: five stages, deepest first, each starting
+    with max-unpooling at the positions recorded by the matching encoder pool,
+    followed by convs whose widths mirror VGG-16-BN (3, 3, 3, 2, 1 blocks; a
+    final 3x3 conv is the classifier).  No skip connections: the encoder
+    passes only pooling indices, which is what distinguishes SegNet from U-Net.
+
+    Bi-temporal adaptation:
+      - the two dates are fused once, at the deepest level, with the same
+        fusion as the U-Net decoder (concat[f1, f2, |f1-f2|]) and a 1x1 conv;
+      - each date has its own pooling indices, so every unpooling step is the
+        average of unpooling with date-1 and date-2 indices (neither date is
+        privileged).
+
+    Convs are shared; BatchNorm and residual adapters are per-domain
+    (DomainConvBlock), as in UNetDecoder.  The auxiliary head branches off the
+    first decoder stage (512 ch at H/16), the same position as UNetDecoder's.
+    """
+
+    # Block widths per decoder stage, deepest first.  The stage input width must
+    # equal the matching encoder pool's channels (512, 512, 256, 128, 64) so the
+    # unpooling indices line up; this mirror guarantees it.
+    _STAGES = (
+        (512, 512, 512),    # unpool encoder pool5: H/32 -> H/16
+        (512, 512, 256),    # unpool encoder pool4: H/16 -> H/8
+        (256, 256, 128),    # unpool encoder pool3: H/8  -> H/4
+        (128, 64),          # unpool encoder pool2: H/4  -> H/2
+        (64,),              # unpool encoder pool1: H/2  -> H   (+ classifier)
+    )
+
+    def __init__(
+        self,
+        domain_list: Iterable[str],
+        prior: float = 0.02,
+        fusion_type: str = "abs",
+        use_attention: bool = False,
+        adapter_reduction: int = 16,
+        adapter_dropout: float = 0.1,
+        in_channels: int = 512,
+    ):
+        super().__init__()
+        self.domain_list = list(domain_list)
+        self.fusion_type = fusion_type
+        self.use_attention = use_attention
+
+        mult = 4 if fusion_type == "abs_prod" else 3
+        fused_channels = mult * in_channels
+        self.attention = CBAM(fused_channels) if use_attention else nn.Identity()
+
+        blk = dict(adapter_reduction=adapter_reduction, adapter_dropout=adapter_dropout)
+        self.bottleneck = DomainConvBlock(
+            fused_channels, 512, domain_list, kernel_size=1, padding=0, **blk
+        )
+        self.stages = nn.ModuleList()
+        ch = 512
+        for widths in self._STAGES:
+            blocks = nn.ModuleList()
+            for w in widths:
+                blocks.append(DomainConvBlock(ch, w, domain_list, **blk))
+                ch = w
+            self.stages.append(blocks)
+
+        self.classifier = nn.Conv2d(ch, 1, kernel_size=3, padding=1)
+        self.aux_decoder = AuxDecoder(self._STAGES[0][-1], domain_list, widths=(128, 64, 32, 16))
+
+        prior_bias = math.log(prior / (1.0 - prior))
+        for head in (self.classifier, self.aux_decoder.classifier):
+            nn.init.normal_(head.weight, std=0.01)
+            nn.init.constant_(head.bias, prior_bias)
+
+    @staticmethod
+    def _unpool(x: torch.Tensor, idx_t1: torch.Tensor, idx_t2: torch.Tensor,
+                size: torch.Size) -> torch.Tensor:
+        if x.shape != idx_t1.shape or x.shape != idx_t2.shape:
+            raise ValueError(
+                f"decoder feature {tuple(x.shape)} does not match pooling indices "
+                f"{tuple(idx_t1.shape)}; use an input size divisible by 32"
+            )
+        # VGG-16-BN pools are all kernel 2, stride 2.
+        up1 = F.max_unpool2d(x, idx_t1, kernel_size=2, stride=2, output_size=size)
+        up2 = F.max_unpool2d(x, idx_t2, kernel_size=2, stride=2, output_size=size)
+        return 0.5 * (up1 + up2)
+
+    def forward(
+        self,
+        fused: torch.Tensor,
+        indices_t1: List[torch.Tensor],
+        indices_t2: List[torch.Tensor],
+        sizes: List[torch.Size],
+        domain: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not (len(indices_t1) == len(indices_t2) == len(sizes) == len(self.stages)):
+            raise ValueError("need pooling indices and sizes for all 5 encoder stages")
+        x = self.bottleneck(self.attention(fused), domain)
+        aux = None
+        for i, blocks in enumerate(self.stages):
+            k = len(self.stages) - 1 - i          # encoder stage to undo: 5,4,3,2,1
+            x = self._unpool(x, indices_t1[k], indices_t2[k], sizes[k])
+            for block in blocks:
+                x = block(x, domain)
+            if i == 0:
+                aux = self.aux_decoder(x, domain)
+        return self.classifier(x), aux
+
+    def domain_parameters(self, domain: str) -> list:
+        """Per-domain BatchNorm + adapters: every ModuleDict keyed by domain."""
+        params: list = []
+        for module in self.modules():
+            if isinstance(module, nn.ModuleDict) and domain in module:
+                params += list(module[domain].parameters())
+        return params
+
+    def shared_parameters(self) -> list:
+        domain_param_ids = {id(p) for d in self.domain_list for p in self.domain_parameters(d)}
+        return [p for p in self.parameters() if id(p) not in domain_param_ids]
+
+
 class ChangeDetectionModel(nn.Module):
-    """Bi-temporal U-Net CD: adapter encoder + shared decoder (domain BN + adapters)."""
+    """Bi-temporal U-Net CD: adapter encoder + shared decoder (domain BN + adapters).
+
+    Works with any backbone that exposes:
+      - ``extract_multiscale(img, domain) -> {"l1", "l2", "l3", "l4"}``
+      - ``domain_parameters(domain) -> List[Parameter]``
+      - ``domain_list: List[str]``
+      - ``STAGE_CHANNELS: Dict[str, int]``  (optional; falls back to ResNet-50)
+    """
 
     def __init__(
         self,
@@ -362,16 +473,18 @@ class ChangeDetectionModel(nn.Module):
         use_attention: bool = False,
         decoder_adapter_reduction: int = 16,
         decoder_adapter_dropout: float = 0.1,
-        decoder_adapter_type: str = "simple",
-        num_experts: int = 4,
-        router_top_k: Optional[int] = 2,
-        router_temperature: float = 1.0,
+        decoder: str = "unet",
+        use_recon: bool = False,
     ):
         super().__init__()
+        if decoder not in ("unet", "segnet"):
+            raise ValueError(f"decoder must be 'unet' or 'segnet', got {decoder!r}")
         self.backbone = backbone
         self.use_deep_supervision = use_deep_supervision
         self.fusion_type = fusion_type
         self.use_attention = use_attention
+        self.decoder_type = decoder
+        self.use_recon = use_recon
 
         if domain_list is None:
             domain_list = getattr(backbone, "domain_list", None)
@@ -381,21 +494,37 @@ class ChangeDetectionModel(nn.Module):
             )
         self.domain_list: List[str] = list(domain_list)
 
-        self.decoder = UNetDecoder(
-            self.domain_list,
-            prior=prior,
-            fusion_type=fusion_type,
-            use_attention=use_attention,
-            adapter_reduction=decoder_adapter_reduction,
-            adapter_dropout=decoder_adapter_dropout,
-            adapter_type=decoder_adapter_type,
-            num_experts=num_experts,
-            router_top_k=router_top_k,
-            router_temperature=router_temperature,
-            use_deep_supervision=use_deep_supervision,
-        )
-        # Mean routing-balance loss over encoder and decoder guided adapters.
-        self.routing_balance: Optional[torch.Tensor] = None
+        # Read stage_channels from the backbone class (VGG vs ResNet differ here)
+        backbone_sc: Optional[Dict[str, int]] = getattr(
+            type(backbone), "STAGE_CHANNELS", None
+        ) or getattr(backbone, "STAGE_CHANNELS", None)
+
+        if decoder == "segnet":
+            if not hasattr(backbone, "extract_with_indices"):
+                raise ValueError(
+                    "The SegNet decoder needs max-pool indices from the encoder; "
+                    "only the VGG-16-BN encoder (SegNetWithAdapters) provides them."
+                )
+            self.decoder = SegNetDecoder(
+                self.domain_list,
+                prior=prior,
+                fusion_type=fusion_type,
+                use_attention=use_attention,
+                adapter_reduction=decoder_adapter_reduction,
+                adapter_dropout=decoder_adapter_dropout,
+                in_channels=backbone_sc["l4"],
+            )
+        else:
+            self.decoder = UNetDecoder(
+                self.domain_list,
+                prior=prior,
+                fusion_type=fusion_type,
+                use_attention=use_attention,
+                adapter_reduction=decoder_adapter_reduction,
+                adapter_dropout=decoder_adapter_dropout,
+                stage_channels=backbone_sc,
+                use_recon=use_recon,
+            )
 
         # Fixed (structural) set of shared-parameter ids, decided once at
         # construction time. ``freeze_domain`` toggles ``requires_grad`` on
@@ -405,6 +534,14 @@ class ChangeDetectionModel(nn.Module):
         shared_ids = {id(p) for p in self.decoder.shared_parameters()}
         if getattr(self.backbone, "unfreeze_layer4", False):
             shared_ids |= {id(p) for p in self.backbone.layer4.parameters()}
+        if getattr(self.backbone, "unfreeze_backbone", False):
+            for stage in (getattr(self.backbone, "stage1", None),
+                          getattr(self.backbone, "stage2", None),
+                          getattr(self.backbone, "stage3", None),
+                          getattr(self.backbone, "stage4", None),
+                          getattr(self.backbone, "stage5", None)):
+                if stage is not None:
+                    shared_ids |= {id(p) for p in stage.parameters()}
         self._shared_param_ids = shared_ids
 
     def _fuse_pyramid(
@@ -416,22 +553,31 @@ class ChangeDetectionModel(nn.Module):
         }
 
     def forward(
-        self, img1: torch.Tensor, img2: torch.Tensor, domain: str
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        # Both timesteps go through the encoder together: change-guided
-        # adapters need x1 and x2 at the same point in the network.
-        pyramid1, pyramid2 = self.backbone.extract_multiscale_pair(img1, img2, domain)
-        fused = self._fuse_pyramid(pyramid1, pyramid2)
-
-        logits, aux = self.decoder(fused, domain)
-
-        parts = [
-            t for t in (
-                getattr(self.backbone, "routing_balance", None),
-                getattr(self.decoder, "routing_balance", None),
-            ) if t is not None
-        ]
-        self.routing_balance = torch.stack(parts).mean() if parts else None
+        self, img1: torch.Tensor, img2: torch.Tensor, domain: str, return_recon: bool = False
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]] | Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        if self.decoder_type == "segnet":
+            # SegNet: fuse the two dates at the deepest level only; the decoder
+            # upsamples with each date's pooling indices (no skip features).
+            f1, idx1, sizes = self.backbone.extract_with_indices(img1, domain)
+            f2, idx2, _ = self.backbone.extract_with_indices(img2, domain)
+            fused_l4 = build_bitemporal_fusion(f1, f2, fusion_type=self.fusion_type)
+            logits, aux = self.decoder(fused_l4, idx1, idx2, sizes, domain)
+            recons = None
+        else:
+            pyramid1 = self.backbone.extract_multiscale(img1, domain)
+            pyramid2 = self.backbone.extract_multiscale(img2, domain)
+            fused = self._fuse_pyramid(pyramid1, pyramid2)
+            if return_recon:
+                logits, aux, recons = self.decoder(fused, domain, return_recon=True)
+                if recons is not None:
+                    r1, r2 = recons
+                    if r1.shape[-2:] != img1.shape[-2:]:
+                        r1 = F.interpolate(r1, size=img1.shape[-2:], mode="bilinear", align_corners=False)
+                        r2 = F.interpolate(r2, size=img2.shape[-2:], mode="bilinear", align_corners=False)
+                    recons = (r1, r2)
+            else:
+                logits, aux = self.decoder(fused, domain, return_recon=False)
+                recons = None
 
         # ``aux`` is returned in eval mode too, so the auxiliary head can be
         # scored as a standalone predictor alongside the main head.  It is
@@ -445,6 +591,8 @@ class ChangeDetectionModel(nn.Module):
                 aux, size=img1.shape[-2:], mode="bilinear", align_corners=False
             )
 
+        if return_recon:
+            return logits, aux, recons
         return logits, aux
 
     def domain_parameters(self, domain: str) -> list:

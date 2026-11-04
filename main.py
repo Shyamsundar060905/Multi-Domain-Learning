@@ -5,6 +5,7 @@ import torch
 from torch.utils.data import DataLoader, RandomSampler
 
 from src.data.LEVIR_dataset import LEVIRDataset, list_image_names, verify_levir_splits
+from src.data.SYSU_dataset import SYSUDataset
 from src.data.WHU_dataset import WHUDataset
 from src.data.transforms import get_test_transform, get_train_transform
 from src.models.factory import build_change_detection_model, print_architecture
@@ -16,12 +17,6 @@ def build_parser(defaults=None):
     defaults = defaults or {}
     p = argparse.ArgumentParser(description="Multi-Domain Change Detection (per-domain adapters)")
     p.add_argument("--config", type=str, default=None)
-    p.add_argument("--model", type=str, default=defaults.get("model", "adapter"),
-                   choices=["adapter", "plain"],
-                   help="'adapter' = frozen ResNet50 + per-domain adapters + shared decoder "
-                        "with per-domain BatchNorm. 'plain' = the individual baseline: frozen "
-                        "ResNet50 + one ordinary trainable decoder, no per-domain parameters "
-                        "(single domain only).")
     p.add_argument("--epochs", type=int, default=defaults.get("epochs", 10))
     p.add_argument("--lr", type=float, default=defaults.get("lr", 1e-4))
     p.add_argument("--weight-decay", type=float, default=defaults.get("weight_decay", 1e-4))
@@ -85,11 +80,17 @@ def build_parser(defaults=None):
                         "or rotated (round_robin mode).")
     p.add_argument("--domains", type=str, nargs="+",
                    default=defaults.get("domains"),
-                   choices=["WHU", "LEVIR"],
-                   help="Datasets to train on (default: both). "
+                   choices=["WHU", "LEVIR", "SYSU"],
+                   help="Datasets to train on (default: WHU and LEVIR). "
                         "Use one name for uni-domain baselines, e.g. --domains WHU.")
     p.add_argument("--whu-dir", type=str, default=defaults.get("whu_dir", "./Data/WHU"))
     p.add_argument("--levir-dir", type=str, default=defaults.get("levir_dir", "./Data/LEVIR CD"))
+    p.add_argument("--sysu-dir", type=str, default=defaults.get("sysu_dir", "./Data/SYSU-CD"))
+    p.add_argument("--max-train-samples-per-domain", type=int,
+                   default=defaults.get("max_train_samples_per_domain"),
+                   help="Cap on training samples a domain contributes per epoch; a larger "
+                        "domain is randomly subsampled with a fresh draw every epoch. "
+                        "Default: no cap (each domain uses its full training set).")
     p.add_argument("--device", type=str, default=defaults.get("device", "cuda" if torch.cuda.is_available() else "cpu"),
                    help="Device to run on, e.g. cuda, cuda:0, cuda:7, or cpu.")
     p.add_argument("--fusion-type", type=str, default=defaults.get("fusion_type", "abs"),
@@ -106,37 +107,39 @@ def build_parser(defaults=None):
                    default=defaults.get("adapter_stages", ["layer1", "layer2", "layer3", "layer4"]),
                    choices=["layer1", "layer2", "layer3", "layer4"],
                    help="Stages in ResNet backbone to place adapters.")
-    p.add_argument("--adapter-type", type=str, default=defaults.get("adapter_type", "guided"),
-                   choices=["simple", "guided"],
-                   help="Encoder adapter. 'simple' = ResidualAdapter on each temporal stream "
-                        "independently; 'guided' = change-guided mixture-of-experts adapter "
-                        "that sees both timesteps and adapts them jointly.")
-    p.add_argument("--no-deep-supervision", dest="use_deep_supervision",
-                   action="store_false", default=defaults.get("use_deep_supervision", True),
-                   help="Remove the auxiliary head entirely: no AuxDecoder is built, no "
-                        "auxiliary loss, and nothing to distil from.")
-    p.add_argument("--decoder-adapter-type", type=str,
-                   default=defaults.get("decoder_adapter_type", "simple"),
-                   choices=["simple", "guided"],
-                   help="Decoder adapter. 'guided' conditions each decoder stage on the "
-                        "encoder's |f1-f2| change map at that scale; up-stage 4 runs at full "
-                        "resolution where no change map exists, so it keeps residual adapters.")
-    p.add_argument("--guided-granularity", type=str,
-                   default=defaults.get("guided_granularity", "stage"),
-                   choices=["stage", "block"],
-                   help="Guided adapters only: one per ResNet stage, or one after every "
-                        "bottleneck block ('block' is ~3.6x the parameters and far more "
-                        "activation memory).")
-    p.add_argument("--num-experts", type=int, default=defaults.get("num_experts", 4),
-                   help="Adapter experts per guided adapter.")
-    p.add_argument("--guided-reduction", type=int, default=defaults.get("guided_reduction", 16),
-                   help="Bottleneck reduction inside guided adapters (the reference code used 4).")
-    p.add_argument("--router-top-k", type=int, default=defaults.get("router_top_k", 2),
-                   help="Experts kept per sample. 0 = use all experts (dense routing).")
-    p.add_argument("--routing-balance-weight", type=float,
-                   default=defaults.get("routing_balance_weight", 0.01),
-                   help="Weight of the load-balancing loss that stops top-k routing collapsing "
-                        "onto a single expert. 0 disables it.")
+    p.add_argument("--backbone", type=str,
+                   default=defaults.get("backbone", "unet"),
+                   choices=["resnet50", "vgg16", "segnet", "unet", "unet_2conv"],
+                   help="'unet' (default) = VGG-16-BN encoder + U-Net decoder; 'segnet' = the "
+                        "same encoder + SegNet decoder (unpooling with pooling indices, no "
+                        "skips); 'unet_2conv' = 2-conv U-Net encoder from VGG-16-BN; "
+                        "'vgg16'; 'resnet50'.")
+    p.add_argument("--vgg-adapter-stages", type=str, nargs="+",
+                   default=defaults.get("vgg_adapter_stages", ["l1", "l2", "l3", "l4"]),
+                   choices=["l1", "l2", "l3", "l4"],
+                   help="VGG pyramid levels to insert adapters at (only used when --backbone=vgg16).")
+    p.add_argument("--segnet-adapter-stages", type=str, nargs="+",
+                   default=defaults.get("segnet_adapter_stages", ["l1", "l2", "l3", "l4"]),
+                   choices=["l1", "l2", "l3", "l4"],
+                   help="SegNet pyramid levels to insert adapters at (only used when --backbone=segnet).")
+    p.add_argument("--unet-adapter-stages", type=str, nargs="+",
+                   default=defaults.get("unet_adapter_stages", ["l1", "l2", "l3", "l4"]),
+                   choices=["l1", "l2", "l3", "l4"],
+                   help="Pyramid levels to insert adapters at (used with --backbone unet "
+                        "and unet_2conv).")
+    p.add_argument("--unfreeze-backbone", action="store_true",
+                   default=defaults.get("unfreeze_backbone", False),
+                   help="VGG-based encoders (vgg16, unet, segnet, unet_2conv): train every "
+                        "encoder weight, shared across domains, instead of freezing it. "
+                        "Use a separate --ckpt-dir so frozen-encoder checkpoints are kept.")
+    p.add_argument("--use-recon", dest="use_recon", action="store_true",
+                   default=defaults.get("use_recon", False),
+                   help="Enable bottleneck reconstruction decoder to reconstruct T1' and T2'.")
+    p.add_argument("--no-recon", dest="use_recon", action="store_false",
+                   help="Disable bottleneck reconstruction decoder.")
+    p.add_argument("--recon-weight", type=float,
+                   default=defaults.get("recon_weight", 0.5),
+                   help="Weight on the bottleneck reconstruction MSE loss.")
     p.add_argument("--select-metric", type=str, default=defaults.get("select_metric", "dice"),
                    choices=["dice", "f1"],
                    help="Which validation score picks the best checkpoint: 'dice' = the "
@@ -259,6 +262,66 @@ def _make_loaders(args):
         except Exception as e:
             print(f"[Warning] LEVIR loading failed: {e}")
 
+    if "SYSU" in requested:
+        try:
+            sysu_train = SYSUDataset(
+                root_dir=args.sysu_dir, split="train", transform=train_transform,
+                positive_only=args.positive_only, image_size=args.image_size,
+            )
+            sysu_val = SYSUDataset(
+                root_dir=args.sysu_dir, split="val", transform=test_transform,
+                image_size=args.image_size,
+            )
+            sysu_test = SYSUDataset(
+                root_dir=args.sysu_dir, split="test", transform=test_transform,
+                image_size=args.image_size,
+            )
+            train_loaders["SYSU"] = DataLoader(
+                sysu_train, batch_size=args.batch_size, shuffle=True,
+                num_workers=args.num_workers, pin_memory=True, drop_last=True,
+                persistent_workers=args.num_workers > 0,
+            )
+            eval_loaders["SYSU"] = DataLoader(
+                sysu_val, batch_size=args.batch_size, shuffle=False,
+                num_workers=args.num_workers,
+            )
+            test_loaders["SYSU"] = DataLoader(
+                sysu_test, batch_size=args.batch_size, shuffle=False,
+                num_workers=args.num_workers,
+            )
+            print(
+                f"SYSU loaded: {len(sysu_train)} train | "
+                f"{len(sysu_val)} val (eval each epoch) | "
+                f"{len(sysu_test)} test (final only)"
+            )
+        except Exception as e:
+            print(f"[Warning] SYSU loading failed: {e}")
+
+    missing = [d for d in requested if d not in train_loaders]
+    if missing:
+        # A requested dataset that failed to load must stop the run: otherwise
+        # it silently trains and reports on fewer domains than asked for.
+        raise SystemExit(f"Requested domain(s) failed to load: {missing} (see warnings above)")
+
+    cap = args.max_train_samples_per_domain
+    if cap is not None:
+        if args.balance_domain_samples and len(train_loaders) > 1:
+            raise SystemExit("--max-train-samples-per-domain and domain balancing both "
+                             "resample the training sets; use one or the other.")
+        for d, ld in list(train_loaders.items()):
+            n = len(ld.dataset)
+            if n <= cap:
+                continue
+            # Without replacement, re-drawn every epoch: over a run the whole
+            # training set is still seen, but each epoch has at most ``cap``.
+            train_loaders[d] = DataLoader(
+                ld.dataset, batch_size=args.batch_size,
+                sampler=RandomSampler(ld.dataset, replacement=False, num_samples=cap),
+                num_workers=args.num_workers, pin_memory=True, drop_last=True,
+                persistent_workers=args.num_workers > 0,
+            )
+            print(f"[cap] {d}: {n} train samples -> {cap} per epoch (fresh random draw each epoch)")
+
     if args.balance_domain_samples and len(train_loaders) > 1:
         train_loaders = _balance_domain_samples(train_loaders, args)
 
@@ -337,30 +400,28 @@ def main():
         unfreeze_layer4=args.unfreeze_layer4,
         use_attention=args.use_attention,
         adapter_stages=args.adapter_stages,
-        adapter_type=args.adapter_type,
-        guided_granularity=args.guided_granularity,
-        num_experts=args.num_experts,
-        guided_reduction=args.guided_reduction,
-        router_top_k=(args.router_top_k or None),
-        decoder_adapter_type=args.decoder_adapter_type,
-        use_deep_supervision=args.use_deep_supervision,
-        model_type=args.model,
+        backbone=args.backbone,
+        vgg_adapter_stages=args.vgg_adapter_stages,
+        segnet_adapter_stages=args.segnet_adapter_stages,
+        unet_adapter_stages=args.unet_adapter_stages,
+        unfreeze_backbone=args.unfreeze_backbone,
+        use_recon=args.use_recon,
     )
-    print_architecture(
-        mode=mode,
-        model_type=args.model,
-        adapter_type=args.adapter_type,
-        guided_granularity=args.guided_granularity,
-        num_experts=args.num_experts,
-        router_top_k=(args.router_top_k or None),
-        decoder_adapter_type=args.decoder_adapter_type,
-    )
+    print_architecture(mode=mode, backbone=args.backbone,
+                       unfreeze_backbone=args.unfreeze_backbone,
+                       use_recon=args.use_recon)
 
     count_parameters(model)
 
     domain_order = [d for d in args.domain_order if d in train_loaders]
     if not domain_order:
         domain_order = domain_list
+    # A loaded domain left out of domain_order would never be trained in the
+    # round-robin / sequential schedules (but would still be evaluated).
+    unordered = [d for d in domain_list if d not in domain_order]
+    if unordered:
+        domain_order = domain_order + unordered
+        print(f"[note] {unordered} not in --domain-order; appended -> {domain_order}")
 
     if args.pos_weight_per_domain:
         pos_weight_arg = {d: args.pos_weight for d in domain_list}
@@ -372,6 +433,14 @@ def main():
                 print(f"[warn] --pos-weight-per-domain entry {kv!r} references unknown domain; ignored.")
                 continue
             pos_weight_arg[d] = float(v)
+        given = {kv.split("=", 1)[0] for kv in args.pos_weight_per_domain}
+        unset = [d for d in domain_list if d not in given]
+        if unset:
+            raise SystemExit(
+                f"--pos-weight-per-domain has no value for {unset}. Add e.g. "
+                f"'{unset[0]}=<value>' (config key pos_weight_per_domain) rather than "
+                f"silently using --pos-weight {args.pos_weight}."
+            )
     else:
         # Sensible defaults tuned for WHU (~13% pos) vs LEVIR (~3% pos).
         # No per-domain values given: use the single --pos-weight for every
@@ -386,8 +455,10 @@ def main():
         train_loaders=train_loaders,
         eval_loaders=eval_loaders,
         test_loaders=test_loaders,
-        eval_domain_splits={"LEVIR": "val", "WHU": "val"},
-        test_domain_splits={"LEVIR": "test", "WHU": "test"},
+        # Every dataset is validated on its own val split (and only val splits
+        # choose the best checkpoint); test splits are used once, at the end.
+        eval_domain_splits={d: "val" for d in eval_loaders},
+        test_domain_splits={d: "test" for d in test_loaders},
         domain_list=domain_list,
         device=device,
         lr=args.lr,
@@ -400,7 +471,7 @@ def main():
         distill_alpha=args.distill_alpha,
         ewc_lambda=args.ewc_lambda,
         ewc_fisher_batches=args.ewc_fisher_batches,
-        routing_balance_weight=args.routing_balance_weight,
+        routing_balance_weight=0.0,  # no guided adapters on this branch
         schedule=args.schedule,
         domain_order=domain_order,
         scheduler_step_size=args.scheduler_step_size,
@@ -409,6 +480,8 @@ def main():
         select_metric=args.select_metric,
         ckpt_dir=args.ckpt_dir,
         ckpt_name=args.ckpt_name,
+        use_recon=args.use_recon,
+        recon_weight=args.recon_weight,
     )
 
     print("Starting training...")
