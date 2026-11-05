@@ -3,14 +3,16 @@
 
     python check_recon_change.py
 
-1. Builds the LEVIR model with and without --recon-change and checks the
-   parameter counts (the flag-off model must equal the individual LEVIR
-   reconstruction run's logged 24,957,544).
-2. Forward/backward: output shapes, gradient reaches every new part.
-3. The reconstruction-branch change signal is |s1 - s2|, so swapping the two
-   dates must give the same change logits.
-4. Runs the real main.main() for 1 epoch on tiny synthetic data, so the
-   trainer's new loss term and the "rchg aggregate" scores are exercised.
+1. Builds the LEVIR model for several --recon-change-stages choices and checks
+   the parameter counts (flag off must equal the individual LEVIR
+   reconstruction run's logged 24,957,544; stage 1 must equal the first
+   recon-change run's 26,213,721).
+2. Forward/backward with stages 1+2+3: shapes, gradient reaches every new part.
+3. The change signal is |date-1 features - date-2 features|, so swapping the
+   two dates must give the same change logits at every stage.
+4. Runs the real main.main() for 1 epoch on tiny synthetic data with stages
+   2 and 3, so the trainer's loss term and per-stage "rchg sK aggregate"
+   scores are exercised.
 """
 import contextlib
 import io
@@ -32,11 +34,11 @@ def check(cond, msg):
     ok = ok and bool(cond)
 
 
-def build(recon_change):
+def build(recon_change, stages=(1,)):
     torch.manual_seed(0)
     return factory.build_change_detection_model(
         ["LEVIR"], backbone="unet", unfreeze_backbone=True,
-        use_recon=True, recon_change=recon_change,
+        use_recon=True, recon_change=recon_change, recon_change_stages=stages,
     )
 
 
@@ -44,25 +46,40 @@ def count(m):
     return sum(p.numel() for p in m.parameters())
 
 
-print("=== 1. parameter counts ===")
-base, new = build(False), build(True)
-cb, cn = count(base), count(new)
-check(cb == 24_957_544, f"flag OFF: {cb:,} (individual LEVIR recon run logged 24,957,544)")
-check(cn == 26_213_721, f"flag ON:  {cn:,} (expected 26,213,721 = +1,256,177: change head 174,577 "
-                         f"+ wider up-stage 2 1,081,600)")
-check(base.decoder.recon_change_head is None and new.decoder.recon_change_head is not None,
-      "change head exists only with the flag")
-check(base.decoder.up_stages[1].upconv.in_channels == 256
-      and new.decoder.up_stages[1].upconv.in_channels == 512,
-      "up-stage 2 input: 256 without the flag, 256+256 with it")
-check(new.decoder.recon_decoder.ups[0].in_channels == 512,
-      "reconstruction decoder takes the encoder's l4 (512 ch) per date")
-dp = sum(p.numel() for p in domain_parameters(new, "LEVIR"))
-sp = sum(p.numel() for p in shared_parameters(new))
-check(dp + sp == cn, f"every parameter is either LEVIR-specific ({dp:,}) or shared ({sp:,})")
+# Expected counts, worked out by hand from the layer definitions:
+#   stage 1: head 174,577 + up-stage 2 widened 256->512 ch   1,081,600
+#   stage 2: head  43,249 + up-stage 3 widened 128->256 ch     270,464
+#   stage 3: head  10,353 + up-stage 4 widened  64->128 ch     215,104
+EXPECTED = {
+    None: 24_957_544,
+    (1,): 26_213_721,
+    (2,): 25_271_257,
+    (3,): 25_183_001,
+    (2, 3): 25_496_714,
+    (1, 2, 3): 26_752_891,
+}
+UP_IN_BASE = {1: 256, 2: 128, 3: 64}
+RECON_W = {1: 256, 2: 128, 3: 64}
 
-print("\n=== 2. forward / backward ===")
-m = new
+print("=== 1. parameter counts ===")
+for stages, exp in EXPECTED.items():
+    m = build(stages is not None, stages or (1,))
+    c = count(m)
+    label = "flag OFF" if stages is None else f"stages {list(stages)}"
+    check(c == exp, f"{label:15s} {c:,} (expected {exp:,})")
+    if stages is not None:
+        d = m.decoder
+        check(sorted(int(k) for k in d.recon_change_heads) == list(stages),
+              f"{label:15s} one change head per stage")
+        widths = {k: d.up_stages[k].upconv.in_channels for k in (1, 2, 3)}
+        want = {k: UP_IN_BASE[k] + (RECON_W[k] if k in stages else 0) for k in (1, 2, 3)}
+        check(widths == want, f"{label:15s} U-Net up-stage 2/3/4 inputs {widths}")
+        dp = sum(p.numel() for p in domain_parameters(m, "LEVIR"))
+        sp = sum(p.numel() for p in shared_parameters(m))
+        check(dp + sp == c, f"{label:15s} every parameter is LEVIR-specific or shared")
+
+print("\n=== 2. forward / backward, stages 1+2+3 ===")
+m = build(True, (1, 2, 3))
 x1, x2 = torch.randn(2, 3, 64, 64), torch.randn(2, 3, 64, 64)
 m.train()
 freeze_domain(m, "LEVIR")
@@ -72,8 +89,11 @@ check(tuple(logits.shape) == (2, 1, 64, 64), f"main logits {tuple(logits.shape)}
 check(aux is not None and tuple(aux.shape) == (2, 1, 64, 64), "aux logits at full resolution")
 check(recons is not None and all(tuple(r.shape) == (2, 3, 64, 64) for r in recons),
       "T1' and T2' reconstructions at full resolution")
-check(rc is not None and tuple(rc.shape) == (2, 1, 64, 64), "recon-change logits at full resolution")
-(logits.mean() + aux.mean() + rc.mean() + recons[0].mean() + recons[1].mean()).backward()
+check(isinstance(rc, dict) and sorted(rc) == [1, 2, 3]
+      and all(tuple(v.shape) == (2, 1, 64, 64) for v in rc.values()),
+      "recon-change logits for stages 1, 2, 3, each at full resolution")
+(logits.mean() + aux.mean() + sum(v.mean() for v in rc.values())
+ + recons[0].mean() + recons[1].mean()).backward()
 
 
 def has_grad(p):
@@ -81,9 +101,10 @@ def has_grad(p):
 
 
 d = m.decoder
-check(has_grad(d.recon_change_head.classifier.weight), "grad reaches the recon-change head")
-check(has_grad(d.recon_decoder.ups[0].weight), "grad reaches reconstruction stage 1")
-check(has_grad(d.up_stages[1].upconv.weight), "grad reaches the widened U-Net up-stage 2")
+for k in (1, 2, 3):
+    check(has_grad(d.recon_change_heads[str(k)].classifier.weight), f"grad reaches stage-{k} change head")
+    check(has_grad(d.recon_decoder.ups[k - 1].weight), f"grad reaches reconstruction stage {k}")
+    check(has_grad(d.up_stages[k].upconv.weight), f"grad reaches widened U-Net up-stage {k + 1}")
 check(has_grad(m.backbone.stage1[0].weight), "grad reaches the (trainable) encoder")
 check(has_grad(m.backbone.domain_adapters["LEVIR"]["l4"].up.weight), "grad reaches LEVIR encoder adapter")
 
@@ -91,12 +112,14 @@ print("\n=== 3. swapping the dates gives the same recon-change signal ===")
 m.eval()
 with torch.no_grad():
     m(x1, x2, "LEVIR")
-    a = m.recon_change_logits.clone()
+    a = {k: v.clone() for k, v in m.recon_change_logits.items()}
     m(x2, x1, "LEVIR")
-    b = m.recon_change_logits.clone()
-check(torch.allclose(a, b, atol=1e-5), f"max |difference| = {(a - b).abs().max().item():.2e}")
+    b = m.recon_change_logits
+for k in (1, 2, 3):
+    check(torch.allclose(a[k], b[k], atol=1e-5),
+          f"stage {k}: max |difference| = {(a[k] - b[k]).abs().max().item():.2e}")
 
-print("\n=== 4. real main.main(), 1 epoch, synthetic LEVIR data ===")
+print("\n=== 4. real main.main(), 1 epoch, synthetic LEVIR data, stages 2 3 ===")
 import main as M
 
 
@@ -119,20 +142,26 @@ M.LEVIRDataset = FakeLEVIR
 M.list_image_names = lambda root, split, image_subdir="A": [f"{split}_{i}" for i in range(4)]
 M.verify_levir_splits = lambda root, splits: None
 sys.argv = ["main.py", "--config", "configs/indiv_unet_recon_trainable_levir_rchg.json",
+            "--recon-change-stages", "2", "3",
             "--epochs", "1", "--device", "cpu", "--image-size", "64", "--batch-size", "2",
             "--num-workers", "0", "--ckpt-dir", tempfile.mkdtemp()]
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
     M.main()
 log = buf.getvalue()
-check("Recon-change loss:     ON (weight=0.5" in log, "trainer reports the recon-change loss (weight 0.5)")
-check("Recon-change:" in log, "architecture header shows the recon-change branch")
+check("Recon-change loss:     ON (weight=0.5, stages [2, 3]" in log,
+      "trainer reports the recon-change loss (weight 0.5, stages [2, 3])")
+check("Recon-change stage 2:" in log and "Recon-change stage 3:" in log
+      and "Recon-change stage 1:" not in log, "architecture header lists stages 2 and 3 only")
 check(re.search(r"rchg=[\d.]+x0\.5", log) is not None, "per-epoch summary includes rchg=...x0.5")
-check(re.search(r"\[LEVIR val\] rchg aggregate: F1=", log) is not None, "val prints rchg aggregate scores")
-check(re.search(r"\[LEVIR test\] rchg aggregate: F1=", log) is not None, "final test prints rchg aggregate scores")
-check(re.search(r"Trainable parameters:\s+26,213,721", log) is not None, "logged trainable params = 26,213,721")
+for split in ("val", "test"):
+    for k in (2, 3):
+        check(re.search(rf"\[LEVIR {split}\] rchg s{k} aggregate: F1=", log) is not None,
+              f"{split} prints rchg s{k} aggregate scores")
+check(re.search(r"Trainable parameters:\s+25,496,714", log) is not None,
+      "logged trainable params = 25,496,714")
 for line in log.splitlines():
-    if re.search(r"Recon|rchg|Trainable parameters|LEVIR test\] main aggregate", line):
+    if re.search(r"Recon|rchg s|Trainable parameters|LEVIR test\] main aggregate", line):
         print("  | " + line.strip())
 
 print("\nALL CHECKS PASSED" if ok else "\nSOME CHECKS FAILED")
