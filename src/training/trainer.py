@@ -362,8 +362,9 @@ class MultiDomainTrainer:
         if self.use_recon:
             print(f"Reconstruction loss:   ON (weight={self.recon_weight}, MSE + PSNR tracking)")
         if getattr(self.model, "recon_change", False):
-            print(f"Recon-change loss:     ON (weight={self.recon_change_weight}, "
-                  f"focal BCE + Dice vs the change mask)")
+            stages = getattr(getattr(self.model, "decoder", None), "recon_change_stages", ())
+            print(f"Recon-change loss:     ON (weight={self.recon_change_weight}, stages "
+                  f"{list(stages)}, focal BCE + Dice vs the change mask, mean over stages)")
         print(f"Distill alpha:         {self.distill_alpha}"
               f"{'  (off)' if self.distill_alpha <= 0 else ''}")
         if self.ewc_lambda > 0:
@@ -653,18 +654,22 @@ class MultiDomainTrainer:
                 raw_mse = 0.5 * (F.mse_loss(u_r1, u_img1) + F.mse_loss(u_r2, u_img2)).item()
                 psnr_val = 10.0 * math.log10(1.0 / max(raw_mse, 1e-10))
 
-        # Reconstruction-change branch: its change logits (full resolution) are
-        # supervised by the same focal BCE + Dice as the main head.
+        # Reconstruction-change branch: each exchange stage's change logits (full
+        # resolution) are supervised by the same focal BCE + Dice as the main
+        # head; the weight applies to the mean over stages.
         rchg_val = 0.0
         rc_logits = getattr(self.model, "recon_change_logits", None)
-        if rc_logits is not None and self.recon_change_weight > 0.0:
-            rc_loss = change_detection_loss(
-                rc_logits, mask,
-                pos_weight=self.pos_weight[domain],
-                gamma=self.focal_gamma,
-                dice_weight=self.dice_weight,
-                bce_weight=self.bce_weight,
-            )
+        if rc_logits and self.recon_change_weight > 0.0:
+            rc_loss = torch.stack([
+                change_detection_loss(
+                    lg, mask,
+                    pos_weight=self.pos_weight[domain],
+                    gamma=self.focal_gamma,
+                    dice_weight=self.dice_weight,
+                    bce_weight=self.bce_weight,
+                )
+                for lg in rc_logits.values()
+            ]).mean()
             loss = loss + self.recon_change_weight * rc_loss
             rchg_val = float(rc_loss.detach())
 
@@ -870,9 +875,9 @@ class MultiDomainTrainer:
         recon_count = 0
         n = 0
         # Running pixel counts for the aggregate (dataset-level) scores.
-        agg = {"main": [0.0, 0.0, 0.0, 0.0], "aux": [0.0, 0.0, 0.0, 0.0],
-               "rchg": [0.0, 0.0, 0.0, 0.0]}
-        has_rchg = False
+        agg = {"main": [0.0, 0.0, 0.0, 0.0], "aux": [0.0, 0.0, 0.0, 0.0]}
+        # Reconstruction-branch change heads, one pixel count per exchange stage.
+        agg_rchg: Dict[int, List[float]] = {}
         desc = f"{domain} {split_label}"
         if epoch is not None and total_epochs is not None:
             desc = f"{domain} {split_label} (ep {epoch}/{total_epochs})"
@@ -926,10 +931,10 @@ class MultiDomainTrainer:
                         agg["aux"][i] += v
 
                 rc_logits = getattr(self.model, "recon_change_logits", None)
-                if rc_logits is not None:
-                    has_rchg = True
-                    for i, v in enumerate(_confusion(rc_logits, mask)):
-                        agg["rchg"][i] += v
+                for stage, lg in (rc_logits or {}).items():
+                    counts = agg_rchg.setdefault(stage, [0.0, 0.0, 0.0, 0.0])
+                    for i, v in enumerate(_confusion(lg, mask)):
+                        counts[i] += v
                 n += 1
 
         if was_training:
@@ -974,10 +979,10 @@ class MultiDomainTrainer:
                 f"P={aux_agg['precision']:.4f}  R={aux_agg['recall']:.4f}"
             )
 
-        if has_rchg:
-            rc_agg = _aggregate_scores(*agg["rchg"])
+        for stage in sorted(agg_rchg):
+            rc_agg = _aggregate_scores(*agg_rchg[stage])
             print(
-                f"{indent}[{domain} {split_label}] rchg aggregate: "
+                f"{indent}[{domain} {split_label}] rchg s{stage} aggregate: "
                 f"F1={rc_agg['f1']:.4f}  IoU={rc_agg['iou']:.4f}  "
                 f"P={rc_agg['precision']:.4f}  R={rc_agg['recall']:.4f}"
             )

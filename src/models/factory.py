@@ -62,6 +62,7 @@ def build_change_detection_model(
     # --- bottleneck reconstruction decoder ---
     use_recon: bool = False,
     recon_change: bool = False,
+    recon_change_stages: Iterable[int] = (1,),
 ) -> ChangeDetectionModel:
     """Build a bi-temporal change-detection model with the requested backbone.
 
@@ -163,6 +164,7 @@ def build_change_detection_model(
         decoder=decoder,
         use_recon=use_recon,
         recon_change=recon_change,
+        recon_change_stages=recon_change_stages,
     )
     if device is not None:
         model = model.to(device)
@@ -179,6 +181,7 @@ def print_architecture(
     unfreeze_backbone: bool = False,
     use_recon: bool = False,
     recon_change: bool = False,
+    recon_change_stages: Iterable[int] = (1,),
 ) -> None:
     label = "Uni-domain" if mode == "uni" else "Multi-domain"
     vgg_bn = "frozen ImageNet VGG-16-BN (all 13 convs) + per-domain residual adapters (l1-l4)"
@@ -211,7 +214,11 @@ def print_architecture(
     if use_recon and recon_change:
         print("  Recon:   shared decoder run per date (T1' from date-1 l4, T2' from date-2 l4; "
               "MSE loss + PSNR eval)")
-        print("  Recon-change: |stage-1 date 1 - stage-1 date 2| (256 ch, H/16) -> change head "
-              "(supervised) + concatenated into U-Net before up-stage 2")
+        where = {1: "256 ch @ H/16 -> before up-stage 2",
+                 2: "128 ch @ H/8 -> before up-stage 3",
+                 3: "64 ch @ H/4 -> before up-stage 4"}
+        for k in sorted(set(int(s) for s in recon_change_stages)):
+            print(f"  Recon-change stage {k}: |date 1 - date 2| ({where.get(k, '?')}); "
+                  f"own supervised change head + concatenated into U-Net")
     elif use_recon:
         print("  Recon:   bottleneck decoder reconstructing T1' & T2' (MSE loss + PSNR eval)")

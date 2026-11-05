@@ -149,7 +149,14 @@ def build_parser(defaults=None):
     p.add_argument("--recon-change-weight", type=float,
                    default=defaults.get("recon_change_weight", 0.5),
                    help="Weight on the reconstruction-branch change loss "
-                        "(same focal BCE + Dice as the main head).")
+                        "(same focal BCE + Dice as the main head). With several "
+                        "--recon-change-stages, it weights the MEAN of their losses.")
+    p.add_argument("--recon-change-stages", type=int, nargs="+",
+                   default=defaults.get("recon_change_stages", [1]),
+                   choices=[1, 2, 3],
+                   help="Decoder stages that do the reconstruction->change exchange: "
+                        "1 = H/16 (into up-stage 2), 2 = H/8 (into up-stage 3), "
+                        "3 = H/4 (into up-stage 4). Default 1.")
     p.add_argument("--select-metric", type=str, default=defaults.get("select_metric", "dice"),
                    choices=["dice", "f1"],
                    help="Which validation score picks the best checkpoint: 'dice' = the "
@@ -417,11 +424,13 @@ def main():
         unfreeze_backbone=args.unfreeze_backbone,
         use_recon=args.use_recon,
         recon_change=args.recon_change,
+        recon_change_stages=args.recon_change_stages,
     )
     print_architecture(mode=mode, backbone=args.backbone,
                        unfreeze_backbone=args.unfreeze_backbone,
                        use_recon=args.use_recon,
-                       recon_change=args.recon_change)
+                       recon_change=args.recon_change,
+                       recon_change_stages=args.recon_change_stages)
 
     count_parameters(model)
 
