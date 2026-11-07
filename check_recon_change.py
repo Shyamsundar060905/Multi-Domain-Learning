@@ -164,32 +164,37 @@ for line in log.splitlines():
     if re.search(r"Recon|rchg s|Trainable parameters|LEVIR test\] main aggregate", line):
         print("  | " + line.strip())
 
-print("\n=== 5. three datasets, stage 3 (configs/rchg_s3_*.json) ===")
+print("\n=== 5. three datasets, stages 1+2+3 (configs/rchg_s123_*.json) ===")
 DOMS = ["LEVIR", "WHU", "SYSU"]
 torch.manual_seed(0)
 m3 = factory.build_change_detection_model(
     DOMS, backbone="unet", unfreeze_backbone=True,
-    use_recon=True, recon_change=True, recon_change_stages=(3,),
+    use_recon=True, recon_change=True, recon_change_stages=(1, 2, 3),
 )
-# Each extra dataset adds 137,008 of its own parameters: the 136,912 of the
-# reconstruction model plus 96 for its BatchNorm in the stage-3 change head.
+# Each extra dataset adds 137,712 of its own parameters: the 136,912 of the
+# reconstruction model plus 800 for its BatchNorms in the three change heads
+# (480 + 224 + 96).
 c3 = count(m3)
-check(c3 == 25_457_017, f"3 datasets: {c3:,} (expected 25,457,017 = 25,183,001 + 2 x 137,008)")
+check(c3 == 27_028_315, f"3 datasets: {c3:,} (expected 27,028,315 = 26,752,891 + 2 x 137,712)")
 per = {d: {id(p) for p in domain_parameters(m3, d)} for d in DOMS}
 for d in DOMS:
     n = sum(p.numel() for p in domain_parameters(m3, d))
-    check(n == 137_008, f"{d} has its own {n:,} parameters (expected 137,008)")
+    check(n == 137_712, f"{d} has its own {n:,} parameters (expected 137,712)")
 check(not (per["LEVIR"] & per["WHU"]) and not (per["LEVIR"] & per["SYSU"]) and not (per["WHU"] & per["SYSU"]),
       "no parameter belongs to two datasets")
-h = m3.decoder.recon_change_heads["3"]
-check(all(set(nm.keys()) == set(DOMS) for nm in h.norms), "stage-3 change head has a BatchNorm per dataset")
+heads = {k: m3.decoder.recon_change_heads[str(k)] for k in (1, 2, 3)}
+for k, h in heads.items():
+    check(all(set(nm.keys()) == set(DOMS) for nm in h.norms),
+          f"stage-{k} change head has a BatchNorm per dataset")
 check(all(set(nm.keys()) == set(DOMS) for nm in m3.decoder.recon_decoder.norms),
       "reconstruction decoder has a BatchNorm per dataset")
 m3.train()
 freeze_domain(m3, "WHU")
 lg, ax, rc3 = m3(x1, x2, "WHU", return_recon=True)
-(lg.mean() + ax.mean() + m3.recon_change_logits[3].mean() + rc3[0].mean() + rc3[1].mean()).backward()
-check(has_grad(h.norms[0]["WHU"].weight), "a WHU step trains WHU's change-head BatchNorm")
+(lg.mean() + ax.mean() + sum(v.mean() for v in m3.recon_change_logits.values())
+ + rc3[0].mean() + rc3[1].mean()).backward()
+for k, h in heads.items():
+    check(has_grad(h.norms[0]["WHU"].weight), f"a WHU step trains WHU's stage-{k} change-head BatchNorm")
 named = dict(m3.named_parameters())
 others = [p for nm_, p in named.items() if id(p) in per["LEVIR"] | per["SYSU"]]
 check(all(p.grad is None for p in others), "a WHU step leaves every LEVIR and SYSU parameter untouched")
@@ -197,14 +202,15 @@ check(all(p.grad is None for p in others), "a WHU step leaves every LEVIR and SY
 print("\n=== 6. real main.main(), 1 epoch, synthetic data, all three datasets ===")
 M.WHUDataset = FakeLEVIR
 M.SYSUDataset = FakeLEVIR
-sys.argv = ["main.py", "--config", "configs/rchg_s3_levir_whu_sysu.json",
+sys.argv = ["main.py", "--config", "configs/rchg_s123_levir_whu_sysu.json",
             "--epochs", "1", "--device", "cpu", "--image-size", "64", "--batch-size", "2",
             "--num-workers", "0", "--ckpt-dir", tempfile.mkdtemp()]
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
     M.main()
 log = buf.getvalue()
-check("Recon-change loss:     ON (weight=1.0, stages [3]" in log, "trainer: recon-change weight 1.0, stage 3")
+check("Recon-change loss:     ON (weight=1.0, stages [1, 2, 3]" in log,
+      "trainer: recon-change weight 1.0, stages 1, 2, 3")
 pw_line = next((l for l in log.splitlines() if l.startswith("Per-domain pos_weight:")), "")
 check(all(s in pw_line for s in ("'LEVIR': 10.0", "'WHU': 3.0", "'SYSU': 2.0")),
       f"pos_weight LEVIR 10 / WHU 3 / SYSU 2  ({pw_line.strip()})")
@@ -212,8 +218,10 @@ sel_line = next((l for l in log.splitlines() if l.startswith("Checkpoint selecti
 check(all(f"{d} val" in sel_line for d in DOMS) and "(aggregate F1)" in sel_line,
       f"checkpoint chosen on all three val splits ({sel_line.strip()})")
 for d in DOMS:
-    check(re.search(rf"\[{d} test\] rchg s3 aggregate: F1=", log) is not None, f"{d} test prints rchg s3 scores")
-check(re.search(r"Trainable parameters:\s+25,457,017", log) is not None, "logged trainable params = 25,457,017")
+    for k in (1, 2, 3):
+        check(re.search(rf"\[{d} test\] rchg s{k} aggregate: F1=", log) is not None,
+              f"{d} test prints rchg s{k} scores")
+check(re.search(r"Trainable parameters:\s+27,028,315", log) is not None, "logged trainable params = 27,028,315")
 for line in log.splitlines():
     if re.search(r"Recon-change|pos_weight|Checkpoint selection|Trainable parameters", line):
         print("  | " + line.strip())

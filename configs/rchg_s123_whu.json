@@ -26,9 +26,9 @@
   "recon_weight": 0.1,
   "recon_change": true,
   "recon_change_weight": 1.0,
-  "recon_change_stages": [3],
+  "recon_change_stages": [1, 2, 3],
   "select_metric": "f1",
-  "ckpt_dir": "checkpoints/rchg_s3_whu",
+  "ckpt_dir": "checkpoints/rchg_s123_whu",
   "whu_dir": "./Data/WHU",
   "levir_dir": "./Data/LEVIR CD",
   "sysu_dir": "./Data/SYSU-CD"
