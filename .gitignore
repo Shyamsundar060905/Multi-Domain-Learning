@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+# training outputs (tools/train.py, tools/train_md.py) and test.py change maps
+results*/
+snunet/
+*.log
