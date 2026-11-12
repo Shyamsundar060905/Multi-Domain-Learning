@@ -201,11 +201,11 @@ def trainValidateSegmentation(args):
     args.vis_dir = args.savedir + '/Vis/'
 
     if args.file_root == 'LEVIR':
-        args.file_root = 'H:\\penghaifeng\\LEVIR-CD'
+        args.file_root = '/home/23ucs712/mcd_data/LEVIR'
     elif args.file_root == 'BCDD':
-        args.file_root = 'H:\\penghaifeng\\BCDD'
+        args.file_root = '/home/23ucs712/mcd_data/WHU'
     elif args.file_root == 'SYSU':
-        args.file_root = 'H:\\penghaifeng\\SYSU-CD'
+        args.file_root = '/home/23ucs712/mcd_data/SYSU'
     elif args.file_root == 'CDD':
         args.file_root = '/home/guan/Documents/Datasets/ChangeDetection/CDD'
     elif args.file_root == 'quick_start':
@@ -370,7 +370,7 @@ if __name__ == '__main__':
     parser.add_argument('--step_loss', type=int, default=100, help='Decrease learning rate after how many epochs')
     parser.add_argument('--lr', type=float, default=5e-4, help='Initial learning rate')
     parser.add_argument('--lr_mode', default='poly', help='Learning rate policy, step or poly')
-    parser.add_argument('--savedir', default='H:\\penghaifeng\\A2Net-main2\\results', help='Directory to save the results')
+    parser.add_argument('--savedir', default='./results', help='Directory to save the results')
     parser.add_argument('--resume', default=True, help='Use this checkpoint to continue training | '
                                                        './results_ep100/checkpoint.pth.tar')
     parser.add_argument('--logFile', default='trainValLog.txt',
