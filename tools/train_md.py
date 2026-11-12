@@ -341,8 +341,10 @@ def main(argv=None):
         model.load_state_dict(ck['state_dict'])
         optimizer.load_state_dict(ck['optimizer'])
         start_epoch, best_mean, best_epoch = ck['epoch'], ck['best_mean'], ck['best_epoch']
-        print('=> resumed from %s: next epoch %d, best mean val F1 %.4f (epoch %d). '
-              'Batches restart in a new random order.' % (ckpt_path, start_epoch, best_mean, best_epoch))
+        print('=> resumed from %s: next epoch %d, best mean val F1 %.4f (epoch %d). Weights, optimizer and '
+              'learning-rate schedule continue exactly; the batch order, augmentations and dropout start '
+              'again from the seed, so this is not identical to an uninterrupted run.'
+              % (ckpt_path, start_epoch, best_mean, best_epoch))
 
     logger = open(os.path.join(savedir, args.logFile), 'a' if args.resume else 'w')
     if args.resume:
