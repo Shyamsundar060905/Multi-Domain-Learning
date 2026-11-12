@@ -54,8 +54,13 @@ SPLITS = ('train', 'val', 'test')
 # Same as tools/train.py (OpenCV reads BGR; ToTensor flips the channel order).
 MEAN = [0.406, 0.456, 0.485, 0.406, 0.456, 0.485]
 STD = [0.225, 0.224, 0.229, 0.225, 0.224, 0.229]
-PART_FLAGS = (('domain_bn', 'bn'), ('enc_adapters', 'enc'),
-              ('diff_adapters', 'diff'), ('dec_adapters', 'dec'))
+# Per-dataset parts: (option attribute, tag in the run name, what it is).
+PART_INFO = (
+    ('domain_bn', 'bn', 'BatchNorm layers (encoder + decoder)'),
+    ('enc_adapters', 'enc', 'adapters on the 5 encoder outputs'),
+    ('diff_adapters', 'diff', 'adapters on the 5 difference maps'),
+    ('dec_adapters', 'dec', 'adapters after the 12 decoder convs'),
+)
 
 
 def BCEDiceLoss(inputs, targets):
@@ -152,11 +157,51 @@ def train_epoch(args, model, optimizer, cycles, epoch, rounds_per_epoch, total_r
     return stats, lr
 
 
+def parts_tag(args):
+    """'bn-enc-diff-dec' style tag of the per-dataset parts that are on ('shared' if none)."""
+    tags = [tag for flag, tag, _ in PART_INFO if getattr(args, flag)]
+    return '-'.join(tags) if tags else 'shared'
+
+
+def run_label(args):
+    return '%s | %s' % ('-'.join(args.datasets), parts_tag(args))
+
+
 def run_dir(args):
-    parts = [tag for flag, tag in PART_FLAGS if getattr(args, flag)]
-    return '%s_%s_%s_iter_%d_lr_%s' % (args.savedir, '-'.join(args.datasets),
-                                       '-'.join(parts) if parts else 'shared',
+    return '%s_%s_%s_iter_%d_lr_%s' % (args.savedir, '-'.join(args.datasets), parts_tag(args),
                                        args.max_steps, str(args.lr))
+
+
+def describe(args, model, total_params, shared_params, per_dataset, sizes):
+    """Header lines saying what this run is (printed and written to the log)."""
+    bar = '=' * 78
+    lines = [bar, 'EXPERIMENT: ' + run_label(args), bar,
+             'Datasets: %s  (data root %s)' % (', '.join(args.datasets), args.data_root),
+             'Per-dataset parts (each dataset gets its own copy):',
+             '  %-5s  %-38s  %7s  %14s' % ('', 'part', 'modules', 'params/dataset')]
+    for flag, _, desc in PART_INFO:
+        on = getattr(args, flag)
+        lines.append('  %-5s  %-38s  %7s  %14s' % (
+            '[ON]' if on else '[off]', desc, len(model.parts[flag]) if on else '-',
+            '{:,}'.format(sizes[flag]) if on else '-'))
+    shared = "the base network's conv layers (encoder + decoder) and classifier"
+    if not args.domain_bn:
+        shared += ', and all its BatchNorm layers'
+    lines.append('Shared by all datasets: ' + shared)
+    if any(getattr(args, flag) for flag, _, _ in PART_INFO[1:]):
+        lines.append('Adapter: 1x1 conv down to max(C/%d, 8) channels -> BN -> ReLU -> 1x1 conv up '
+                     '(starts at zero) -> dropout %g, added to its input'
+                     % (args.adapter_reduction, args.adapter_dropout))
+    lines += [
+        'Parameters: total {:,} = shared {:,} + {} x {:,} per dataset'.format(
+            total_params, shared_params, len(args.datasets), per_dataset),
+        'Per-dataset parameters: {:,} ({})'.format(
+            per_dataset, ', '.join('{} {:,}'.format(k, v) for k, v in sizes.items())),
+        'Total network parameters (excluding idr): ' + str(total_params),
+        'Training: %dx%d input, batch %d per dataset, Adam lr %g (%s), BCE + Dice loss, seed %d'
+        % (args.inWidth, args.inHeight, args.batch_size, args.lr, args.lr_mode, args.seed),
+        bar]
+    return lines
 
 
 def parse_args(argv=None):
@@ -227,14 +272,8 @@ def main(argv=None):
     shared_params = sum(q.numel() for q in model.shared_parameters())
     sizes = model.part_sizes()
     per_dataset = sum(sizes.values())
-    print('Total network parameters (excluding idr): ' + str(total_params))
-    print('Datasets: %s  (data root %s)' % (', '.join(args.datasets), args.data_root))
-    print('Per-dataset parts: ' + ' | '.join(
-        '%s %s' % (flag, 'ON' if getattr(args, flag) else 'off') for flag, _ in PART_FLAGS))
-    print('Parameters: total {:,} = shared {:,} + {} x {:,} per dataset'.format(
-        total_params, shared_params, len(args.datasets), per_dataset))
-    print('Per-dataset parameters: {:,} ({})'.format(
-        per_dataset, ', '.join('{} {:,}'.format(k, v) for k, v in sizes.items())))
+    header = describe(args, model, total_params, shared_params, per_dataset, sizes)
+    print('\n'.join(header))
 
     train_tf = myTransforms.Compose([
         myTransforms.Normalize(mean=MEAN, std=STD),
@@ -306,12 +345,13 @@ def main(argv=None):
               'Batches restart in a new random order.' % (ckpt_path, start_epoch, best_mean, best_epoch))
 
     logger = open(os.path.join(savedir, args.logFile), 'a' if args.resume else 'w')
-    if not args.resume:
-        logger.write('Parameters: %d total, %d shared, %d per dataset\n'
-                     % (total_params, shared_params, per_dataset))
+    if args.resume:
+        logger.write('Resumed: next epoch %d\n' % start_epoch)
+    else:
+        logger.write('\n'.join(header) + '\n')
         logger.write('Config: %s\n' % config)
         logger.write('Epoch\tDataset\tKappa (val)\tIoU (val)\tF1 (val)\tR (val)\tP (val)\n')
-        logger.flush()
+    logger.flush()
 
     cycles = {d: Cycle(loaders[d]['train']) for d in args.datasets}
     for epoch in range(start_epoch, max_epochs):

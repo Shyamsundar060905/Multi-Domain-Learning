@@ -19,7 +19,8 @@ about a minute:
 6. Swapping date 1 and date 2 gives the same output.
 7. tools/train_md.py end to end on tiny synthetic data: two datasets with
    every part on, a refused re-run, --resume, and one dataset with every part
-   off.
+   off; the experiment header at the start says which parts are on and the
+   parameter counts.
 """
 import contextlib
 import copy
@@ -242,12 +243,17 @@ try:
           'two datasets: epoch = pass over the smaller set (4 rounds), 8 rounds = 8 steps per dataset')
     check('Per-dataset parameters: 74,160' in log, 'header: 74,160 parameters per dataset')
     check('Checkpoint selection: best mean val F1 over LEVIR, WHU' in log, 'header: selection on mean val F1')
+    rows_on = re.findall(r'^  \[ON\] ', log, re.M)
+    check('EXPERIMENT: LEVIR-WHU | bn-enc-diff-dec' in log and len(rows_on) == 4
+          and '[off]' not in log, 'header: experiment name, all 4 parts shown [ON]')
     check(all(re.search(r'\[%s\] Test :\t Kappa \(te\) = ' % d, log) for d in ('LEVIR', 'WHU'))
           and 'Mean test F1 over LEVIR, WHU:' in log, 'a Test line per dataset, plus the mean')
     rdir = os.path.join(tmp, 'results_md_LEVIR-WHU_bn-enc-diff-dec_iter_8_lr_0.0005')
     check(all(os.path.isfile(os.path.join(rdir, f)) for f in
               ('best_model.pth', 'checkpoint.pth.tar', 'trainValLog.txt')),
           'run folder has best_model.pth, checkpoint.pth.tar, trainValLog.txt')
+    with open(os.path.join(rdir, 'trainValLog.txt')) as f:
+        check('EXPERIMENT: LEVIR-WHU | bn-enc-diff-dec' in f.read(), 'trainValLog.txt starts with the experiment header')
     try:
         run(two)
         refused = False
@@ -262,9 +268,16 @@ try:
     tot = re.search(r'Total network parameters \(excluding idr\): (\d+)', log1)
     check(tot is not None and int(tot.group(1)) == base_total,
           'one dataset, every part off: %s parameters = BaseNet' % (tot.group(1) if tot else '?'))
+    rows_off = re.findall(r'^  \[off\] ', log1, re.M)
+    check('EXPERIMENT: LEVIR | shared' in log1 and len(rows_off) == 4 and '[ON]' not in log1,
+          'one dataset, every part off: header shows all 4 parts [off]')
+    print('\n  Start of a run (two datasets, every part on; then one dataset, every part off), '
+          'and its test lines:')
     for line in (log + log1).splitlines():
-        if re.search(r'Per-dataset|Parameters:|Schedule|Test :|Mean test', line):
-            print('  | ' + line.strip())
+        if re.search(r'^=+$|EXPERIMENT|^Datasets|Per-dataset|part  |\[ON\]|\[off\]|Shared by|Adapter:|'
+                     r'Parameters:|Total network|Training:|Schedule|Checkpoint selection|'
+                     r'Test :|Mean test', line):
+            print('  | ' + line.rstrip())
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
