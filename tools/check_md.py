@@ -17,10 +17,16 @@ about a minute:
    BatchNorm statistic unchanged and trains all of WHU's adapters.  Also shows
    that plain zero_grad() would NOT leave them unchanged.
 6. Swapping date 1 and date 2 gives the same output.
-7. tools/train_md.py end to end on tiny synthetic data: two datasets with
-   every part on, a refused re-run, --resume, and one dataset with every part
-   off; the experiment header at the start says which parts are on and the
-   parameter counts.
+7. Reconstruction task: the change map is exactly BaseNet's with the
+   reconstruction decoder added (the change path is untouched), every other
+   weight and the random stream are unchanged, the reconstruction loss reaches
+   the encoder but not the change decoder (and the change loss does not reach
+   the reconstruction decoder), parameter counts, per-dataset isolation, and
+   the PSNR helper exactly inverts the input normalisation.
+8. tools/train_md.py end to end on tiny synthetic data: two datasets with
+   every part on, a refused re-run, --resume, one dataset with every part
+   off, and one dataset with --recon; the experiment header at the start says
+   which parts are on and the parameter counts.
 """
 import contextlib
 import copy
@@ -199,7 +205,106 @@ with torch.no_grad():
 check(worst <= 1e-6, 'trained model, all 3 datasets: same output with the dates swapped '
       '(max |difference| %.1e)' % worst)
 
-print('\n=== 7. tools/train_md.py end to end (synthetic data, CPU) ===')
+print('\n=== 7. reconstruction task (--recon) ===')
+RECON_SHARED = 501760 + 870   # 5 transposed convs + the two 3x3 output convs
+RECON_BN = 992                # BatchNorm weight + bias: 2 x (256 + 128 + 64 + 32 + 16)
+mr = MultiDatasetNet(['LEVIR'], recon=True, base=copy.deepcopy(base))
+check(count(mr) - base_total == RECON_SHARED + RECON_BN == mr.recon_parameter_count() == 503622,
+      'one dataset: the reconstruction decoder adds {:,} parameters'.format(count(mr) - base_total))
+check(list(base.state_dict()) == [k for k in mr.state_dict() if not k.startswith('recon.')],
+      'every change-path tensor keeps its name and order; the only new ones are recon.*')
+for mode in ('eval', 'train'):
+    d = same_output(mr, base, 'LEVIR', mode)
+    check(d <= 1e-6, '%s mode: change map identical to BaseNet with the reconstruction decoder added '
+          '(max |difference| %.1e)' % (mode, d))
+mr.eval()
+with torch.no_grad():
+    plain = mr(x1, x2, 'LEVIR')
+    mask_r, (r1, r2) = mr(x1, x2, 'LEVIR', return_recon=True)
+check(torch.equal(plain, mask_r), 'the change map is the same whether or not the reconstructions are computed')
+check(tuple(r1.shape) == tuple(r2.shape) == tuple(x1.shape), "T1' and T2' have the input's shape (2, 3, 64, 64)")
+
+torch.manual_seed(1)
+a = quiet(MultiDatasetNet, DS, **ALL_ON)
+rng_a = torch.get_rng_state()
+torch.manual_seed(1)
+b = quiet(MultiDatasetNet, DS, recon=True, **ALL_ON)
+rng_b = torch.get_rng_state()
+torch.manual_seed(1)
+c = quiet(MultiDatasetNet, DS, recon=True)
+sa, sb = a.state_dict(), b.state_dict()
+check(torch.equal(rng_a, rng_b), 'reconstruction on or off: same random stream afterwards (same batches)')
+check(all(torch.equal(sa[k], sb[k]) for k in sa), 'reconstruction on or off: every other weight starts the same')
+check(torch.equal(b.recon.ups[0].weight, c.recon.ups[0].weight)
+      and torch.equal(b.recon.head_t2.weight, c.recon.head_t2.weight),
+      'the reconstruction decoder starts the same whichever other parts are on')
+
+
+def has_grad(module):
+    return any(q.grad is not None and q.grad.abs().sum().item() > 0 for q in module.parameters())
+
+
+mg = MultiDatasetNet(DS, recon=True, base=copy.deepcopy(base), **ALL_ON)
+mg.train()
+_, recons = mg(x1, x2, 'WHU', return_recon=True)
+mg.zero_grad(set_to_none=True)
+train_md.recon_mse(recons, x1, x2).backward()
+change_side = [q for n, q in mg.named_parameters() if n.startswith('swa.') or n.startswith('diff_adapters.')]
+check(all(q.grad is None for q in change_side),
+      'the reconstruction loss sends no gradient into the change decoder or the difference adapters')
+check(has_grad(mg.backbone.features[0]) and has_grad(mg.backbone.features[17]) and has_grad(mg.recon),
+      'the reconstruction loss trains the reconstruction decoder and reaches the shared encoder (first and last block)')
+mg.zero_grad(set_to_none=True)
+mask_g, _ = mg(x1, x2, 'WHU', return_recon=True)
+train_md.BCEDiceLoss(mask_g, target).backward()
+check(all(q.grad is None for q in mg.recon.parameters()),
+      'the change loss sends no gradient into the reconstruction decoder (both computed in one pass)')
+mg.zero_grad(set_to_none=True)
+
+per_r = sum(mg.part_sizes().values())
+shared_r = sum(q.numel() for q in mg.shared_parameters())
+check(len(mg.recon_bn) == 5 and mg.part_sizes()['recon_bn'] == RECON_BN and per_r == 74160 + RECON_BN
+      and count(mg) == count(md) + RECON_SHARED + len(DS) * RECON_BN and shared_r + len(DS) * per_r == count(mg),
+      'every part on + reconstruction, 3 datasets: 5 reconstruction BatchNorms per dataset; '
+      'total {:,} = shared {:,} + 3 x {:,}'.format(count(mg), shared_r, per_r))
+
+
+def rec_step(model, opt, dataset):
+    model.train()
+    mask, rec = model(x1, x2, dataset, return_recon=True)
+    loss = train_md.BCEDiceLoss(mask, target) + 0.1 * train_md.recon_mse(rec, x1, x2)
+    opt.zero_grad(set_to_none=True)
+    loss.backward()
+    opt.step()
+
+
+m = copy.deepcopy(mg)
+opt = torch.optim.Adam(m.parameters(), 5e-4, (0.9, 0.99), eps=1e-08, weight_decay=1e-4)
+rec_step(m, opt, 'LEVIR')
+rec_step(m, opt, 'SYSU')
+before = {k: v.clone() for k, v in m.state_dict().items()}
+rec_step(m, opt, 'WHU')
+after = m.state_dict()
+moved = [k for k in before if ('.per_dataset.LEVIR.' in k or '.per_dataset.SYSU.' in k)
+         and not torch.equal(before[k], after[k])]
+recon_moved = any(not torch.equal(before[k], after[k]) for k in after if k.startswith('recon.ups.'))
+check(not moved and recon_moved, 'with reconstruction: a WHU step changes no LEVIR/SYSU tensor (%d changed) '
+      'and trains the shared reconstruction convs' % len(moved))
+m.eval()
+with torch.no_grad():
+    worst = max(max_diff(m(x1, x2, d), m(x2, x1, d)) for d in DS)
+check(worst <= 1e-6, 'with reconstruction, trained: same change map with the dates swapped '
+      '(max |difference| %.1e)' % worst)
+
+img6 = np.random.RandomState(1).randint(0, 256, (8, 8, 6)).astype(np.uint8)
+t6, _ = train_md.myTransforms.Compose([train_md.myTransforms.Normalize(mean=train_md.MEAN, std=train_md.STD),
+                                       train_md.myTransforms.ToTensor()])(img6, np.zeros((8, 8), np.uint8))
+want = torch.from_numpy(img6[:, :, ::-1].astype(np.float32).transpose(2, 0, 1).copy() / 255.0)
+got = torch.cat([train_md.unnormalize(t6[None, 0:3].float()), train_md.unnormalize(t6[None, 3:6].float())], 1)[0]
+check(max_diff(got, want) <= 1e-5, "PSNR helper: unnormalising the inputs gives back the original [0, 1] RGB "
+      "pixels (max |difference| %.1e)" % max_diff(got, want))
+
+print('\n=== 8. tools/train_md.py end to end (synthetic data, CPU) ===')
 tmp = tempfile.mkdtemp(prefix='check_md_')
 rng = np.random.RandomState(0)
 
@@ -271,12 +376,31 @@ try:
     rows_off = re.findall(r'^  \[off\] ', log1, re.M)
     check('EXPERIMENT: LEVIR | shared' in log1 and len(rows_off) == 4 and '[ON]' not in log1,
           'one dataset, every part off: header shows all 4 parts [off]')
-    print('\n  Start of a run (two datasets, every part on; then one dataset, every part off), '
-          'and its test lines:')
-    for line in (log + log1).splitlines():
+    check('Reconstruction task: off' in log1 and 'Recon(tr)' not in log1 and 'PSNR' not in log1,
+          'without --recon: header says off; epoch and test lines as before')
+    rec = ['--datasets', 'LEVIR', '--recon'] + common
+    logr = run(rec)
+    check('EXPERIMENT: LEVIR | shared | recon 0.1' in logr and 'Reconstruction task: ON' in logr
+          and os.path.isdir(os.path.join(tmp, 'results_md_LEVIR_shared_rec0.1_iter_8_lr_0.0005')),
+          'with --recon: header says ON (weight 0.1); run folder results_md_LEVIR_shared_rec0.1_...')
+    check('Total network parameters (excluding idr): %d' % (base_total + 503622) in logr
+          and 'Parameters without the reconstruction decoder (what the change map uses): {:,}'.format(base_total)
+          in logr, 'with --recon: {:,} parameters in training, {:,} used for the change map'.format(
+              base_total + 503622, base_total))
+    check(re.search(r'Recon\(tr\) = \d+\.\d{4}\t PSNR\(val\) = -?\d+\.\d{2} dB', logr) is not None
+          and re.search(r'\[LEVIR\] Test :\t Kappa \(te\) = ', logr) is not None
+          and '[LEVIR] Test reconstruction: PSNR = ' in logr,
+          'with --recon: epoch lines add Recon(tr) and PSNR(val); test adds a PSNR line')
+    log_rr = run(rec + ['--resume'])
+    check('=> resumed from' in log_rr and '[LEVIR] Test reconstruction: PSNR = ' in log_rr,
+          'with --recon: --resume reloads the run and tests it')
+    print('\n  Start of a run (two datasets, every part on; one dataset, every part off; one dataset with '
+          '--recon), and its epoch and test lines:')
+    for line in (log + log1 + logr).splitlines():
         if re.search(r'^=+$|EXPERIMENT|^Datasets|Per-dataset|part  |\[ON\]|\[off\]|Shared by|Adapter:|'
-                     r'Parameters:|Total network|Training:|Schedule|Checkpoint selection|'
-                     r'Test :|Mean test', line):
+                     r'Reconstruction task|  decoder:|  loss:|  parameters:|without the reconstruction|'
+                     r'Parameters:|Total network|Training:|Schedule|Checkpoint selection|Recon\(tr\)|'
+                     r'Test :|Test reconstruction|Mean test', line):
             print('  | ' + line.rstrip())
 finally:
     shutil.rmtree(tmp, ignore_errors=True)

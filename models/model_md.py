@@ -16,13 +16,25 @@ per-dataset parts that can each be switched on:
 
 Everything else -- every conv weight and the final classifier -- is shared.
 
+Optional second task, ``recon``: a reconstruction decoder rebuilds each input
+image from that date's deepest encoder features (features[17], the same
+tensor the change path takes its deepest difference from).  It is a side
+branch: nothing flows from it into the change path, so the change map is
+computed exactly as without it; it only shapes the shared encoder through its
+loss, and it is not needed at test time.  Same design as the
+bottleneck-reconstruction branch's ReconstructionDecoder (5 stride-2
+transposed convs + BatchNorm + ReLU, a 3x3 output conv per date), run once per
+date with the same weights.  Its BatchNorms are per dataset when domain_bn is
+on.
+
 * With every switch off the network IS models.model.BaseNet: same modules,
   same parameter names, same outputs.
 * Every adapter's last 1x1 conv starts at zero, so with switches on the
   untrained network still gives BaseNet's outputs.
-* Creating the adapters does not change the random-number stream, so every
-  switch combination starts from the same shared weights and (same seed, same
-  datasets) trains on the same batches in the same order.
+* Creating the adapters or the reconstruction decoder does not change the
+  random-number stream, so every switch combination starts from the same
+  shared weights and (same seed, same datasets) trains on the same batches in
+  the same order.
 tools/check_md.py checks all of this.
 """
 import copy
@@ -41,6 +53,8 @@ CHANNELS = (16, 24, 32, 96, 320)
 PARTS = ('domain_bn', 'enc_adapters', 'diff_adapters', 'dec_adapters')
 # How many per-dataset modules each part must create (fail loudly otherwise).
 PART_MODULES = {'domain_bn': 63, 'enc_adapters': 5, 'diff_adapters': 5, 'dec_adapters': 12}
+# Reconstruction decoder stage widths (as on the bottleneck-reconstruction branch).
+RECON_WIDTHS = (256, 128, 64, 32, 16)
 
 
 class ResidualAdapter(nn.Module):
@@ -62,6 +76,36 @@ class ResidualAdapter(nn.Module):
 
     def forward(self, x):
         return x + self.dropout(self.up(self.act(self.bn(self.down(x)))))
+
+
+class ReconstructionDecoder(nn.Module):
+    """Rebuilds one date's image from that date's deepest encoder features.
+
+    As the bottleneck-reconstruction branch's ReconstructionDecoder: each stage
+    is a 2x2 stride-2 transposed conv (no bias) -> BatchNorm -> ReLU, so 5
+    stages take 1/32 size back to full size; then a 3x3 conv to RGB, with a
+    separate output conv for each date.  PyTorch's default initialisation.
+    """
+
+    def __init__(self, in_ch, widths=RECON_WIDTHS, out_channels=3):
+        super(ReconstructionDecoder, self).__init__()
+        self.ups = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        ch = in_ch
+        for w in widths:
+            self.ups.append(nn.ConvTranspose2d(ch, w, kernel_size=2, stride=2, bias=False))
+            self.norms.append(nn.BatchNorm2d(w))
+            ch = w
+        self.act = nn.ReLU(inplace=True)
+        self.head_t1 = nn.Conv2d(ch, out_channels, kernel_size=3, padding=1)
+        self.head_t2 = nn.Conv2d(ch, out_channels, kernel_size=3, padding=1)
+
+    def forward(self, x, date):
+        if date not in ('t1', 't2'):
+            raise ValueError("date must be 't1' or 't2', got %r" % (date,))
+        for up, norm in zip(self.ups, self.norms):
+            x = self.act(norm(up(x)))
+        return (self.head_t1 if date == 't1' else self.head_t2)(x)
 
 
 class PerDataset(nn.Module):
@@ -123,7 +167,8 @@ class MultiDatasetNet(nn.Module):
     """
 
     def __init__(self, datasets, domain_bn=False, enc_adapters=False, diff_adapters=False,
-                 dec_adapters=False, adapter_reduction=16, adapter_dropout=0.1, base=None):
+                 dec_adapters=False, adapter_reduction=16, adapter_dropout=0.1, base=None,
+                 recon=False):
         super(MultiDatasetNet, self).__init__()
         datasets = list(datasets)
         if not datasets or len(set(datasets)) != len(datasets):
@@ -162,6 +207,17 @@ class MultiDatasetNet(nn.Module):
                 block = getattr(self.swa, name)
                 block.double_conv, made = _with_adapters(block.double_conv, datasets, r, p)
                 self.parts['dec_adapters'] += made
+        self.recon = None
+        self.recon_bn = []
+        if recon:
+            # Same starting decoder whichever adapters are on.
+            torch.set_rng_state(rng)
+            self.recon = ReconstructionDecoder(CHANNELS[-1])
+            if domain_bn:
+                self.recon_bn = _per_dataset_batchnorms(self.recon, datasets)
+                if len(self.recon_bn) != len(RECON_WIDTHS):
+                    raise RuntimeError('reconstruction decoder: made %d per-dataset BatchNorms, expected %d'
+                                       % (len(self.recon_bn), len(RECON_WIDTHS)))
         torch.set_rng_state(rng)
 
         on = {'domain_bn': domain_bn, 'enc_adapters': enc_adapters,
@@ -172,7 +228,7 @@ class MultiDatasetNet(nn.Module):
                 raise RuntimeError('%s: made %d per-dataset modules, expected %d'
                                    % (part, len(mods), want))
         self.switches = on
-        self._per_dataset = [m for mods in self.parts.values() for m in mods]
+        self._per_dataset = [m for mods in self.parts.values() for m in mods] + self.recon_bn
 
     # ------------------------------------------------------------------
     def set_dataset(self, dataset):
@@ -211,7 +267,12 @@ class MultiDatasetNet(nn.Module):
         s2 = s.cat2(torch.cat([e2, d2, d1], dim=1))
         return s.cls(s2)
 
-    def forward(self, x1, x2, dataset):
+    def forward(self, x1, x2, dataset, return_recon=False):
+        """Change probability map; with ``return_recon`` also (T1', T2').
+
+        The change map is computed first and the same way either way; the
+        reconstruction decoder only reads each date's deepest features.
+        """
         self.set_dataset(dataset)
         f1 = self.encode(x1)
         f2 = self.encode(x2)
@@ -220,7 +281,12 @@ class MultiDatasetNet(nn.Module):
             c = [ad(ci) for ad, ci in zip(self.diff_adapters, c)]
         mask = self.decode(c)
         mask = F.interpolate(mask, scale_factor=(4, 4), mode='bilinear')
-        return torch.sigmoid(mask)
+        mask = torch.sigmoid(mask)
+        if not return_recon:
+            return mask
+        if self.recon is None:
+            raise RuntimeError('return_recon=True needs a model built with recon=True')
+        return mask, (self.recon(f1[-1], 't1'), self.recon(f2[-1], 't2'))
 
     # ------------------------------------------------------------------
     def dataset_parameters(self, dataset):
@@ -232,7 +298,14 @@ class MultiDatasetNet(nn.Module):
         return [q for q in self.parameters() if id(q) not in own]
 
     def part_sizes(self, dataset=None):
-        """Parameters of one dataset in each per-dataset part."""
+        """Parameters of one dataset in each per-dataset part (plus 'recon_bn' with recon)."""
         d = self.datasets[0] if dataset is None else dataset
+        groups = list(self.parts.items())
+        if self.recon is not None:
+            groups.append(('recon_bn', self.recon_bn))
         return OrderedDict((part, sum(q.numel() for m in mods for q in m.per_dataset[d].parameters()))
-                           for part, mods in self.parts.items())
+                           for part, mods in groups)
+
+    def recon_parameter_count(self):
+        """All reconstruction-decoder parameters (every dataset's BatchNorm copies included)."""
+        return 0 if self.recon is None else sum(q.numel() for q in self.recon.parameters())

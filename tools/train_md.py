@@ -30,7 +30,18 @@ Multi-dataset schedule
     zero_grad() (torch 1.8) the other datasets' parameters get zero gradients,
     and Adam keeps moving them through momentum and weight decay during this
     dataset's steps.
+
+Reconstruction task (--recon, weight --recon-weight, default 0.1)
+  * A second decoder rebuilds each date's input image from that date's
+    deepest encoder features (models/model_md.py).  The change path is not
+    modified; the reconstruction decoder is used for training only.
+  * Loss per batch: BCE + Dice (change) + w * 1/2 (MSE(T1', T1) + MSE(T2', T2)),
+    the MSE on the normalised input images, as on the bottleneck-reconstruction
+    branch.  "Train Loss" in the epoch lines stays the change loss alone;
+    Recon(tr) is the reconstruction MSE and PSNR(val) the validation PSNR on
+    [0, 1] images.  Checkpoint selection still uses the change F1 only.
 """
+import math
 import os
 import sys
 import time
@@ -54,6 +65,9 @@ SPLITS = ('train', 'val', 'test')
 # Same as tools/train.py (OpenCV reads BGR; ToTensor flips the channel order).
 MEAN = [0.406, 0.456, 0.485, 0.406, 0.456, 0.485]
 STD = [0.225, 0.224, 0.229, 0.225, 0.224, 0.229]
+# After ToTensor's flip each 3-channel half of the input is in RGB order.
+RGB_MEAN = MEAN[2::-1]
+RGB_STD = STD[2::-1]
 # Per-dataset parts: (option attribute, tag in the run name, what it is).
 PART_INFO = (
     ('domain_bn', 'bn', 'BatchNorm layers (encoder + decoder)'),
@@ -114,23 +128,51 @@ def binarize(output):
     return torch.where(output > 0.5, torch.ones_like(output), torch.zeros_like(output)).long()
 
 
+def recon_mse(recons, pre, post):
+    """Reconstruction loss: mean of the two dates' MSE on the normalised images."""
+    r1, r2 = recons
+    return 0.5 * (F.mse_loss(r1, pre) + F.mse_loss(r2, post))
+
+
+def unnormalize(t):
+    """Normalised RGB input -> [0, 1] image (for PSNR)."""
+    mean = t.new_tensor(RGB_MEAN).view(1, 3, 1, 1)
+    std = t.new_tensor(RGB_STD).view(1, 3, 1, 1)
+    return (t * std + mean).clamp(0.0, 1.0)
+
+
+def batch_psnr(recons, pre, post):
+    """PSNR (dB) of one batch on [0, 1] images, as on the bottleneck-reconstruction branch."""
+    r1, r2 = recons
+    raw = 0.5 * (F.mse_loss(unnormalize(r1), unnormalize(pre))
+                 + F.mse_loss(unnormalize(r2), unnormalize(post))).item()
+    return 10.0 * math.log10(1.0 / max(raw, 1e-10))
+
+
 @torch.no_grad()
-def evaluate(model, loader, dataset, device):
+def evaluate(model, loader, dataset, device, recon=False):
+    """Change loss, change scores, and (with recon) the mean PSNR over batches."""
     model.eval()
     meter = ConfuseMatrixMeter(n_class=2)
-    losses = []
+    losses, psnrs = [], []
     for img, target in loader:
         pre, post, target = to_device(img, target, device)
-        output = model(pre, post, dataset)
+        if recon:
+            output, recons = model(pre, post, dataset, return_recon=True)
+            psnrs.append(batch_psnr(recons, pre, post))
+        else:
+            output = model(pre, post, dataset)
         losses.append(BCEDiceLoss(output, target).item())
         meter.update_cm(pr=binarize(output).cpu().numpy(), gt=target.cpu().numpy())
-    return sum(losses) / len(losses), meter.get_scores()
+    psnr = sum(psnrs) / len(psnrs) if psnrs else None
+    return sum(losses) / len(losses), meter.get_scores(), psnr
 
 
 def train_epoch(args, model, optimizer, cycles, epoch, rounds_per_epoch, total_rounds, device):
     model.train()
     meters = {d: ConfuseMatrixMeter(n_class=2) for d in args.datasets}
     losses = {d: [] for d in args.datasets}
+    rec_losses = {d: [] for d in args.datasets}
     lr = None
     for r in range(rounds_per_epoch):
         cur = epoch * rounds_per_epoch + r
@@ -139,12 +181,19 @@ def train_epoch(args, model, optimizer, cycles, epoch, rounds_per_epoch, total_r
         for d in args.datasets:
             img, target = cycles[d].next()
             pre, post, target = to_device(img, target, device)
-            output = model(pre, post, d)
-            loss = BCEDiceLoss(output, target)
+            if args.recon:
+                output, recons = model(pre, post, d, return_recon=True)
+                cd_loss = BCEDiceLoss(output, target)
+                rec_loss = recon_mse(recons, pre, post)
+                loss = cd_loss + args.recon_weight * rec_loss
+                rec_losses[d].append(rec_loss.item())
+            else:
+                output = model(pre, post, d)
+                cd_loss = loss = BCEDiceLoss(output, target)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
-            losses[d].append(loss.item())
+            losses[d].append(cd_loss.item())
             with torch.no_grad():
                 meters[d].update_cm(pr=binarize(output).cpu().numpy(), gt=target.cpu().numpy())
         if r % 5 == 0:
@@ -153,7 +202,9 @@ def train_epoch(args, model, optimizer, cycles, epoch, rounds_per_epoch, total_r
             print('\rround: [%d/%d] lr: %.7f loss: %s time:%.3f h'
                   % (cur + 1, total_rounds, lr, last, left), end='')
     print()
-    stats = {d: (sum(losses[d]) / len(losses[d]), meters[d].get_scores()) for d in args.datasets}
+    stats = {d: (sum(losses[d]) / len(losses[d]), meters[d].get_scores(),
+                 sum(rec_losses[d]) / len(rec_losses[d]) if rec_losses[d] else None)
+             for d in args.datasets}
     return stats, lr
 
 
@@ -164,11 +215,13 @@ def parts_tag(args):
 
 
 def run_label(args):
-    return '%s | %s' % ('-'.join(args.datasets), parts_tag(args))
+    label = '%s | %s' % ('-'.join(args.datasets), parts_tag(args))
+    return label + (' | recon %g' % args.recon_weight if args.recon else '')
 
 
 def run_dir(args):
-    return '%s_%s_%s_iter_%d_lr_%s' % (args.savedir, '-'.join(args.datasets), parts_tag(args),
+    tag = parts_tag(args) + ('_rec%g' % args.recon_weight if args.recon else '')
+    return '%s_%s_%s_iter_%d_lr_%s' % (args.savedir, '-'.join(args.datasets), tag,
                                        args.max_steps, str(args.lr))
 
 
@@ -187,19 +240,39 @@ def describe(args, model, total_params, shared_params, per_dataset, sizes):
     shared = "the base network's conv layers (encoder + decoder) and classifier"
     if not args.domain_bn:
         shared += ', and all its BatchNorm layers'
+    if args.recon:
+        shared += '; the reconstruction decoder' + (' (except its BatchNorms)' if args.domain_bn else '')
     lines.append('Shared by all datasets: ' + shared)
     if any(getattr(args, flag) for flag, _, _ in PART_INFO[1:]):
         lines.append('Adapter: 1x1 conv down to max(C/%d, 8) channels -> BN -> ReLU -> 1x1 conv up '
                      '(starts at zero) -> dropout %g, added to its input'
                      % (args.adapter_reduction, args.adapter_dropout))
+    n_recon = model.recon_parameter_count()
+    if args.recon:
+        lines += [
+            "Reconstruction task: ON  (training only; the change path is unchanged and never uses it)",
+            "  decoder: each date's deepest encoder features (320 ch, 1/32 size) -> 5 x [2x2 up-conv -> BN -> "
+            "ReLU] (256, 128, 64, 32, 16 ch) -> 3x3 conv to RGB; one decoder run once per date, "
+            "one output conv per date",
+            "  loss: BCE + Dice (change) + %g x 1/2 (MSE(T1', T1) + MSE(T2', T2)) on the normalised images"
+            % args.recon_weight,
+            "  parameters: {:,} (BatchNorms {})".format(
+                n_recon, 'per dataset' if args.domain_bn else 'shared')]
+    else:
+        lines.append('Reconstruction task: off')
     lines += [
         'Parameters: total {:,} = shared {:,} + {} x {:,} per dataset'.format(
             total_params, shared_params, len(args.datasets), per_dataset),
         'Per-dataset parameters: {:,} ({})'.format(
             per_dataset, ', '.join('{} {:,}'.format(k, v) for k, v in sizes.items())),
-        'Total network parameters (excluding idr): ' + str(total_params),
-        'Training: %dx%d input, batch %d per dataset, Adam lr %g (%s), BCE + Dice loss, seed %d'
-        % (args.inWidth, args.inHeight, args.batch_size, args.lr, args.lr_mode, args.seed),
+        'Total network parameters (excluding idr): ' + str(total_params)]
+    if args.recon:
+        lines.append('Parameters without the reconstruction decoder (what the change map uses): {:,}'.format(
+            total_params - n_recon))
+    lines += [
+        'Training: %dx%d input, batch %d per dataset, Adam lr %g (%s), BCE + Dice loss%s, seed %d'
+        % (args.inWidth, args.inHeight, args.batch_size, args.lr, args.lr_mode,
+           ' + %g x reconstruction MSE' % args.recon_weight if args.recon else '', args.seed),
         bar]
     return lines
 
@@ -229,9 +302,15 @@ def parse_args(argv=None):
     p.add_argument('--dec-adapters', action='store_true', help='per-dataset adapters after the 12 decoder convs')
     p.add_argument('--adapter-reduction', type=int, default=16)
     p.add_argument('--adapter-dropout', type=float, default=0.1)
+    p.add_argument('--recon', action='store_true',
+                   help='add the reconstruction task (a second decoder rebuilds each date; training only)')
+    p.add_argument('--recon-weight', type=float, default=0.1,
+                   help='weight of the reconstruction MSE (with --recon)')
     args = p.parse_args(argv)
     if len(set(args.datasets)) != len(args.datasets):
         p.error('--datasets lists a dataset twice')
+    if args.recon and not args.recon_weight > 0:
+        p.error('--recon-weight must be > 0')
     args.data_root = os.path.expanduser(args.data_root)
     return args
 
@@ -251,7 +330,7 @@ def main(argv=None):
     model = MultiDatasetNet(args.datasets, domain_bn=args.domain_bn,
                             enc_adapters=args.enc_adapters, diff_adapters=args.diff_adapters,
                             dec_adapters=args.dec_adapters, adapter_reduction=args.adapter_reduction,
-                            adapter_dropout=args.adapter_dropout)
+                            adapter_dropout=args.adapter_dropout, recon=args.recon)
 
     savedir = run_dir(args)
     if os.path.isdir(savedir) and not args.resume:
@@ -327,6 +406,8 @@ def main(argv=None):
         'batch_size': args.batch_size, 'lr': args.lr, 'lr_mode': args.lr_mode,
         'inWidth': args.inWidth, 'inHeight': args.inHeight, 'seed': args.seed,
     }
+    if args.recon:  # only then, so runs from before --recon existed still resume
+        config['recon_weight'] = args.recon_weight
     ckpt_path = os.path.join(savedir, 'checkpoint.pth.tar')
     best_path = os.path.join(savedir, 'best_model.pth')
     start_epoch, best_mean, best_epoch = 0, 0.0, -1
@@ -352,7 +433,8 @@ def main(argv=None):
     else:
         logger.write('\n'.join(header) + '\n')
         logger.write('Config: %s\n' % config)
-        logger.write('Epoch\tDataset\tKappa (val)\tIoU (val)\tF1 (val)\tR (val)\tP (val)\n')
+        logger.write('Epoch\tDataset\tKappa (val)\tIoU (val)\tF1 (val)\tR (val)\tP (val)%s\n'
+                     % ('\tPSNR (val)' if args.recon else ''))
     logger.flush()
 
     cycles = {d: Cycle(loaders[d]['train']) for d in args.datasets}
@@ -364,12 +446,13 @@ def main(argv=None):
         if epoch == 0:
             continue  # tools/train.py does not validate after epoch 0
 
-        val = {d: evaluate(model, loaders[d]['val'], d, device) for d in args.datasets}
+        val = {d: evaluate(model, loaders[d]['val'], d, device, recon=args.recon) for d in args.datasets}
         mean_f1 = float(np.mean([val[d][1]['F1'] for d in args.datasets]))
         for d in args.datasets:
             s = val[d][1]
-            logger.write('%d\t%s\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\n'
-                         % (epoch, d, s['Kappa'], s['IoU'], s['F1'], s['recall'], s['precision']))
+            logger.write('%d\t%s\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f%s\n'
+                         % (epoch, d, s['Kappa'], s['IoU'], s['F1'], s['recall'], s['precision'],
+                            '\t%.2f' % val[d][2] if args.recon else ''))
         logger.write('%d\tmean F1\t\t\t%.4f\n' % (epoch, mean_f1))
         logger.flush()
 
@@ -385,8 +468,10 @@ def main(argv=None):
         print('Epoch No. %d:\tmean F1(val) = %.4f\t(best %.4f @ epoch %d)%s'
               % (epoch, mean_f1, best_mean, best_epoch, note))
         for d in args.datasets:
-            print('    %-5s\tTrain Loss = %.4f\tVal Loss = %.4f\t F1(tr) = %.4f\t F1(val) = %.4f'
-                  % (d, stats[d][0], val[d][0], stats[d][1]['F1'], val[d][1]['F1']))
+            print('    %-5s\tTrain Loss = %.4f\tVal Loss = %.4f\t F1(tr) = %.4f\t F1(val) = %.4f%s'
+                  % (d, stats[d][0], val[d][0], stats[d][1]['F1'], val[d][1]['F1'],
+                     '\t Recon(tr) = %.4f\t PSNR(val) = %.2f dB' % (stats[d][2], val[d][2])
+                     if args.recon else ''))
         if device.type == 'cuda':
             torch.cuda.empty_cache()
 
@@ -396,12 +481,15 @@ def main(argv=None):
     print('\nTesting the best checkpoint: epoch %d, mean val F1 %.4f' % (best_epoch, best_mean))
     test_f1 = []
     for d in args.datasets:
-        _, s = evaluate(model, loaders[d]['test'], d, device)
+        _, s, psnr = evaluate(model, loaders[d]['test'], d, device, recon=args.recon)
         test_f1.append(s['F1'])
         print('[%s] Test :\t Kappa (te) = %.4f\t IoU (te) = %.4f\t F1 (te) = %.4f\t R (te) = %.4f\t P (te) = %.4f'
               % (d, s['Kappa'], s['IoU'], s['F1'], s['recall'], s['precision']))
         logger.write('Test\t%s\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\n'
                      % (d, s['Kappa'], s['IoU'], s['F1'], s['recall'], s['precision']))
+        if args.recon:
+            print('[%s] Test reconstruction: PSNR = %.2f dB' % (d, psnr))
+            logger.write('Test\t%s\tPSNR\t%.2f\n' % (d, psnr))
     print('Mean test F1 over %s: %.4f' % (', '.join(args.datasets), float(np.mean(test_f1))))
     logger.write('Test\tmean F1\t\t\t%.4f\n' % float(np.mean(test_f1)))
     logger.close()
