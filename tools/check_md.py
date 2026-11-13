@@ -25,8 +25,8 @@ about a minute:
    the PSNR helper exactly inverts the input normalisation.
 8. Fusion: the widened change-decoder conv keeps its original weights and
    starts the new ones at zero (untrained change map = BaseNet's), nothing
-   else changes, parameter counts, which losses reach which parts, the
-   date-swap symmetry, stages 1-3 with every part on, per-dataset isolation,
+   else changes, parameter counts, the change map alone does not run the
+   training-only parts, which losses reach which parts, the date-swap symmetry, stages 1-3 with every part on, per-dataset isolation,
    and fusion without reconstruction is refused.
 9. tools/train_md.py end to end on tiny synthetic data: two datasets with
    every part on, a refused re-run, --resume, one dataset with every part
@@ -353,6 +353,19 @@ with torch.no_grad():
 check(torch.equal(plain_f, mask_f) and list(aux_f['heads']) == [2]
       and tuple(aux_f['heads'][2].shape) == (2, 1, 64, 64),
       'the change map is the same with or without the extra outputs; one stage-2 head map at full size')
+calls = []
+hooks = [mod.register_forward_hook(lambda *_: calls.append(1))
+         for mod in (mf.recon.ups[2], mf.recon.head_t1, mf.recon.head_t2, mf.fusion_heads['2'])]
+with torch.no_grad():
+    mf(x1, x2, 'LEVIR')
+    n_plain = len(calls)
+    mf(x1, x2, 'LEVIR', return_aux=True)
+    n_aux = len(calls) - n_plain
+for h in hooks:
+    h.remove()
+check(n_plain == 0 and n_aux == 5,
+      'the change map alone runs only reconstruction stages 1-2: stage 3, the RGB outputs and the fusion head '
+      'are not run (%d calls); with the extra outputs they are (%d calls)' % (n_plain, n_aux))
 
 mf.train()
 mf.zero_grad(set_to_none=True)
@@ -523,6 +536,13 @@ try:
         except SystemExit:
             refused_f = True
     check(refused_f, '--fusion-stages without --recon is refused')
+    a_def = train_md.parse_args(['--datasets', 'LEVIR', '--recon'] + common)
+    a_seed = train_md.parse_args(['--datasets', 'LEVIR', '--recon', '--seed', '7'] + common)
+    check(train_md.run_dir(a_def) == os.path.join(tmp, 'results_md_LEVIR_shared_rec0.1_iter_8_lr_0.0005')
+          and train_md.run_dir(a_seed) == os.path.join(tmp, 'results_md_LEVIR_shared_rec0.1_seed7_iter_8_lr_0.0005')
+          and train_md.run_label(a_seed) == 'LEVIR | shared | recon 0.1 | seed 7',
+          'run folder: the default seed keeps the name it always had; --seed 7 adds _seed7, so repeats '
+          'with other seeds do not collide')
 
     # A new run that stops before its first checkpoint removes its run folder; later stops keep it.
     real_epoch = train_md.train_epoch

@@ -51,6 +51,9 @@ Fusion (--fusion-stages 1/2/3, needs --recon)
     branch.  Head(tr) in the epoch lines is that head loss.
 
 Run folder
+  * Named after the datasets, the per-dataset parts, the reconstruction weight,
+    the fusion stages, --max_steps and --lr; a --seed other than 2333 adds
+    _seed<N>, so repeats with different seeds do not collide.
   * A new run refuses to start if its folder exists (add --resume to continue
     it).  A new run that stops before its first checkpoint (saved after
     epoch 1) -- an error such as a full GPU, or Ctrl+C -- removes its folder
@@ -77,6 +80,7 @@ from models.model_md import MultiDatasetNet  # noqa: E402
 
 DATASETS = ('LEVIR', 'WHU', 'SYSU')
 SPLITS = ('train', 'val', 'test')
+DEFAULT_SEED = 2333  # tools/train.py's seed
 # Same as tools/train.py (OpenCV reads BGR; ToTensor flips the channel order).
 MEAN = [0.406, 0.456, 0.485, 0.406, 0.456, 0.485]
 STD = [0.225, 0.224, 0.229, 0.225, 0.224, 0.229]
@@ -223,6 +227,7 @@ def train_epoch(args, model, optimizer, cycles, epoch, rounds_per_epoch, total_r
             print('\rround: [%d/%d] lr: %.7f loss: %s time:%.3f h'
                   % (cur + 1, total_rounds, lr, last, left), end='')
     print()
+
     def mean(v):
         return sum(v) / len(v) if v else None
 
@@ -253,13 +258,19 @@ def run_label(args):
         label += ' | fusion stage%s %s (head weight %g)' % (
             's' if len(args.fusion_stages) > 1 else '',
             ', '.join(str(k) for k in args.fusion_stages), args.fusion_head_weight)
+    if args.seed != DEFAULT_SEED:
+        label += ' | seed %d' % args.seed
     return label
 
 
 def run_dir(args):
+    """Run folder.  The default seed leaves the name as it always was; any other seed adds
+    _seed<N>, so repeats of one experiment with different seeds get their own folders."""
     tag = parts_tag(args) + ('_rec%g' % args.recon_weight if args.recon else '')
     if args.fusion_stages:
         tag += '_' + fusion_tag(args)
+    if args.seed != DEFAULT_SEED:
+        tag += '_seed%d' % args.seed
     return '%s_%s_%s_iter_%d_lr_%s' % (args.savedir, '-'.join(args.datasets), tag,
                                        args.max_steps, str(args.lr))
 
@@ -375,7 +386,8 @@ def parse_args(argv=None):
     p.add_argument('--lr_mode', default='poly', help='poly or step')
     p.add_argument('--savedir', default='./results_md', help='prefix of the run folder')
     p.add_argument('--logFile', default='trainValLog.txt')
-    p.add_argument('--seed', type=int, default=2333)
+    p.add_argument('--seed', type=int, default=DEFAULT_SEED,
+                   help='a seed other than %d is added to the run folder name (_seed<N>)' % DEFAULT_SEED)
     p.add_argument('--device', default='cuda')
     p.add_argument('--resume', action='store_true',
                    help="continue the run in this run's folder from its last epoch")

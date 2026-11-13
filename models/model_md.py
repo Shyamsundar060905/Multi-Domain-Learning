@@ -121,15 +121,20 @@ class ReconstructionDecoder(nn.Module):
         self.head_t1 = nn.Conv2d(ch, out_channels, kernel_size=3, padding=1)
         self.head_t2 = nn.Conv2d(ch, out_channels, kernel_size=3, padding=1)
 
+    def stage_features(self, x, n=None):
+        """Outputs of the first ``n`` stages (all 5 by default); stage k = result[k-1]."""
+        feats = []
+        for up, norm in list(zip(self.ups, self.norms))[:n]:
+            x = self.act(norm(up(x)))
+            feats.append(x)
+        return feats
+
     def forward(self, x, date, return_feats=False):
         """Rebuilt image; with ``return_feats`` also each stage's output (stage k = feats[k-1])."""
         if date not in ('t1', 't2'):
             raise ValueError("date must be 't1' or 't2', got %r" % (date,))
-        feats = []
-        for up, norm in zip(self.ups, self.norms):
-            x = self.act(norm(up(x)))
-            feats.append(x)
-        image = (self.head_t1 if date == 't1' else self.head_t2)(x)
+        feats = self.stage_features(x)
+        image = (self.head_t1 if date == 't1' else self.head_t2)(feats[-1])
         return (image, feats) if return_feats else image
 
 
@@ -375,9 +380,12 @@ class MultiDatasetNet(nn.Module):
         {'recon': (T1', T2'), 'heads': {stage: fusion-head probability map}}.
 
         Without fusion the reconstruction decoder only reads each date's
-        deepest features and is run only for ``return_aux``; with fusion it
-        always runs, because the change map uses its stage differences.  (It
-        draws no random numbers, so where it runs does not change dropout.)
+        deepest features and is run only for ``return_aux``.  With fusion the
+        change map uses its stage differences, so its stages up to the last
+        fused one always run; the later stages and the RGB outputs still run
+        only for ``return_aux`` (training, PSNR), so plain inference does not
+        pay for them.  (The decoder draws no random numbers, so where it runs
+        does not change dropout.)
         """
         self.set_dataset(dataset)
         f1 = self.encode(x1)
@@ -389,9 +397,14 @@ class MultiDatasetNet(nn.Module):
             raise RuntimeError('return_aux=True needs a model built with recon=True')
         recons, fused, heads = None, {}, OrderedDict()
         if self.recon is not None and (return_aux or self.fusion_stages):
-            r1, s1 = self.recon(f1[-1], 't1', return_feats=True)
-            r2, s2 = self.recon(f2[-1], 't2', return_feats=True)
-            recons = (r1, r2)
+            if return_aux:
+                r1, s1 = self.recon(f1[-1], 't1', return_feats=True)
+                r2, s2 = self.recon(f2[-1], 't2', return_feats=True)
+                recons = (r1, r2)
+            else:  # the change map alone: only the stages up to the last fused one
+                last = max(self.fusion_stages)
+                s1 = self.recon.stage_features(f1[-1], last)
+                s2 = self.recon.stage_features(f2[-1], last)
             fused = {k: torch.abs(s1[k - 1] - s2[k - 1]) for k in self.fusion_stages}
             if return_aux and self.fusion_heads is not None:
                 heads = OrderedDict((k, self.fusion_heads[str(k)](fused[k])) for k in self.fusion_stages)
