@@ -244,7 +244,8 @@ def run_label(args):
     if args.recon:
         label += ' | recon %g' % args.recon_weight
     if args.fusion_stages:
-        label += ' | fusion stage %s (head weight %g)' % (
+        label += ' | fusion stage%s %s (head weight %g)' % (
+            's' if len(args.fusion_stages) > 1 else '',
             ', '.join(str(k) for k in args.fusion_stages), args.fusion_head_weight)
     return label
 
