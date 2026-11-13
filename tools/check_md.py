@@ -26,8 +26,9 @@ about a minute:
 8. Fusion: the widened change-decoder conv keeps its original weights and
    starts the new ones at zero (untrained change map = BaseNet's), nothing
    else changes, parameter counts, the change map alone does not run the
-   training-only parts, which losses reach which parts, the date-swap symmetry, stages 1-3 with every part on, per-dataset isolation,
-   and fusion without reconstruction is refused.
+   training-only parts, which losses reach which parts, the date-swap
+   symmetry, stages 1-3 with every part on, per-dataset isolation, and fusion
+   without reconstruction is refused.
 9. tools/train_md.py end to end on tiny synthetic data: two datasets with
    every part on, a refused re-run, --resume, one dataset with every part
    off, one dataset with --recon, and one with --recon and fusion at stage 2;
