@@ -32,7 +32,10 @@ about a minute:
    every part on, a refused re-run, --resume, one dataset with every part
    off, one dataset with --recon, and one with --recon and fusion at stage 2;
    the experiment header at the start says what is on and the parameter
-   counts.
+   counts.  A new run that stops before its first checkpoint (simulated out
+   of GPU memory, Ctrl+C) removes its run folder so the same command runs
+   again; one that stops later, or a resumed one, keeps it and resumes; a
+   file the script did not write is never deleted.
 """
 import contextlib
 import copy
@@ -520,6 +523,69 @@ try:
         except SystemExit:
             refused_f = True
     check(refused_f, '--fusion-stages without --recon is refused')
+
+    # A new run that stops before its first checkpoint removes its run folder; later stops keep it.
+    real_epoch = train_md.train_epoch
+
+    def run_failing(argv, fake_epoch):
+        """train_md.main with train_epoch replaced; returns (exception type or None, stderr text)."""
+        train_md.train_epoch = fake_epoch
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                run(argv)
+            raised = None
+        except BaseException as e:  # KeyboardInterrupt and SystemExit included
+            raised = type(e)
+        finally:
+            train_md.train_epoch = real_epoch
+        return raised, err.getvalue()
+
+    def oom(*a):
+        raise RuntimeError('CUDA out of memory (simulated by check_md)')
+
+    def ctrl_c(*a):
+        raise KeyboardInterrupt
+
+    def oom_at_epoch_2(args_, model_, optimizer_, cycles_, epoch, *rest):
+        if epoch == 2:
+            raise RuntimeError('CUDA out of memory (simulated by check_md)')
+        return real_epoch(args_, model_, optimizer_, cycles_, epoch, *rest)
+
+    def other_file_then_oom(args_, *rest):
+        open(os.path.join(train_md.run_dir(args_), 'notes.txt'), 'w').close()
+        raise RuntimeError('CUDA out of memory (simulated by check_md)')
+
+    whu = ['--datasets', 'WHU'] + common
+    wdir = os.path.join(tmp, 'results_md_WHU_shared_iter_8_lr_0.0005')
+    raised, err = run_failing(whu, oom)
+    check(raised is RuntimeError and not os.path.exists(wdir) and ('removed %s' % wdir) in err,
+          'out of GPU memory in epoch 0 (simulated): the error still stops the run, and its run folder '
+          'is removed')
+    check('[WHU] Test :' in run(whu), '... so the same command then simply runs (no "already exists")')
+    raised, err = run_failing(whu + ['--max_steps', '4'], ctrl_c)
+    check(raised is KeyboardInterrupt
+          and not os.path.exists(os.path.join(tmp, 'results_md_WHU_shared_iter_4_lr_0.0005')),
+          'Ctrl+C in epoch 0: the run folder is removed too')
+    w12 = whu + ['--max_steps', '12']
+    w12dir = os.path.join(tmp, 'results_md_WHU_shared_iter_12_lr_0.0005')
+    raised, err = run_failing(w12, oom_at_epoch_2)
+    stopped_msg = 'This run stopped before its first checkpoint'
+    check(raised is RuntimeError and os.path.isfile(os.path.join(w12dir, 'checkpoint.pth.tar'))
+          and stopped_msg not in err,
+          'out of GPU memory in epoch 2, after the first checkpoint: the run folder is kept')
+    raised, err = run_failing(w12 + ['--resume'], oom_at_epoch_2)
+    check(raised is RuntimeError and os.path.isfile(os.path.join(w12dir, 'checkpoint.pth.tar'))
+          and stopped_msg not in err, 'a resumed run that stops again keeps its folder')
+    log_w12 = run(w12 + ['--resume'])
+    check('=> resumed from' in log_w12 and 'next epoch 2' in log_w12 and '[WHU] Test :' in log_w12,
+          '... and --resume then continues it from epoch 2 and tests it')
+    w16dir = os.path.join(tmp, 'results_md_WHU_shared_iter_16_lr_0.0005')
+    raised, err = run_failing(whu + ['--max_steps', '16'], other_file_then_oom)
+    check(raised is RuntimeError and os.path.isdir(w16dir) and os.listdir(w16dir) == ['notes.txt']
+          and ('left %s in place' % w16dir) in err,
+          'stopped in epoch 0 with a file in the run folder the script did not write: only the '
+          "script's own files are deleted, the folder and that file stay")
     print('\n  Start of a run (two datasets, every part on; one dataset, every part off; one dataset with '
           '--recon; one with --recon and fusion at stage 2), and its epoch and test lines:')
     for line in (log + log1 + logr + logf).splitlines():

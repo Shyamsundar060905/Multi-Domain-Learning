@@ -49,6 +49,12 @@ Fusion (--fusion-stages 1/2/3, needs --recon)
     --fusion-head-weight (default 1.0, 0 = no heads) x the main output's
     BCE + Dice, averaged over stages, as on the bottleneck-reconstruction
     branch.  Head(tr) in the epoch lines is that head loss.
+
+Run folder
+  * A new run refuses to start if its folder exists (add --resume to continue
+    it).  A new run that stops before its first checkpoint (saved after
+    epoch 1) -- an error such as a full GPU, or Ctrl+C -- removes its folder
+    again, so the same command can simply be run again.
 """
 import math
 import os
@@ -256,6 +262,26 @@ def run_dir(args):
         tag += '_' + fusion_tag(args)
     return '%s_%s_%s_iter_%d_lr_%s' % (args.savedir, '-'.join(args.datasets), tag,
                                        args.max_steps, str(args.lr))
+
+
+def remove_unfinished_run(savedir, own_files):
+    """For a NEW run that stopped before its first checkpoint: deletes the files this script
+    wrote into its run folder, then the folder itself if nothing else is in it.  Never deletes
+    anything else.  Returns what was done, for the message."""
+    try:
+        for path in own_files:
+            if os.path.isfile(path):
+                os.remove(path)
+        left = sorted(os.listdir(savedir))
+        if not left:
+            os.rmdir(savedir)
+    except OSError as e:
+        return 'could not clean up %s (%s); delete it by hand before running the same command again.' % (
+            savedir, e)
+    if left:
+        return 'left %s in place: it also holds %s, which this script did not write.' % (
+            savedir, ', '.join(left))
+    return 'removed %s, so the same command can simply be run again.' % savedir
 
 
 def describe(args, model, total_params, shared_params, per_dataset, sizes):
@@ -497,56 +523,82 @@ def main(argv=None):
               % (ckpt_path, start_epoch, best_mean, best_epoch))
 
     # The run folder is made only now, after the model is on the GPU and the data and optimizer
-    # are set up, so a run that fails during setup (e.g. a full GPU) leaves no folder behind.
-    os.makedirs(savedir, exist_ok=True)
-    logger = open(os.path.join(savedir, args.logFile), 'a' if args.resume else 'w')
+    # are set up, so a run that fails during setup leaves no folder behind.  A NEW run that stops
+    # before its first checkpoint (saved after epoch 1) -- e.g. the GPU fills up during epoch 0,
+    # or Ctrl+C -- has nothing to resume, so it removes its folder again on the way out and the
+    # same command can simply be run again.  (kill -9 or a lost session cannot be caught; then
+    # the folder stays.)  A resumed run's folder is never removed.
     if args.resume:
-        logger.write('Resumed: next epoch %d\n' % start_epoch)
+        os.makedirs(savedir, exist_ok=True)
     else:
-        logger.write('\n'.join(header) + '\n')
-        logger.write('Config: %s\n' % config)
-        logger.write('Epoch\tDataset\tKappa (val)\tIoU (val)\tF1 (val)\tR (val)\tP (val)%s\n'
-                     % ('\tPSNR (val)' if args.recon else ''))
-    logger.flush()
-
-    cycles = {d: Cycle(loaders[d]['train']) for d in args.datasets}
-    for epoch in range(start_epoch, max_epochs):
-        stats, lr = train_epoch(args, model, optimizer, cycles, epoch, rounds_per_epoch,
-                                total_rounds, device)
-        if device.type == 'cuda':
-            torch.cuda.empty_cache()
-        if epoch == 0:
-            continue  # tools/train.py does not validate after epoch 0
-
-        val = {d: evaluate(model, loaders[d]['val'], d, device, recon=args.recon) for d in args.datasets}
-        mean_f1 = float(np.mean([val[d][1]['F1'] for d in args.datasets]))
-        for d in args.datasets:
-            s = val[d][1]
-            logger.write('%d\t%s\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f%s\n'
-                         % (epoch, d, s['Kappa'], s['IoU'], s['F1'], s['recall'], s['precision'],
-                            '\t%.2f' % val[d][2] if args.recon else ''))
-        logger.write('%d\tmean F1\t\t\t%.4f\n' % (epoch, mean_f1))
+        try:
+            os.makedirs(savedir)
+        except FileExistsError:
+            raise SystemExit('%s appeared while this run was being set up (another start of the same '
+                             'command?); leaving it alone.' % savedir)
+    log_path = os.path.join(savedir, args.logFile)
+    have_checkpoint = args.resume
+    logger = None
+    try:
+        logger = open(log_path, 'a' if args.resume else 'w')
+        if args.resume:
+            logger.write('Resumed: next epoch %d\n' % start_epoch)
+        else:
+            logger.write('\n'.join(header) + '\n')
+            logger.write('Config: %s\n' % config)
+            logger.write('Epoch\tDataset\tKappa (val)\tIoU (val)\tF1 (val)\tR (val)\tP (val)%s\n'
+                         % ('\tPSNR (val)' if args.recon else ''))
         logger.flush()
 
-        note = ''
-        if best_mean <= mean_f1:
-            best_mean, best_epoch = mean_f1, epoch
-            torch.save(model.state_dict(), best_path)
-            note = '  * new best, saved'
-        torch.save({'epoch': epoch + 1, 'state_dict': model.state_dict(),
-                    'optimizer': optimizer.state_dict(), 'best_mean': best_mean,
-                    'best_epoch': best_epoch, 'config': config, 'lr': lr}, ckpt_path)
+        cycles = {d: Cycle(loaders[d]['train']) for d in args.datasets}
+        for epoch in range(start_epoch, max_epochs):
+            stats, lr = train_epoch(args, model, optimizer, cycles, epoch, rounds_per_epoch,
+                                    total_rounds, device)
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+            if epoch == 0:
+                continue  # tools/train.py does not validate after epoch 0
 
-        print('Epoch No. %d:\tmean F1(val) = %.4f\t(best %.4f @ epoch %d)%s'
-              % (epoch, mean_f1, best_mean, best_epoch, note))
-        for d in args.datasets:
-            print('    %-5s\tTrain Loss = %.4f\tVal Loss = %.4f\t F1(tr) = %.4f\t F1(val) = %.4f%s'
-                  % (d, stats[d][0], val[d][0], stats[d][1]['F1'], val[d][1]['F1'],
-                     ('\t Recon(tr) = %.4f\t PSNR(val) = %.2f dB' % (stats[d][2], val[d][2])
-                      if args.recon else '')
-                     + ('\t Head(tr) = %.4f' % stats[d][3] if stats[d][3] is not None else '')))
-        if device.type == 'cuda':
-            torch.cuda.empty_cache()
+            val = {d: evaluate(model, loaders[d]['val'], d, device, recon=args.recon) for d in args.datasets}
+            mean_f1 = float(np.mean([val[d][1]['F1'] for d in args.datasets]))
+            for d in args.datasets:
+                s = val[d][1]
+                logger.write('%d\t%s\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f%s\n'
+                             % (epoch, d, s['Kappa'], s['IoU'], s['F1'], s['recall'], s['precision'],
+                                '\t%.2f' % val[d][2] if args.recon else ''))
+            logger.write('%d\tmean F1\t\t\t%.4f\n' % (epoch, mean_f1))
+            logger.flush()
+
+            note = ''
+            if best_mean <= mean_f1:
+                best_mean, best_epoch = mean_f1, epoch
+                torch.save(model.state_dict(), best_path)
+                note = '  * new best, saved'
+            torch.save({'epoch': epoch + 1, 'state_dict': model.state_dict(),
+                        'optimizer': optimizer.state_dict(), 'best_mean': best_mean,
+                        'best_epoch': best_epoch, 'config': config, 'lr': lr}, ckpt_path)
+            have_checkpoint = True
+
+            print('Epoch No. %d:\tmean F1(val) = %.4f\t(best %.4f @ epoch %d)%s'
+                  % (epoch, mean_f1, best_mean, best_epoch, note))
+            for d in args.datasets:
+                print('    %-5s\tTrain Loss = %.4f\tVal Loss = %.4f\t F1(tr) = %.4f\t F1(val) = %.4f%s'
+                      % (d, stats[d][0], val[d][0], stats[d][1]['F1'], val[d][1]['F1'],
+                         ('\t Recon(tr) = %.4f\t PSNR(val) = %.2f dB' % (stats[d][2], val[d][2])
+                          if args.recon else '')
+                         + ('\t Head(tr) = %.4f' % stats[d][3] if stats[d][3] is not None else '')))
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+    except BaseException:  # any error, including running out of GPU memory, and Ctrl+C
+        if not have_checkpoint:
+            if logger is not None:
+                logger.close()
+            sys.stdout.flush()
+            print('\nThis run stopped before its first checkpoint (saved after epoch 1), so there is nothing '
+                  'to resume; ' + remove_unfinished_run(savedir, [log_path, best_path, ckpt_path])
+                  + ' What stopped it is printed below.', file=sys.stderr)
+            sys.stderr.flush()
+        raise
 
     if not os.path.isfile(best_path):
         raise SystemExit('no validated epoch, so no best model (need at least 2 epochs)')
