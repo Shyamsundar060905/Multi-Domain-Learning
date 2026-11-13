@@ -23,10 +23,16 @@ about a minute:
    the encoder but not the change decoder (and the change loss does not reach
    the reconstruction decoder), parameter counts, per-dataset isolation, and
    the PSNR helper exactly inverts the input normalisation.
-8. tools/train_md.py end to end on tiny synthetic data: two datasets with
+8. Fusion: the widened change-decoder conv keeps its original weights and
+   starts the new ones at zero (untrained change map = BaseNet's), nothing
+   else changes, parameter counts, which losses reach which parts, the
+   date-swap symmetry, stages 1-3 with every part on, per-dataset isolation,
+   and fusion without reconstruction is refused.
+9. tools/train_md.py end to end on tiny synthetic data: two datasets with
    every part on, a refused re-run, --resume, one dataset with every part
-   off, and one dataset with --recon; the experiment header at the start says
-   which parts are on and the parameter counts.
+   off, one dataset with --recon, and one with --recon and fusion at stage 2;
+   the experiment header at the start says what is on and the parameter
+   counts.
 """
 import contextlib
 import copy
@@ -220,7 +226,8 @@ for mode in ('eval', 'train'):
 mr.eval()
 with torch.no_grad():
     plain = mr(x1, x2, 'LEVIR')
-    mask_r, (r1, r2) = mr(x1, x2, 'LEVIR', return_recon=True)
+    mask_r, aux_r = mr(x1, x2, 'LEVIR', return_aux=True)
+    r1, r2 = aux_r['recon']
 check(torch.equal(plain, mask_r), 'the change map is the same whether or not the reconstructions are computed')
 check(tuple(r1.shape) == tuple(r2.shape) == tuple(x1.shape), "T1' and T2' have the input's shape (2, 3, 64, 64)")
 
@@ -246,7 +253,7 @@ def has_grad(module):
 
 mg = MultiDatasetNet(DS, recon=True, base=copy.deepcopy(base), **ALL_ON)
 mg.train()
-_, recons = mg(x1, x2, 'WHU', return_recon=True)
+recons = mg(x1, x2, 'WHU', return_aux=True)[1]['recon']
 mg.zero_grad(set_to_none=True)
 train_md.recon_mse(recons, x1, x2).backward()
 change_side = [q for n, q in mg.named_parameters() if n.startswith('swa.') or n.startswith('diff_adapters.')]
@@ -255,7 +262,7 @@ check(all(q.grad is None for q in change_side),
 check(has_grad(mg.backbone.features[0]) and has_grad(mg.backbone.features[17]) and has_grad(mg.recon),
       'the reconstruction loss trains the reconstruction decoder and reaches the shared encoder (first and last block)')
 mg.zero_grad(set_to_none=True)
-mask_g, _ = mg(x1, x2, 'WHU', return_recon=True)
+mask_g, _ = mg(x1, x2, 'WHU', return_aux=True)
 train_md.BCEDiceLoss(mask_g, target).backward()
 check(all(q.grad is None for q in mg.recon.parameters()),
       'the change loss sends no gradient into the reconstruction decoder (both computed in one pass)')
@@ -271,8 +278,10 @@ check(len(mg.recon_bn) == 5 and mg.part_sizes()['recon_bn'] == RECON_BN and per_
 
 def rec_step(model, opt, dataset):
     model.train()
-    mask, rec = model(x1, x2, dataset, return_recon=True)
-    loss = train_md.BCEDiceLoss(mask, target) + 0.1 * train_md.recon_mse(rec, x1, x2)
+    mask, aux = model(x1, x2, dataset, return_aux=True)
+    loss = train_md.BCEDiceLoss(mask, target) + 0.1 * train_md.recon_mse(aux['recon'], x1, x2)
+    if aux['heads']:
+        loss = loss + torch.stack([train_md.BCEDiceLoss(h, target) for h in aux['heads'].values()]).mean()
     opt.zero_grad(set_to_none=True)
     loss.backward()
     opt.step()
@@ -304,7 +313,103 @@ got = torch.cat([train_md.unnormalize(t6[None, 0:3].float()), train_md.unnormali
 check(max_diff(got, want) <= 1e-5, "PSNR helper: unnormalising the inputs gives back the original [0, 1] RGB "
       "pixels (max |difference| %.1e)" % max_diff(got, want))
 
-print('\n=== 8. tools/train_md.py end to end (synthetic data, CPU) ===')
+print('\n=== 8. fusion (--fusion-stages, needs --recon) ===')
+BLOCK = {1: 'cat4', 2: 'cat3', 3: 'cat2'}
+WIDEN = {1: 256 * 96 * 9, 2: 128 * 32 * 9, 3: 64 * 48 * 9}   # new first-conv weights in cat4 / cat3 / cat2
+HEAD = {2: 128 * 64 * 4 + 64 * 32 * 4 + 32 * 16 * 4 + 2 * (64 + 32 + 16) + 16 + 1}   # stage-2 head: 43,249
+RECON_TO_2 = 320 * 256 * 4 + 2 * 256 + 256 * 128 * 4 + 2 * 128   # reconstruction stages 1-2: 459,520
+torch.manual_seed(3)
+mr3 = MultiDatasetNet(['LEVIR'], recon=True, base=copy.deepcopy(base))
+rng_r = torch.get_rng_state()
+torch.manual_seed(3)
+mf = MultiDatasetNet(['LEVIR'], recon=True, fusion_stages=(2,), base=copy.deepcopy(base))
+rng_f = torch.get_rng_state()
+check(torch.equal(rng_r, rng_f), 'fusion on or off: same random stream afterwards (same batches)')
+sr, sf = mr3.state_dict(), mf.state_dict()
+wkey = 'swa.cat3.double_conv.0.weight'
+check(all(torch.equal(sr[k], sf[k]) for k in sr if k != wkey)
+      and all(k.startswith('fusion_heads.') for k in sf if k not in sr),
+      'fusion on or off: every other weight (reconstruction decoder included) starts the same; '
+      'the only new tensors are fusion_heads.*')
+check(tuple(sf[wkey].shape) == (32, 192, 3, 3) and torch.equal(sf[wkey][:, :64], sr[wkey])
+      and sf[wkey][:, 64:].abs().sum().item() == 0,
+      "stage 2: cat3's first conv takes 64 + 128 inputs; the original 64 keep their weights, the new 128 start at zero")
+for mode in ('eval', 'train'):
+    d = same_output(mf, base, 'LEVIR', mode)
+    check(d <= 1e-5, "%s mode, untrained: the change map is still BaseNet's (max |difference| %.1e)" % (mode, d))
+n_change = base_total + WIDEN[2] + RECON_TO_2
+n_only = sum(q.numel() for q in mf.training_only_parameters())
+check(mf.fusion_widened[2] == WIDEN[2] and mf.fusion_head_parameter_count() == HEAD[2]
+      and count(mf) == base_total + 503622 + WIDEN[2] + HEAD[2] and count(mf) - n_only == n_change,
+      'stage 2: +{:,} change-decoder weights, +{:,} head; the change map uses {:,} of the {:,} '
+      '(reconstruction stages 1-2 included)'.format(WIDEN[2], HEAD[2], n_change, count(mf)))
+mf.eval()
+with torch.no_grad():
+    plain_f = mf(x1, x2, 'LEVIR')
+    mask_f, aux_f = mf(x1, x2, 'LEVIR', return_aux=True)
+check(torch.equal(plain_f, mask_f) and list(aux_f['heads']) == [2]
+      and tuple(aux_f['heads'][2].shape) == (2, 1, 64, 64),
+      'the change map is the same with or without the extra outputs; one stage-2 head map at full size')
+
+mf.train()
+mf.zero_grad(set_to_none=True)
+train_md.BCEDiceLoss(mf(x1, x2, 'LEVIR'), target).backward()
+gw = mf.swa.cat3.double_conv[0].weight.grad
+late = list(mf.recon.ups)[2:] + list(mf.recon.norms)[2:] + [mf.recon.head_t1, mf.recon.head_t2, mf.fusion_heads]
+check(gw is not None and gw[:, 64:].abs().sum().item() > 0
+      and all(q.grad is None for mod in late for q in mod.parameters()),
+      'change loss: the new cat3 weights get gradient (so fusion can switch on); reconstruction stages 3-5, '
+      'the RGB outputs and the fusion head take no part')
+opt_f = torch.optim.Adam(mf.parameters(), 5e-4, (0.9, 0.99), eps=1e-08, weight_decay=1e-4)
+opt_f.step()
+mf.zero_grad(set_to_none=True)
+train_md.BCEDiceLoss(mf(x1, x2, 'LEVIR'), target).backward()
+check(has_grad(mf.recon.ups[0]) and has_grad(mf.recon.ups[1]),
+      'after one step: the change loss reaches reconstruction stages 1-2 through the fusion')
+mf.zero_grad(set_to_none=True)
+train_md.BCEDiceLoss(mf(x1, x2, 'LEVIR', return_aux=True)[1]['heads'][2], target).backward()
+check(has_grad(mf.fusion_heads) and has_grad(mf.recon.ups[1]) and has_grad(mf.backbone.features[17])
+      and all(q.grad is None for q in mf.swa.parameters())
+      and all(q.grad is None for mod in list(mf.recon.ups)[2:] for q in mod.parameters()),
+      'fusion-head loss: trains the head, reconstruction stages 1-2 and the encoder; never the change decoder '
+      'or reconstruction stages 3-5')
+mf.zero_grad(set_to_none=True)
+mf.eval()
+with torch.no_grad():
+    sw = max_diff(mf(x1, x2, 'LEVIR'), mf(x2, x1, 'LEVIR'))
+check(sw <= 1e-6, 'with fusion, after a step: same change map with the dates swapped (max |difference| %.1e)' % sw)
+
+torch.manual_seed(4)
+m123 = MultiDatasetNet(DS, recon=True, fusion_stages=(1, 2, 3), base=copy.deepcopy(base), **ALL_ON)
+shapes = {k: tuple(getattr(m123.swa, BLOCK[k]).double_conv[0].weight.shape) for k in (1, 2, 3)}
+check(shapes == {1: (96, 448, 3, 3), 2: (32, 192, 3, 3), 3: (48, 136, 3, 3)},
+      'stages 1, 2, 3 with every part on: cat4 / cat3 / cat2 take 192+256 / 64+128 / 72+64 inputs')
+for mode in ('eval', 'train'):
+    worst = max(same_output(m123, base, d, mode) for d in DS)
+    check(worst <= 1e-5, "stages 1-3, every part on, untrained, %s mode: BaseNet's change map for all 3 datasets "
+          "(max |difference| %.1e)" % (mode, worst))
+per_f = sum(m123.part_sizes().values())
+shared_f = sum(q.numel() for q in m123.shared_parameters())
+check(m123.part_sizes()['fusion_bn'] == 800 and shared_f + len(DS) * per_f == count(m123),
+      'stages 1-3: the three heads\' BatchNorms are per dataset (800 each); total {:,} = shared {:,} + 3 x {:,}'
+      .format(count(m123), shared_f, per_f))
+opt = torch.optim.Adam(m123.parameters(), 5e-4, (0.9, 0.99), eps=1e-08, weight_decay=1e-4)
+rec_step(m123, opt, 'LEVIR')
+rec_step(m123, opt, 'SYSU')
+before = {k: v.clone() for k, v in m123.state_dict().items()}
+rec_step(m123, opt, 'WHU')
+after = m123.state_dict()
+moved = [k for k in before if ('.per_dataset.LEVIR.' in k or '.per_dataset.SYSU.' in k)
+         and not torch.equal(before[k], after[k])]
+check(not moved, 'stages 1-3, every part on: a WHU step changes no LEVIR/SYSU tensor (%d changed)' % len(moved))
+try:
+    MultiDatasetNet(['LEVIR'], fusion_stages=(2,), base=copy.deepcopy(base))
+    refused_m = False
+except ValueError:
+    refused_m = True
+check(refused_m, 'fusion without the reconstruction decoder is refused')
+
+print('\n=== 9. tools/train_md.py end to end (synthetic data, CPU) ===')
 tmp = tempfile.mkdtemp(prefix='check_md_')
 rng = np.random.RandomState(0)
 
@@ -384,7 +489,7 @@ try:
           and os.path.isdir(os.path.join(tmp, 'results_md_LEVIR_shared_rec0.1_iter_8_lr_0.0005')),
           'with --recon: header says ON (weight 0.1); run folder results_md_LEVIR_shared_rec0.1_...')
     check('Total network parameters (excluding idr): %d' % (base_total + 503622) in logr
-          and 'Parameters without the reconstruction decoder (what the change map uses): {:,}'.format(base_total)
+          and 'Parameters the change map uses (training-only parts left out): {:,}'.format(base_total)
           in logr, 'with --recon: {:,} parameters in training, {:,} used for the change map'.format(
               base_total + 503622, base_total))
     check(re.search(r'Recon\(tr\) = \d+\.\d{4}\t PSNR\(val\) = -?\d+\.\d{2} dB', logr) is not None
@@ -394,11 +499,33 @@ try:
     log_rr = run(rec + ['--resume'])
     check('=> resumed from' in log_rr and '[LEVIR] Test reconstruction: PSNR = ' in log_rr,
           'with --recon: --resume reloads the run and tests it')
+    check('Fusion: off' in logr, 'with --recon only: header says fusion is off')
+    fus = ['--datasets', 'LEVIR', '--recon', '--recon-weight', '0.5', '--fusion-stages', '2'] + common
+    logf = run(fus)
+    check('EXPERIMENT: LEVIR | shared | recon 0.5 | fusion stage 2 (head weight 1)' in logf
+          and 'Fusion: ON' in logf
+          and os.path.isdir(os.path.join(tmp, 'results_md_LEVIR_shared_rec0.5_fus2_iter_8_lr_0.0005')),
+          'with --fusion-stages 2: header says so; run folder results_md_LEVIR_shared_rec0.5_fus2_...')
+    check('Total network parameters (excluding idr): %d' % count(mf) in logf
+          and 'Parameters the change map uses (training-only parts left out): {:,}'.format(n_change) in logf,
+          'with fusion at stage 2: {:,} parameters in training, {:,} used for the change map'.format(
+              count(mf), n_change))
+    check(re.search(r'Recon\(tr\) = \d+\.\d{4}\t PSNR\(val\) = -?\d+\.\d{2} dB\t Head\(tr\) = \d+\.\d{4}', logf)
+          is not None and '[LEVIR] Test reconstruction: PSNR = ' in logf,
+          'with fusion: epoch lines add Head(tr) after Recon(tr) and PSNR(val); test as with --recon')
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            run(['--datasets', 'LEVIR', '--fusion-stages', '2'] + common)
+            refused_f = False
+        except SystemExit:
+            refused_f = True
+    check(refused_f, '--fusion-stages without --recon is refused')
     print('\n  Start of a run (two datasets, every part on; one dataset, every part off; one dataset with '
-          '--recon), and its epoch and test lines:')
-    for line in (log + log1 + logr).splitlines():
+          '--recon; one with --recon and fusion at stage 2), and its epoch and test lines:')
+    for line in (log + log1 + logr + logf).splitlines():
         if re.search(r'^=+$|EXPERIMENT|^Datasets|Per-dataset|part  |\[ON\]|\[off\]|Shared by|Adapter:|'
-                     r'Reconstruction task|  decoder:|  loss:|  parameters:|without the reconstruction|'
+                     r'Reconstruction task|  decoder:|  loss:|  parameters:|Fusion:|  new input|'
+                     r'  fusion change head|change map uses|'
                      r'Parameters:|Total network|Training:|Schedule|Checkpoint selection|Recon\(tr\)|'
                      r'Test :|Test reconstruction|Mean test', line):
             print('  | ' + line.rstrip())

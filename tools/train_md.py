@@ -40,6 +40,15 @@ Reconstruction task (--recon, weight --recon-weight, default 0.1)
     branch.  "Train Loss" in the epoch lines stays the change loss alone;
     Recon(tr) is the reconstruction MSE and PSNR(val) the validation PSNR on
     [0, 1] images.  Checkpoint selection still uses the change F1 only.
+
+Fusion (--fusion-stages 1/2/3, needs --recon)
+  * |date-1 - date-2| of the reconstruction decoder's stage-k features is
+    appended to the input of the change-decoder block of the same size
+    (1 -> cat4, 2 -> cat3, 3 -> cat2), with those new weights starting at
+    zero; a change head per stage on the same difference adds
+    --fusion-head-weight (default 1.0, 0 = no heads) x the main output's
+    BCE + Dice, averaged over stages, as on the bottleneck-reconstruction
+    branch.  Head(tr) in the epoch lines is that head loss.
 """
 import math
 import os
@@ -158,8 +167,8 @@ def evaluate(model, loader, dataset, device, recon=False):
     for img, target in loader:
         pre, post, target = to_device(img, target, device)
         if recon:
-            output, recons = model(pre, post, dataset, return_recon=True)
-            psnrs.append(batch_psnr(recons, pre, post))
+            output, aux = model(pre, post, dataset, return_aux=True)
+            psnrs.append(batch_psnr(aux['recon'], pre, post))
         else:
             output = model(pre, post, dataset)
         losses.append(BCEDiceLoss(output, target).item())
@@ -173,6 +182,7 @@ def train_epoch(args, model, optimizer, cycles, epoch, rounds_per_epoch, total_r
     meters = {d: ConfuseMatrixMeter(n_class=2) for d in args.datasets}
     losses = {d: [] for d in args.datasets}
     rec_losses = {d: [] for d in args.datasets}
+    head_losses = {d: [] for d in args.datasets}
     lr = None
     for r in range(rounds_per_epoch):
         cur = epoch * rounds_per_epoch + r
@@ -182,11 +192,16 @@ def train_epoch(args, model, optimizer, cycles, epoch, rounds_per_epoch, total_r
             img, target = cycles[d].next()
             pre, post, target = to_device(img, target, device)
             if args.recon:
-                output, recons = model(pre, post, d, return_recon=True)
+                output, aux = model(pre, post, d, return_aux=True)
                 cd_loss = BCEDiceLoss(output, target)
-                rec_loss = recon_mse(recons, pre, post)
+                rec_loss = recon_mse(aux['recon'], pre, post)
                 loss = cd_loss + args.recon_weight * rec_loss
                 rec_losses[d].append(rec_loss.item())
+                if aux['heads']:
+                    # Fusion heads: the main output's loss, averaged over stages (as on the branch).
+                    head_loss = torch.stack([BCEDiceLoss(h, target) for h in aux['heads'].values()]).mean()
+                    loss = loss + args.fusion_head_weight * head_loss
+                    head_losses[d].append(head_loss.item())
             else:
                 output = model(pre, post, d)
                 cd_loss = loss = BCEDiceLoss(output, target)
@@ -202,8 +217,10 @@ def train_epoch(args, model, optimizer, cycles, epoch, rounds_per_epoch, total_r
             print('\rround: [%d/%d] lr: %.7f loss: %s time:%.3f h'
                   % (cur + 1, total_rounds, lr, last, left), end='')
     print()
-    stats = {d: (sum(losses[d]) / len(losses[d]), meters[d].get_scores(),
-                 sum(rec_losses[d]) / len(rec_losses[d]) if rec_losses[d] else None)
+    def mean(v):
+        return sum(v) / len(v) if v else None
+
+    stats = {d: (mean(losses[d]), meters[d].get_scores(), mean(rec_losses[d]), mean(head_losses[d]))
              for d in args.datasets}
     return stats, lr
 
@@ -214,13 +231,28 @@ def parts_tag(args):
     return '-'.join(tags) if tags else 'shared'
 
 
+def fusion_tag(args):
+    """'fus2' (stage 2, head weight 1), 'fus123h0.5', ... ; '' without fusion."""
+    if not args.fusion_stages:
+        return ''
+    return 'fus' + ''.join(str(k) for k in args.fusion_stages) + (
+        '' if args.fusion_head_weight == 1.0 else 'h%g' % args.fusion_head_weight)
+
+
 def run_label(args):
     label = '%s | %s' % ('-'.join(args.datasets), parts_tag(args))
-    return label + (' | recon %g' % args.recon_weight if args.recon else '')
+    if args.recon:
+        label += ' | recon %g' % args.recon_weight
+    if args.fusion_stages:
+        label += ' | fusion stage %s (head weight %g)' % (
+            ', '.join(str(k) for k in args.fusion_stages), args.fusion_head_weight)
+    return label
 
 
 def run_dir(args):
     tag = parts_tag(args) + ('_rec%g' % args.recon_weight if args.recon else '')
+    if args.fusion_stages:
+        tag += '_' + fusion_tag(args)
     return '%s_%s_%s_iter_%d_lr_%s' % (args.savedir, '-'.join(args.datasets), tag,
                                        args.max_steps, str(args.lr))
 
@@ -242,6 +274,8 @@ def describe(args, model, total_params, shared_params, per_dataset, sizes):
         shared += ', and all its BatchNorm layers'
     if args.recon:
         shared += '; the reconstruction decoder' + (' (except its BatchNorms)' if args.domain_bn else '')
+    if args.fusion_stages and args.fusion_head_weight > 0:
+        shared += '; the fusion heads' + (' (except their BatchNorms)' if args.domain_bn else '')
     lines.append('Shared by all datasets: ' + shared)
     if any(getattr(args, flag) for flag, _, _ in PART_INFO[1:]):
         lines.append('Adapter: 1x1 conv down to max(C/%d, 8) channels -> BN -> ReLU -> 1x1 conv up '
@@ -250,14 +284,32 @@ def describe(args, model, total_params, shared_params, per_dataset, sizes):
     n_recon = model.recon_parameter_count()
     if args.recon:
         lines += [
-            "Reconstruction task: ON  (training only; the change path is unchanged and never uses it)",
+            "Reconstruction task: ON  (%s)" % (
+                'its stage differences feed the change decoder (fusion below)' if args.fusion_stages
+                else 'training only; the change path is unchanged and never uses it'),
             "  decoder: each date's deepest encoder features (320 ch, 1/32 size) -> 5 x [2x2 up-conv -> BN -> "
             "ReLU] (256, 128, 64, 32, 16 ch) -> 3x3 conv to RGB; one decoder run once per date, "
             "one output conv per date",
-            "  loss: BCE + Dice (change) + %g x 1/2 (MSE(T1', T1) + MSE(T2', T2)) on the normalised images"
-            % args.recon_weight,
+            "  loss: + %g x 1/2 (MSE(T1', T1) + MSE(T2', T2)) on the normalised images" % args.recon_weight,
             "  parameters: {:,} (BatchNorms {})".format(
                 n_recon, 'per dataset' if args.domain_bn else 'shared')]
+        if args.fusion_stages:
+            where = {1: 'stage 1 (256 ch, 1/16) -> cat4', 2: 'stage 2 (128 ch, 1/8) -> cat3',
+                     3: 'stage 3 (64 ch, 1/4) -> cat2'}
+            lines += [
+                'Fusion: ON  |date-1 - date-2| of the reconstruction decoder\'s stage features is appended to '
+                'the input of the change-decoder block of the same size: '
+                + '; '.join(where[k] for k in args.fusion_stages),
+                '  new input weights in those blocks: {:,} (start at zero, so the untrained change map is '
+                'unchanged)'.format(sum(model.fusion_widened.values()))]
+            if args.fusion_head_weight > 0:
+                lines.append('  fusion change head per stage (up-convs to full size -> 1x1 conv): loss + %g x '
+                             'BCE + Dice, mean over stages; parameters {:,} (training only)'.format(
+                                 model.fusion_head_parameter_count()) % args.fusion_head_weight)
+            else:
+                lines.append('  fusion change heads: off (--fusion-head-weight 0)')
+        else:
+            lines.append('Fusion: off')
     else:
         lines.append('Reconstruction task: off')
     lines += [
@@ -267,12 +319,16 @@ def describe(args, model, total_params, shared_params, per_dataset, sizes):
             per_dataset, ', '.join('{} {:,}'.format(k, v) for k, v in sizes.items())),
         'Total network parameters (excluding idr): ' + str(total_params)]
     if args.recon:
-        lines.append('Parameters without the reconstruction decoder (what the change map uses): {:,}'.format(
-            total_params - n_recon))
+        lines.append('Parameters the change map uses (training-only parts left out): {:,}'.format(
+            total_params - sum(q.numel() for q in model.training_only_parameters())))
+    loss = 'BCE + Dice'
+    if args.recon:
+        loss += ' + %g x reconstruction MSE' % args.recon_weight
+    if args.fusion_stages and args.fusion_head_weight > 0:
+        loss += ' + %g x fusion-head BCE + Dice' % args.fusion_head_weight
     lines += [
-        'Training: %dx%d input, batch %d per dataset, Adam lr %g (%s), BCE + Dice loss%s, seed %d'
-        % (args.inWidth, args.inHeight, args.batch_size, args.lr, args.lr_mode,
-           ' + %g x reconstruction MSE' % args.recon_weight if args.recon else '', args.seed),
+        'Training: %dx%d input, batch %d per dataset, Adam lr %g (%s), loss %s, seed %d'
+        % (args.inWidth, args.inHeight, args.batch_size, args.lr, args.lr_mode, loss, args.seed),
         bar]
     return lines
 
@@ -306,11 +362,20 @@ def parse_args(argv=None):
                    help='add the reconstruction task (a second decoder rebuilds each date; training only)')
     p.add_argument('--recon-weight', type=float, default=0.1,
                    help='weight of the reconstruction MSE (with --recon)')
+    p.add_argument('--fusion-stages', type=int, nargs='+', choices=(1, 2, 3), default=[],
+                   help='with --recon: reconstruction stages whose |date-1 - date-2| feeds the change decoder')
+    p.add_argument('--fusion-head-weight', type=float, default=1.0,
+                   help='weight of the fusion change heads\' loss (0 = no heads)')
     args = p.parse_args(argv)
     if len(set(args.datasets)) != len(args.datasets):
         p.error('--datasets lists a dataset twice')
     if args.recon and not args.recon_weight > 0:
         p.error('--recon-weight must be > 0')
+    args.fusion_stages = sorted(set(args.fusion_stages))
+    if args.fusion_stages and not args.recon:
+        p.error('--fusion-stages needs --recon')
+    if args.fusion_head_weight < 0:
+        p.error('--fusion-head-weight must be >= 0')
     args.data_root = os.path.expanduser(args.data_root)
     return args
 
@@ -330,7 +395,8 @@ def main(argv=None):
     model = MultiDatasetNet(args.datasets, domain_bn=args.domain_bn,
                             enc_adapters=args.enc_adapters, diff_adapters=args.diff_adapters,
                             dec_adapters=args.dec_adapters, adapter_reduction=args.adapter_reduction,
-                            adapter_dropout=args.adapter_dropout, recon=args.recon)
+                            adapter_dropout=args.adapter_dropout, recon=args.recon,
+                            fusion_stages=args.fusion_stages, fusion_heads=args.fusion_head_weight > 0)
 
     savedir = run_dir(args)
     if os.path.isdir(savedir) and not args.resume:
@@ -407,6 +473,9 @@ def main(argv=None):
     }
     if args.recon:  # only then, so runs from before --recon existed still resume
         config['recon_weight'] = args.recon_weight
+    if args.fusion_stages:
+        config['fusion_stages'] = list(args.fusion_stages)
+        config['fusion_head_weight'] = args.fusion_head_weight
     ckpt_path = os.path.join(savedir, 'checkpoint.pth.tar')
     best_path = os.path.join(savedir, 'best_model.pth')
     start_epoch, best_mean, best_epoch = 0, 0.0, -1
@@ -472,8 +541,9 @@ def main(argv=None):
         for d in args.datasets:
             print('    %-5s\tTrain Loss = %.4f\tVal Loss = %.4f\t F1(tr) = %.4f\t F1(val) = %.4f%s'
                   % (d, stats[d][0], val[d][0], stats[d][1]['F1'], val[d][1]['F1'],
-                     '\t Recon(tr) = %.4f\t PSNR(val) = %.2f dB' % (stats[d][2], val[d][2])
-                     if args.recon else ''))
+                     ('\t Recon(tr) = %.4f\t PSNR(val) = %.2f dB' % (stats[d][2], val[d][2])
+                      if args.recon else '')
+                     + ('\t Head(tr) = %.4f' % stats[d][3] if stats[d][3] is not None else '')))
         if device.type == 'cuda':
             torch.cuda.empty_cache()
 
