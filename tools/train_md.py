@@ -344,7 +344,6 @@ def main(argv=None):
             if not os.path.isfile(lst):
                 raise SystemExit('missing %s (expected <data_root>/%s/%s/{A,B,label,list})'
                                  % (lst, d, split))
-    os.makedirs(savedir, exist_ok=True)
     model = model.to(device)
 
     total_params = sum(q.numel() for q in model.parameters())
@@ -427,6 +426,9 @@ def main(argv=None):
               'again from the seed, so this is not identical to an uninterrupted run.'
               % (ckpt_path, start_epoch, best_mean, best_epoch))
 
+    # The run folder is made only now, after the model is on the GPU and the data and optimizer
+    # are set up, so a run that fails during setup (e.g. a full GPU) leaves no folder behind.
+    os.makedirs(savedir, exist_ok=True)
     logger = open(os.path.join(savedir, args.logFile), 'a' if args.resume else 'w')
     if args.resume:
         logger.write('Resumed: next epoch %d\n' % start_epoch)
