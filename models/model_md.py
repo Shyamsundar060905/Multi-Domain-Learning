@@ -40,14 +40,26 @@ reconstruction stage k, D_k = |stage-k features of date 1 - of date 2| is
 With fusion the change map depends on reconstruction stages 1..max(k), so
 those are needed at test time too.
 
+Optional distillation, ``distill`` (needs recon; instead of fusion): the
+change decoder learns from the reconstruction side, during training only.
+  * teacher change map: |date-1 - date-2| of the reconstruction decoder's
+    last stage (16 ch, full size) -> 1x1 conv -> sigmoid (``teacher_head``);
+  * three feature pairs of the same size: the outputs of cat4 / cat3 / cat2
+    (32 / 24 / 24 ch at 1/16, 1/8, 1/4), each through its own 1x1 conv
+    (``distill_proj``) to the channels of |date-1 - date-2| of
+    reconstruction stage 1 / 2 / 3 (256 / 128 / 64 ch).
+The losses are in tools/train_md.py.  Nothing flows from these parts into
+the change map, so it is computed exactly as without them, and none of them
+is needed at test time.
+
 * With every switch off the network IS models.model.BaseNet: same modules,
   same parameter names, same outputs.
 * Every adapter's last 1x1 conv starts at zero, so with switches on the
   untrained network still gives BaseNet's outputs.
-* Creating the adapters, the reconstruction decoder or the fusion parts does
-  not change the random-number stream, so every switch combination starts
-  from the same shared weights and (same seed, same datasets) trains on the
-  same batches in the same order.
+* Creating the adapters, the reconstruction decoder, the fusion parts or the
+  distillation parts does not change the random-number stream, so every
+  switch combination starts from the same shared weights and (same seed,
+  same datasets) trains on the same batches in the same order.
 tools/check_md.py checks all of this.
 """
 import copy
@@ -76,6 +88,9 @@ FUSION_TARGETS = {1: ('cat4', 192), 2: ('cat3', 64), 3: ('cat2', 72)}
 # (the branch's _RC_HEAD_WIDTHS and prior).
 FUSION_HEAD_WIDTHS = {1: (128, 64, 32, 16), 2: (64, 32, 16), 3: (32, 16)}
 FUSION_PRIOR = 0.02
+# Distillation pairs: (reconstruction stage, change-decoder block whose output is matched,
+# that output's channels).  Same sizes: 1/16, 1/8, 1/4.
+DISTILL_PAIRS = ((1, 'cat4', 32), (2, 'cat3', 24), (3, 'cat2', 24))
 
 
 class ResidualAdapter(nn.Module):
@@ -243,7 +258,7 @@ class MultiDatasetNet(nn.Module):
 
     def __init__(self, datasets, domain_bn=False, enc_adapters=False, diff_adapters=False,
                  dec_adapters=False, adapter_reduction=16, adapter_dropout=0.1, base=None,
-                 recon=False, fusion_stages=(), fusion_heads=True):
+                 recon=False, fusion_stages=(), fusion_heads=True, distill=False):
         super(MultiDatasetNet, self).__init__()
         datasets = list(datasets)
         if not datasets or len(set(datasets)) != len(datasets):
@@ -251,6 +266,10 @@ class MultiDatasetNet(nn.Module):
         fusion_stages = tuple(sorted(set(int(k) for k in fusion_stages)))
         if fusion_stages and not recon:
             raise ValueError('fusion needs the reconstruction decoder (recon=True)')
+        if distill and not recon:
+            raise ValueError('distillation needs the reconstruction decoder (recon=True)')
+        if distill and fusion_stages:
+            raise ValueError('distillation replaces fusion; use one or the other')
         if not set(fusion_stages) <= set(FUSION_TARGETS):
             raise ValueError('fusion stages must be among 1, 2, 3; got %s' % (fusion_stages,))
         self.datasets = datasets
@@ -312,6 +331,16 @@ class MultiDatasetNet(nn.Module):
                 (str(k), FusionHead(RECON_WIDTHS[k - 1], FUSION_HEAD_WIDTHS[k])) for k in fusion_stages))
             if domain_bn:
                 self.fusion_bn = _per_dataset_batchnorms(self.fusion_heads, datasets)
+        # Distillation (made after the reconstruction decoder, so that decoder starts the same with or
+        # without it; never together with fusion).  No BatchNorms, so nothing in it is per dataset.
+        self.teacher_head = None
+        self.distill_proj = None
+        if distill:
+            self.teacher_head = nn.Conv2d(RECON_WIDTHS[-1], 1, kernel_size=1)
+            nn.init.normal_(self.teacher_head.weight, std=0.01)      # as the fusion heads' classifier
+            nn.init.constant_(self.teacher_head.bias, math.log(FUSION_PRIOR / (1.0 - FUSION_PRIOR)))
+            self.distill_proj = nn.ModuleList([nn.Conv2d(ch, RECON_WIDTHS[k - 1], kernel_size=1)
+                                               for k, _, ch in DISTILL_PAIRS])
         torch.set_rng_state(rng)
 
         on = {'domain_bn': domain_bn, 'enc_adapters': enc_adapters,
@@ -344,11 +373,13 @@ class MultiDatasetNet(nn.Module):
                 feats.append(x)
         return feats
 
-    def decode(self, c, fused=None):
+    def decode(self, c, fused=None, return_feats=False):
         """NeighborFeatureAggregation.forward, starting from the difference maps.
 
         ``fused``: {stage: D_k} from fusion, appended (last) to the input of
         cat4 / cat3 / cat2 for stage 1 / 2 / 3; empty or None = the original.
+        ``return_feats``: also return the outputs of cat4, cat3 and cat2
+        (for distillation).
         """
         fused = fused or {}
         s = self.swa
@@ -373,11 +404,15 @@ class MultiDatasetNet(nn.Module):
         f3 = s.cat3(cat([d3, e3], 2))
         e2 = F.interpolate(f3, scale_factor=(2, 2), mode='bilinear')
         s2 = s.cat2(cat([e2, d2, d1], 3))
-        return s.cls(s2)
+        out = s.cls(s2)
+        return (out, [f4, f3, s2]) if return_feats else out
 
     def forward(self, x1, x2, dataset, return_aux=False):
         """Change probability map; with ``return_aux`` also
-        {'recon': (T1', T2'), 'heads': {stage: fusion-head probability map}}.
+        {'recon': (T1', T2'), 'heads': {stage: fusion-head probability map},
+         'distill': None, or {'teacher_map': teacher change probability map,
+                              'pairs': [(projected change-decoder feature,
+                                         reconstruction difference), ...]}}.
 
         Without fusion the reconstruction decoder only reads each date's
         deepest features and is run only for ``return_aux``.  With fusion the
@@ -408,12 +443,20 @@ class MultiDatasetNet(nn.Module):
             fused = {k: torch.abs(s1[k - 1] - s2[k - 1]) for k in self.fusion_stages}
             if return_aux and self.fusion_heads is not None:
                 heads = OrderedDict((k, self.fusion_heads[str(k)](fused[k])) for k in self.fusion_stages)
-        mask = self.decode(c, fused)
+        kd = return_aux and self.teacher_head is not None
+        out = self.decode(c, fused, return_feats=kd)
+        mask, cd_feats = out if kd else (out, None)
         mask = F.interpolate(mask, scale_factor=(4, 4), mode='bilinear')
         mask = torch.sigmoid(mask)
         if not return_aux:
             return mask
-        return mask, {'recon': recons, 'heads': heads}
+        distill = None
+        if kd:  # s1, s2: both dates' reconstruction stage features (computed above for return_aux)
+            distill = {
+                'teacher_map': torch.sigmoid(self.teacher_head(torch.abs(s1[-1] - s2[-1]))),
+                'pairs': [(proj(feat), torch.abs(s1[k - 1] - s2[k - 1]))
+                          for (k, _, _), proj, feat in zip(DISTILL_PAIRS, self.distill_proj, cd_feats)]}
+        return mask, {'recon': recons, 'heads': heads, 'distill': distill}
 
     # ------------------------------------------------------------------
     def dataset_parameters(self, dataset):
@@ -442,14 +485,23 @@ class MultiDatasetNet(nn.Module):
     def fusion_head_parameter_count(self):
         return 0 if self.fusion_heads is None else sum(q.numel() for q in self.fusion_heads.parameters())
 
+    def distill_parameter_count(self):
+        """Teacher head + the three projections (0 without distillation)."""
+        if self.teacher_head is None:
+            return 0
+        return sum(q.numel() for m in (self.teacher_head, self.distill_proj) for q in m.parameters())
+
     def training_only_parameters(self):
         """Parameters the change map never uses (they only serve the training losses):
         the reconstruction stages after the last fusion stage, the two RGB output
-        convs and the fusion heads; without fusion, the whole reconstruction decoder."""
+        convs, the fusion heads and the distillation parts; without fusion, the whole
+        reconstruction decoder."""
         if self.recon is None:
             return []
         k = max(self.fusion_stages) if self.fusion_stages else 0
         mods = list(self.recon.ups)[k:] + list(self.recon.norms)[k:] + [self.recon.head_t1, self.recon.head_t2]
         if self.fusion_heads is not None:
             mods.append(self.fusion_heads)
+        if self.teacher_head is not None:
+            mods += [self.teacher_head, self.distill_proj]
         return [q for m in mods for q in m.parameters()]

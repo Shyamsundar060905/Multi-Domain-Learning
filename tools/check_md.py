@@ -29,11 +29,18 @@ about a minute:
    training-only parts, which losses reach which parts, the date-swap
    symmetry, stages 1-3 with every part on, per-dataset isolation, and fusion
    without reconstruction is refused.
-9. tools/train_md.py end to end on tiny synthetic data: two datasets with
+9. Distillation: the change map is exactly BaseNet's (the change path is
+   untouched), every other weight and the random stream are unchanged,
+   parameter counts (all training only), output shapes, the change map alone
+   runs none of the reconstruction side, the CE and MSE losses train the
+   change side only and the teacher loss the reconstruction side only,
+   per-dataset isolation, date-swap symmetry, and distillation without
+   reconstruction or together with fusion is refused.
+10. tools/train_md.py end to end on tiny synthetic data: two datasets with
    every part on, a refused re-run, --resume, one dataset with every part
-   off, one dataset with --recon, and one with --recon and fusion at stage 2;
-   the experiment header at the start says what is on and the parameter
-   counts.  A new run that stops before its first checkpoint (simulated out
+   off, one dataset with --recon, one with --recon and fusion at stage 2,
+   and one with --recon and --distill; the experiment header at the start
+   says what is on and the parameter counts.  A new run that stops before its first checkpoint (simulated out
    of GPU memory, Ctrl+C) removes its run folder so the same command runs
    again; one that stops later, or a resumed one, keeps it and resumes; a
    file the script did not write is never deleted.
@@ -286,6 +293,8 @@ def rec_step(model, opt, dataset):
     loss = train_md.BCEDiceLoss(mask, target) + 0.1 * train_md.recon_mse(aux['recon'], x1, x2)
     if aux['heads']:
         loss = loss + torch.stack([train_md.BCEDiceLoss(h, target) for h in aux['heads'].values()]).mean()
+    if aux['distill'] is not None:
+        loss = loss + sum(train_md.distill_losses(aux, mask, target))
     opt.zero_grad(set_to_none=True)
     loss.backward()
     opt.step()
@@ -426,7 +435,115 @@ except ValueError:
     refused_m = True
 check(refused_m, 'fusion without the reconstruction decoder is refused')
 
-print('\n=== 9. tools/train_md.py end to end (synthetic data, CPU) ===')
+print('\n=== 9. distillation (--distill, needs --recon) ===')
+# Teacher head 16 + 1; projections 32->256, 24->128, 24->64 with bias: 8,448 + 3,200 + 1,600.
+KD_PARAMS = (16 + 1) + (32 * 256 + 256) + (24 * 128 + 128) + (24 * 64 + 64)   # 13,265
+KD_KEYS = ('teacher_head.', 'distill_proj.')
+torch.manual_seed(5)
+mr5 = MultiDatasetNet(['LEVIR'], recon=True, base=copy.deepcopy(base))
+rng_r5 = torch.get_rng_state()
+torch.manual_seed(5)
+mk = MultiDatasetNet(['LEVIR'], recon=True, distill=True, base=copy.deepcopy(base))
+rng_k = torch.get_rng_state()
+check(torch.equal(rng_r5, rng_k), 'distillation on or off: same random stream afterwards (same batches)')
+s5, sk = mr5.state_dict(), mk.state_dict()
+check(list(s5) == [k for k in sk if not k.startswith(KD_KEYS)] and all(torch.equal(s5[k], sk[k]) for k in s5),
+      'distillation on or off: every other tensor (reconstruction decoder included) keeps its name, order and '
+      'starting value; the only new ones are teacher_head.* and distill_proj.*')
+for mode in ('eval', 'train'):
+    d = same_output(mk, base, 'LEVIR', mode)
+    check(d <= 1e-6, "%s mode: change map identical to BaseNet's with distillation added (max |difference| %.1e)"
+          % (mode, d))
+n_only_k = sum(q.numel() for q in mk.training_only_parameters())
+check(mk.distill_parameter_count() == KD_PARAMS == 13265 and count(mk) == base_total + 503622 + KD_PARAMS
+      and count(mk) - n_only_k == base_total,
+      'distillation adds {:,} parameters (teacher head 17; projections 8,448 / 3,200 / 1,600), all training '
+      'only: total {:,}, the change map uses BaseNet\'s {:,}'.format(KD_PARAMS, count(mk), base_total))
+mk.eval()
+with torch.no_grad():
+    plain_k = mk(x1, x2, 'LEVIR')
+    mask_k, aux_k = mk(x1, x2, 'LEVIR', return_aux=True)
+pair_shapes = [(tuple(st.shape), tuple(te.shape)) for st, te in aux_k['distill']['pairs']]
+check(torch.equal(plain_k, mask_k) and tuple(aux_k['distill']['teacher_map'].shape) == (2, 1, 64, 64)
+      and pair_shapes == [((2, 256, 4, 4),) * 2, ((2, 128, 8, 8),) * 2, ((2, 64, 16, 16),) * 2]
+      and not aux_k['heads'],
+      'same change map with or without the extra outputs; teacher map at full size; the 3 pairs '
+      '(projected change-decoder feature, reconstruction difference) are 256 ch at 1/16, 128 at 1/8, 64 at 1/4')
+calls = []
+hooks = [mod.register_forward_hook(lambda *_: calls.append(1))
+         for mod in (mk.recon, mk.teacher_head, mk.distill_proj[0], mk.distill_proj[2])]
+with torch.no_grad():
+    mk(x1, x2, 'LEVIR')
+for h in hooks:
+    h.remove()
+check(not calls, 'the change map alone runs none of the reconstruction decoder, teacher head or projections '
+      '(%d calls)' % len(calls))
+
+mk.train()
+
+
+def kd_backward(model, which):
+    model.zero_grad(set_to_none=True)
+    mask, aux = model(x1, x2, 'LEVIR', return_aux=True)
+    teacher, ce, mse = train_md.distill_losses(aux, mask, target)
+    {'teacher': teacher, 'ce': ce, 'mse': mse}[which].backward()
+
+
+def no_grad(*modules):
+    return all(q.grad is None for m in modules for q in m.parameters())
+
+
+kd_backward(mk, 'ce')
+check(has_grad(mk.swa) and has_grad(mk.backbone.features[17])
+      and no_grad(mk.recon, mk.teacher_head, mk.distill_proj),
+      'CE loss: trains the change decoder and the encoder; never the reconstruction decoder, the teacher head '
+      'or the projections (the teacher map is fixed)')
+kd_backward(mk, 'mse')
+check(has_grad(mk.distill_proj) and has_grad(mk.swa.cat2) and has_grad(mk.swa.cat4)
+      and has_grad(mk.backbone.features[17]) and no_grad(mk.recon, mk.teacher_head, mk.swa.cls),
+      'feature MSE: trains the projections, the change decoder up to cat2 and the encoder; never the '
+      'reconstruction decoder, the teacher head or the final classifier')
+kd_backward(mk, 'teacher')
+check(has_grad(mk.teacher_head) and has_grad(mk.recon.ups[4]) and has_grad(mk.backbone.features[17])
+      and no_grad(mk.swa, mk.distill_proj, mk.recon.head_t1, mk.recon.head_t2),
+      'teacher loss: trains the teacher head, the reconstruction decoder and the encoder; never the change '
+      'decoder or the projections')
+mk.zero_grad(set_to_none=True)
+
+torch.manual_seed(6)
+mk3 = MultiDatasetNet(DS, recon=True, distill=True, base=copy.deepcopy(base), **ALL_ON)
+per_k = sum(mk3.part_sizes().values())
+shared_k = sum(q.numel() for q in mk3.shared_parameters())
+check(per_k == 74160 + RECON_BN and shared_k + len(DS) * per_k == count(mk3)
+      and count(mk3) == count(mg) + KD_PARAMS,
+      'every part on + distillation, 3 datasets: the distillation parts are shared (per dataset still {:,}); '
+      'total {:,} = shared {:,} + 3 x {:,}'.format(per_k, count(mk3), shared_k, per_k))
+opt = torch.optim.Adam(mk3.parameters(), 5e-4, (0.9, 0.99), eps=1e-08, weight_decay=1e-4)
+rec_step(mk3, opt, 'LEVIR')
+rec_step(mk3, opt, 'SYSU')
+before = {k: v.clone() for k, v in mk3.state_dict().items()}
+rec_step(mk3, opt, 'WHU')
+after = mk3.state_dict()
+moved = [k for k in before if ('.per_dataset.LEVIR.' in k or '.per_dataset.SYSU.' in k)
+         and not torch.equal(before[k], after[k])]
+kd_moved = all(not torch.equal(before[k], after[k]) for k in after if k.startswith(KD_KEYS))
+check(not moved and kd_moved, 'every part on + distillation: a WHU step changes no LEVIR/SYSU tensor (%d changed) '
+      'and trains every distillation tensor' % len(moved))
+mk3.eval()
+with torch.no_grad():
+    worst = max(max_diff(mk3(x1, x2, d), mk3(x2, x1, d)) for d in DS)
+check(worst <= 1e-6, 'with distillation, trained: same change map with the dates swapped (max |difference| %.1e)'
+      % worst)
+for kw, why in ((dict(distill=True), 'without the reconstruction decoder'),
+                (dict(recon=True, distill=True, fusion_stages=(2,)), 'together with fusion')):
+    try:
+        MultiDatasetNet(['LEVIR'], base=copy.deepcopy(base), **kw)
+        refused_k = False
+    except ValueError:
+        refused_k = True
+    check(refused_k, 'distillation %s is refused' % why)
+
+print('\n=== 10. tools/train_md.py end to end (synthetic data, CPU) ===')
 tmp = tempfile.mkdtemp(prefix='check_md_')
 rng = np.random.RandomState(0)
 
@@ -544,6 +661,47 @@ try:
           and train_md.run_label(a_seed) == 'LEVIR | shared | recon 0.1 | seed 7',
           'run folder: the default seed keeps the name it always had; --seed 7 adds _seed7, so repeats '
           'with other seeds do not collide')
+    check('Distillation: off' in logr and 'Distillation: off' in logf and 'Teacher(tr)' not in logr + logf,
+          'without --distill: header says distillation is off; epoch lines as before')
+
+    kd_cmd = ['--datasets', 'LEVIR', '--recon', '--recon-weight', '0.5', '--distill'] + common
+    logk = run(kd_cmd)
+    check('EXPERIMENT: LEVIR | shared | recon 0.5 | distill CE 1, MSE 1 (teacher 1)' in logk
+          and 'Distillation: ON' in logk and 'Fusion: off' in logk
+          and os.path.isdir(os.path.join(tmp, 'results_md_LEVIR_shared_rec0.5_kd-ce1-mse1_iter_8_lr_0.0005')),
+          'with --distill: header says so (CE, MSE and teacher weights 1 by default); run folder '
+          'results_md_LEVIR_shared_rec0.5_kd-ce1-mse1_...')
+    check('Total network parameters (excluding idr): %d' % (base_total + 503622 + KD_PARAMS) in logk
+          and 'Parameters the change map uses (training-only parts left out): {:,}'.format(base_total) in logk
+          and '  parameters: {:,} (teacher head + 3 projections; training only)'.format(KD_PARAMS) in logk,
+          'with --distill: {:,} parameters in training, {:,} (BaseNet) used for the change map'.format(
+              base_total + 503622 + KD_PARAMS, base_total))
+    check(re.search(r'Recon\(tr\) = \d+\.\d{4}\t PSNR\(val\) = -?\d+\.\d{2} dB\t Teacher\(tr\) = \d+\.\d{4}\t '
+                    r'CE\(tr\) = \d+\.\d{4}\t MSE\(tr\) = \d+\.\d{4}\t F1 teacher\(val\) = \d\.\d{4}', logk)
+          is not None and re.search(r'\[LEVIR\] Test teacher map .*F1 = \d\.\d{4}', logk) is not None
+          and '[LEVIR] Test reconstruction: PSNR = ' in logk,
+          'with --distill: epoch lines add Teacher(tr), CE(tr), MSE(tr) and F1 teacher(val); test adds a '
+          'teacher-map line')
+    log_kr = run(kd_cmd + ['--resume'])
+    check('=> resumed from' in log_kr and '[LEVIR] Test teacher map' in log_kr,
+          'with --distill: --resume reloads the run and tests it')
+    a_kd = train_md.parse_args(['--datasets', 'LEVIR', '--recon', '--distill', '--ce-weight', '0.5',
+                                '--teacher-weight', '2'] + common)
+    check(train_md.run_dir(a_kd) == os.path.join(tmp, 'results_md_LEVIR_shared_rec0.1_kd-ce0.5-mse1-t2_iter_8_lr_0.0005')
+          and a_kd.distill_weight == 1.0,
+          'with --distill: other weights go into the run folder name (kd-ce0.5-mse1-t2); unset ones are 1')
+    for bad, why in ((['--distill'], '--distill without --recon'),
+                     (['--recon', '--distill', '--fusion-stages', '2'], '--distill together with fusion'),
+                     (['--recon', '--ce-weight', '0.5'], '--ce-weight without --distill'),
+                     (['--recon', '--distill', '--teacher-weight', '0'], '--ce-weight > 0 with --teacher-weight 0'),
+                     (['--recon', '--distill', '--distill-weight', '-1'], 'a negative --distill-weight')):
+        with contextlib.redirect_stderr(io.StringIO()):
+            try:
+                train_md.parse_args(['--datasets', 'LEVIR'] + bad + common)
+                refused_kd = False
+            except SystemExit:
+                refused_kd = True
+        check(refused_kd, '%s is refused' % why)
 
     # A new run that stops before its first checkpoint removes its run folder; later stops keep it.
     real_epoch = train_md.train_epoch
@@ -608,13 +766,14 @@ try:
           'stopped in epoch 0 with a file in the run folder the script did not write: only the '
           "script's own files are deleted, the folder and that file stay")
     print('\n  Start of a run (two datasets, every part on; one dataset, every part off; one dataset with '
-          '--recon; one with --recon and fusion at stage 2), and its epoch and test lines:')
-    for line in (log + log1 + logr + logf).splitlines():
+          '--recon; one with --recon and fusion at stage 2; one with --recon and --distill), and its epoch '
+          'and test lines:')
+    for line in (log + log1 + logr + logf + logk).splitlines():
         if re.search(r'^=+$|EXPERIMENT|^Datasets|Per-dataset|part  |\[ON\]|\[off\]|Shared by|Adapter:|'
                      r'Reconstruction task|  decoder:|  loss:|  parameters:|Fusion:|  new input|'
-                     r'  fusion change head|change map uses|'
+                     r'  fusion change head|change map uses|Distillation:|  teacher map:|  CE:|  MSE:|'
                      r'Parameters:|Total network|Training:|Schedule|Checkpoint selection|Recon\(tr\)|'
-                     r'Test :|Test reconstruction|Mean test', line):
+                     r'Test :|Test reconstruction|Test teacher|Mean test', line):
             print('  | ' + line.rstrip())
 finally:
     shutil.rmtree(tmp, ignore_errors=True)

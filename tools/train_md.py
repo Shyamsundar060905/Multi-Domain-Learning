@@ -50,6 +50,24 @@ Fusion (--fusion-stages 1/2/3, needs --recon)
     BCE + Dice, averaged over stages, as on the bottleneck-reconstruction
     branch.  Head(tr) in the epoch lines is that head loss.
 
+Distillation (--distill, needs --recon; instead of fusion)
+  * The change decoder learns from the reconstruction side; nothing teaches
+    the reconstruction side back, and the change map is computed exactly as
+    without --distill (none of this is used at test time).
+  * Teacher map: |date-1 - date-2| of the reconstruction decoder's last stage
+    -> 1x1 conv -> sigmoid, trained on the label with
+    --teacher-weight (default 1) x BCE + Dice.
+  * CE: --ce-weight (default 1) x BCE(change map, teacher map), the teacher
+    map held fixed (detached).  Binary cross-entropy with a soft target, so
+    its minimum is the teacher's own entropy, not 0.
+  * MSE: --distill-weight (default 1) x the mean over 3 pairs of
+    MSE(1x1 conv(change-decoder feature), |date-1 - date-2| of the
+    reconstruction stage of the same size), the reconstruction side held
+    fixed: cat4 <-> stage 1 (1/16), cat3 <-> stage 2 (1/8), cat2 <-> stage 3
+    (1/4).
+  * Teacher(tr), CE(tr) and MSE(tr) in the epoch lines are those three
+    losses; F1 teacher(val) / the Test teacher line score the teacher map.
+
 Run folder
   * Named after the datasets, the per-dataset parts, the reconstruction weight,
     the fusion stages, --max_steps and --lr; a --seed other than 2333 adds
@@ -168,23 +186,50 @@ def batch_psnr(recons, pre, post):
     return 10.0 * math.log10(1.0 / max(raw, 1e-10))
 
 
+def distill_losses(aux, output, target):
+    """The three --distill losses: (teacher, CE, MSE).
+
+    teacher: BCE + Dice of the teacher map against the label (trains the teacher head and,
+             through it, the reconstruction decoder and the encoder).
+    CE:      BCE of the change map against the teacher map, the teacher map detached.
+    MSE:     mean over the 3 pairs of MSE(projected change-decoder feature, reconstruction
+             difference), the reconstruction difference detached.
+    The detaching is what makes the change decoder the student: CE and MSE never train the
+    reconstruction side.
+    """
+    kd = aux['distill']
+    teacher_map = kd['teacher_map']
+    teacher = BCEDiceLoss(teacher_map, target)
+    ce = F.binary_cross_entropy(output, teacher_map.detach())
+    mse = torch.stack([F.mse_loss(student, recon_diff.detach()) for student, recon_diff in kd['pairs']]).mean()
+    return teacher, ce, mse
+
+
 @torch.no_grad()
 def evaluate(model, loader, dataset, device, recon=False):
-    """Change loss, change scores, and (with recon) the mean PSNR over batches."""
+    """Change loss, change scores, (with recon) the mean PSNR over batches, and (with
+    --distill) the teacher map's scores (else None)."""
     model.eval()
     meter = ConfuseMatrixMeter(n_class=2)
+    teacher_meter = None
     losses, psnrs = [], []
     for img, target in loader:
         pre, post, target = to_device(img, target, device)
         if recon:
             output, aux = model(pre, post, dataset, return_aux=True)
             psnrs.append(batch_psnr(aux['recon'], pre, post))
+            if aux['distill'] is not None:
+                if teacher_meter is None:
+                    teacher_meter = ConfuseMatrixMeter(n_class=2)
+                teacher_meter.update_cm(pr=binarize(aux['distill']['teacher_map']).cpu().numpy(),
+                                        gt=target.cpu().numpy())
         else:
             output = model(pre, post, dataset)
         losses.append(BCEDiceLoss(output, target).item())
         meter.update_cm(pr=binarize(output).cpu().numpy(), gt=target.cpu().numpy())
     psnr = sum(psnrs) / len(psnrs) if psnrs else None
-    return sum(losses) / len(losses), meter.get_scores(), psnr
+    teacher_scores = teacher_meter.get_scores() if teacher_meter is not None else None
+    return sum(losses) / len(losses), meter.get_scores(), psnr, teacher_scores
 
 
 def train_epoch(args, model, optimizer, cycles, epoch, rounds_per_epoch, total_rounds, device):
@@ -193,6 +238,7 @@ def train_epoch(args, model, optimizer, cycles, epoch, rounds_per_epoch, total_r
     losses = {d: [] for d in args.datasets}
     rec_losses = {d: [] for d in args.datasets}
     head_losses = {d: [] for d in args.datasets}
+    kd_losses = {d: [] for d in args.datasets}
     lr = None
     for r in range(rounds_per_epoch):
         cur = epoch * rounds_per_epoch + r
@@ -212,6 +258,10 @@ def train_epoch(args, model, optimizer, cycles, epoch, rounds_per_epoch, total_r
                     head_loss = torch.stack([BCEDiceLoss(h, target) for h in aux['heads'].values()]).mean()
                     loss = loss + args.fusion_head_weight * head_loss
                     head_losses[d].append(head_loss.item())
+                if aux['distill'] is not None:
+                    teacher, ce, mse = distill_losses(aux, output, target)
+                    loss = loss + args.teacher_weight * teacher + args.ce_weight * ce + args.distill_weight * mse
+                    kd_losses[d].append((teacher.item(), ce.item(), mse.item()))
             else:
                 output = model(pre, post, d)
                 cd_loss = loss = BCEDiceLoss(output, target)
@@ -231,7 +281,11 @@ def train_epoch(args, model, optimizer, cycles, epoch, rounds_per_epoch, total_r
     def mean(v):
         return sum(v) / len(v) if v else None
 
-    stats = {d: (mean(losses[d]), meters[d].get_scores(), mean(rec_losses[d]), mean(head_losses[d]))
+    def mean3(v):  # (teacher, CE, MSE) means
+        return tuple(sum(x[i] for x in v) / len(v) for i in range(3)) if v else None
+
+    stats = {d: (mean(losses[d]), meters[d].get_scores(), mean(rec_losses[d]), mean(head_losses[d]),
+                 mean3(kd_losses[d]))
              for d in args.datasets}
     return stats, lr
 
@@ -250,6 +304,14 @@ def fusion_tag(args):
         '' if args.fusion_head_weight == 1.0 else 'h%g' % args.fusion_head_weight)
 
 
+def distill_tag(args):
+    """'kd-ce1-mse1' (teacher weight 1), 'kd-ce0.5-mse1-t2', ... ; '' without --distill."""
+    if not args.distill:
+        return ''
+    return 'kd-ce%g-mse%g' % (args.ce_weight, args.distill_weight) + (
+        '' if args.teacher_weight == 1.0 else '-t%g' % args.teacher_weight)
+
+
 def run_label(args):
     label = '%s | %s' % ('-'.join(args.datasets), parts_tag(args))
     if args.recon:
@@ -258,6 +320,9 @@ def run_label(args):
         label += ' | fusion stage%s %s (head weight %g)' % (
             's' if len(args.fusion_stages) > 1 else '',
             ', '.join(str(k) for k in args.fusion_stages), args.fusion_head_weight)
+    if args.distill:
+        label += ' | distill CE %g, MSE %g (teacher %g)' % (args.ce_weight, args.distill_weight,
+                                                           args.teacher_weight)
     if args.seed != DEFAULT_SEED:
         label += ' | seed %d' % args.seed
     return label
@@ -269,6 +334,8 @@ def run_dir(args):
     tag = parts_tag(args) + ('_rec%g' % args.recon_weight if args.recon else '')
     if args.fusion_stages:
         tag += '_' + fusion_tag(args)
+    if args.distill:
+        tag += '_' + distill_tag(args)
     if args.seed != DEFAULT_SEED:
         tag += '_seed%d' % args.seed
     return '%s_%s_%s_iter_%d_lr_%s' % (args.savedir, '-'.join(args.datasets), tag,
@@ -314,6 +381,8 @@ def describe(args, model, total_params, shared_params, per_dataset, sizes):
         shared += '; the reconstruction decoder' + (' (except its BatchNorms)' if args.domain_bn else '')
     if args.fusion_stages and args.fusion_head_weight > 0:
         shared += '; the fusion heads' + (' (except their BatchNorms)' if args.domain_bn else '')
+    if args.distill:
+        shared += '; the distillation parts'
     lines.append('Shared by all datasets: ' + shared)
     if any(getattr(args, flag) for flag, _, _ in PART_INFO[1:]):
         lines.append('Adapter: 1x1 conv down to max(C/%d, 8) channels -> BN -> ReLU -> 1x1 conv up '
@@ -348,6 +417,20 @@ def describe(args, model, total_params, shared_params, per_dataset, sizes):
                 lines.append('  fusion change heads: off (--fusion-head-weight 0)')
         else:
             lines.append('Fusion: off')
+        if args.distill:
+            lines += [
+                'Distillation: ON  (training only; the change decoder learns from the reconstruction side, '
+                'which nothing teaches back; the change map is computed as without it)',
+                '  teacher map: |date-1 - date-2| of reconstruction stage 5 (16 ch, full size) -> 1x1 conv -> '
+                'sigmoid; loss + %g x BCE + Dice against the label' % args.teacher_weight,
+                '  CE: loss + %g x BCE(change map, teacher map), teacher map fixed' % args.ce_weight,
+                '  MSE: loss + %g x mean over 3 pairs of MSE(1x1 conv(change-decoder feature), |date-1 - date-2| '
+                'of the reconstruction stage), reconstruction side fixed: cat4 (32 ch) -> stage 1 (256 ch, 1/16); '
+                'cat3 (24 ch) -> stage 2 (128 ch, 1/8); cat2 (24 ch) -> stage 3 (64 ch, 1/4)' % args.distill_weight,
+                '  parameters: {:,} (teacher head + 3 projections; training only)'.format(
+                    model.distill_parameter_count())]
+        else:
+            lines.append('Distillation: off')
     else:
         lines.append('Reconstruction task: off')
     lines += [
@@ -364,6 +447,9 @@ def describe(args, model, total_params, shared_params, per_dataset, sizes):
         loss += ' + %g x reconstruction MSE' % args.recon_weight
     if args.fusion_stages and args.fusion_head_weight > 0:
         loss += ' + %g x fusion-head BCE + Dice' % args.fusion_head_weight
+    if args.distill:
+        loss += ' + %g x teacher BCE + Dice + %g x CE(teacher) + %g x feature MSE' % (
+            args.teacher_weight, args.ce_weight, args.distill_weight)
     lines += [
         'Training: %dx%d input, batch %d per dataset, Adam lr %g (%s), loss %s, seed %d'
         % (args.inWidth, args.inHeight, args.batch_size, args.lr, args.lr_mode, loss, args.seed),
@@ -405,6 +491,15 @@ def parse_args(argv=None):
                    help='with --recon: reconstruction stages whose |date-1 - date-2| feeds the change decoder')
     p.add_argument('--fusion-head-weight', type=float, default=1.0,
                    help='weight of the fusion change heads\' loss (0 = no heads)')
+    p.add_argument('--distill', action='store_true',
+                   help='with --recon, instead of fusion: the change decoder learns from the reconstruction '
+                        'side (CE on the change map, MSE on 3 decoder features); training only')
+    p.add_argument('--ce-weight', type=float, default=None,
+                   help='with --distill: weight of BCE(change map, teacher map) (default 1)')
+    p.add_argument('--distill-weight', type=float, default=None,
+                   help='with --distill: weight of the feature MSE (default 1)')
+    p.add_argument('--teacher-weight', type=float, default=None,
+                   help='with --distill: weight of the teacher map\'s BCE + Dice on the label (default 1)')
     args = p.parse_args(argv)
     if len(set(args.datasets)) != len(args.datasets):
         p.error('--datasets lists a dataset twice')
@@ -415,6 +510,24 @@ def parse_args(argv=None):
         p.error('--fusion-stages needs --recon')
     if args.fusion_head_weight < 0:
         p.error('--fusion-head-weight must be >= 0')
+    kd_weights = (('ce_weight', '--ce-weight'), ('distill_weight', '--distill-weight'),
+                  ('teacher_weight', '--teacher-weight'))
+    if args.distill:
+        if not args.recon:
+            p.error('--distill needs --recon')
+        if args.fusion_stages:
+            p.error('--distill replaces fusion; drop --fusion-stages')
+        for attr, flag in kd_weights:
+            if getattr(args, attr) is None:
+                setattr(args, attr, 1.0)
+            elif getattr(args, attr) < 0:
+                p.error('%s must be >= 0' % flag)
+        if args.ce_weight > 0 and not args.teacher_weight > 0:
+            p.error('--ce-weight > 0 needs --teacher-weight > 0 (an untrained teacher map would teach noise)')
+    else:
+        for attr, flag in kd_weights:
+            if getattr(args, attr) is not None:
+                p.error('%s needs --distill' % flag)
     args.data_root = os.path.expanduser(args.data_root)
     return args
 
@@ -435,7 +548,8 @@ def main(argv=None):
                             enc_adapters=args.enc_adapters, diff_adapters=args.diff_adapters,
                             dec_adapters=args.dec_adapters, adapter_reduction=args.adapter_reduction,
                             adapter_dropout=args.adapter_dropout, recon=args.recon,
-                            fusion_stages=args.fusion_stages, fusion_heads=args.fusion_head_weight > 0)
+                            fusion_stages=args.fusion_stages, fusion_heads=args.fusion_head_weight > 0,
+                            distill=args.distill)
 
     savedir = run_dir(args)
     if os.path.isdir(savedir) and not args.resume:
@@ -515,6 +629,9 @@ def main(argv=None):
     if args.fusion_stages:
         config['fusion_stages'] = list(args.fusion_stages)
         config['fusion_head_weight'] = args.fusion_head_weight
+    if args.distill:
+        config['distill'] = {'ce_weight': args.ce_weight, 'distill_weight': args.distill_weight,
+                             'teacher_weight': args.teacher_weight}
     ckpt_path = os.path.join(savedir, 'checkpoint.pth.tar')
     best_path = os.path.join(savedir, 'best_model.pth')
     start_epoch, best_mean, best_epoch = 0, 0.0, -1
@@ -558,8 +675,8 @@ def main(argv=None):
         else:
             logger.write('\n'.join(header) + '\n')
             logger.write('Config: %s\n' % config)
-            logger.write('Epoch\tDataset\tKappa (val)\tIoU (val)\tF1 (val)\tR (val)\tP (val)%s\n'
-                         % ('\tPSNR (val)' if args.recon else ''))
+            logger.write('Epoch\tDataset\tKappa (val)\tIoU (val)\tF1 (val)\tR (val)\tP (val)%s%s\n'
+                         % ('\tPSNR (val)' if args.recon else '', '\tF1 teacher (val)' if args.distill else ''))
         logger.flush()
 
         cycles = {d: Cycle(loaders[d]['train']) for d in args.datasets}
@@ -575,9 +692,10 @@ def main(argv=None):
             mean_f1 = float(np.mean([val[d][1]['F1'] for d in args.datasets]))
             for d in args.datasets:
                 s = val[d][1]
-                logger.write('%d\t%s\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f%s\n'
+                logger.write('%d\t%s\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f%s%s\n'
                              % (epoch, d, s['Kappa'], s['IoU'], s['F1'], s['recall'], s['precision'],
-                                '\t%.2f' % val[d][2] if args.recon else ''))
+                                '\t%.2f' % val[d][2] if args.recon else '',
+                                '\t%.4f' % val[d][3]['F1'] if val[d][3] is not None else ''))
             logger.write('%d\tmean F1\t\t\t%.4f\n' % (epoch, mean_f1))
             logger.flush()
 
@@ -598,7 +716,9 @@ def main(argv=None):
                       % (d, stats[d][0], val[d][0], stats[d][1]['F1'], val[d][1]['F1'],
                          ('\t Recon(tr) = %.4f\t PSNR(val) = %.2f dB' % (stats[d][2], val[d][2])
                           if args.recon else '')
-                         + ('\t Head(tr) = %.4f' % stats[d][3] if stats[d][3] is not None else '')))
+                         + ('\t Head(tr) = %.4f' % stats[d][3] if stats[d][3] is not None else '')
+                         + ('\t Teacher(tr) = %.4f\t CE(tr) = %.4f\t MSE(tr) = %.4f\t F1 teacher(val) = %.4f'
+                            % (stats[d][4] + (val[d][3]['F1'],)) if stats[d][4] is not None else '')))
             if device.type == 'cuda':
                 torch.cuda.empty_cache()
     except BaseException:  # any error, including running out of GPU memory, and Ctrl+C
@@ -618,7 +738,7 @@ def main(argv=None):
     print('\nTesting the best checkpoint: epoch %d, mean val F1 %.4f' % (best_epoch, best_mean))
     test_f1 = []
     for d in args.datasets:
-        _, s, psnr = evaluate(model, loaders[d]['test'], d, device, recon=args.recon)
+        _, s, psnr, teacher_s = evaluate(model, loaders[d]['test'], d, device, recon=args.recon)
         test_f1.append(s['F1'])
         print('[%s] Test :\t Kappa (te) = %.4f\t IoU (te) = %.4f\t F1 (te) = %.4f\t R (te) = %.4f\t P (te) = %.4f'
               % (d, s['Kappa'], s['IoU'], s['F1'], s['recall'], s['precision']))
@@ -627,6 +747,10 @@ def main(argv=None):
         if args.recon:
             print('[%s] Test reconstruction: PSNR = %.2f dB' % (d, psnr))
             logger.write('Test\t%s\tPSNR\t%.2f\n' % (d, psnr))
+        if teacher_s is not None:
+            print('[%s] Test teacher map (reconstruction side, training only, not the result):\t F1 = %.4f\t '
+                  'IoU = %.4f' % (d, teacher_s['F1'], teacher_s['IoU']))
+            logger.write('Test\t%s\tteacher F1\t%.4f\n' % (d, teacher_s['F1']))
     print('Mean test F1 over %s: %.4f' % (', '.join(args.datasets), float(np.mean(test_f1))))
     logger.write('Test\tmean F1\t\t\t%.4f\n' % float(np.mean(test_f1)))
     logger.close()
